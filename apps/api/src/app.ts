@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import Fastify from "fastify";
 import { db } from "./db/index.js";
 import { registerAuthHook } from "./plugins/auth.js";
+import { registerMetrics } from "./plugins/metrics.js";
 import { registerCsrfOriginCheck, registerSecurityHeaders } from "./plugins/security.js";
 import { adminRoutes } from "./routes/admin.js";
 import { aiRoutes } from "./routes/ai.js";
@@ -62,6 +63,7 @@ export async function buildApp(logger = true) {
   registerSecurityHeaders(app);
   registerCsrfOriginCheck(app, allowedOrigins);
   registerAuthHook(app);
+  registerMetrics(app);
 
   app.setErrorHandler((err, req, reply) => {
     const pgCode = getPgErrorCode(err);

@@ -286,6 +286,11 @@ describe("SupermarketOS OWASP Security Hardening Suite", () => {
         url: "/api/inventory/expiry-alerts",
         expected: { owner: 200, manager: 200, accountant: 403, cashier: 403, clerk: 200 },
       },
+      {
+        method: "GET",
+        url: "/api/metrics",
+        expected: { owner: 200, manager: 200, accountant: 403, cashier: 403, clerk: 403 },
+      },
     ];
 
     const tokens = {
@@ -310,5 +315,17 @@ describe("SupermarketOS OWASP Security Hardening Suite", () => {
         expect(res.statusCode, `${row.method} ${row.url} as ${role}`).toBe(expectedStatus);
       }
     }
+
+    // Verify Prometheus text exposition format on /api/metrics
+    const metricsRes = await app.inject({
+      method: "GET",
+      url: "/api/metrics",
+      headers: authHeaders(ownerToken),
+    });
+    expect(metricsRes.statusCode).toBe(200);
+    expect(metricsRes.headers["content-type"]).toContain("text/plain");
+    expect(metricsRes.body).toContain("http_requests_total");
+    expect(metricsRes.body).toContain("pg_pool_connections");
+    expect(metricsRes.body).toContain("supermarket_auth_lockouts_total");
   });
 });
