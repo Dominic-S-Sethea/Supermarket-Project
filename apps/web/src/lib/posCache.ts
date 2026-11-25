@@ -65,6 +65,8 @@ export interface QueuedPosSale {
   soldAt: string;
   cashierName: string;
   ageVerified: boolean;
+  customerId?: string | null;
+  couponCode?: string | null;
   lines: {
     id: string;
     productId: string;

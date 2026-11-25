@@ -8,17 +8,20 @@ import {
   CreatePurchaseOrderSchema,
   generateUuidV7,
   UpdatePoStatusSchema,
+  UpdateVarianceStatusSchema,
 } from "@supermarket/shared";
 import { and, asc, desc, eq, inArray, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   analyticsDynamicMarkdowns,
+  analyticsSupplierScorecards,
   auditLogs,
   categories,
   db,
   departments,
   goodsReceipts,
   grnLines,
+  grnVariances,
   inventoryBatches,
   marginAlerts,
   productBarcodes,
@@ -603,7 +606,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
       );
       const createdAlerts: { productId: string; resultingMarginBp: number }[] = [];
 
-      const grnId = await db.transaction(async (tx) => {
+      const grnOutcome = await db.transaction(async (tx) => {
         const [grn] = await tx
           .insert(goodsReceipts)
           .values({
@@ -620,7 +623,10 @@ export async function inventoryRoutes(app: FastifyInstance) {
         const orderedLines = [...data.lines].sort((a, b) =>
           a.productId.localeCompare(b.productId)
         );
-        const receivedCasesByProduct = new Map<string, number>();
+        const receivedSummaryByProduct = new Map<
+          string,
+          { cases: number; totalUnits: number; invoiceCents: number }
+        >();
 
         for (const line of orderedLines) {
           const paidUnits = line.paidCases * line.caseQty;
@@ -628,10 +634,16 @@ export async function inventoryRoutes(app: FastifyInstance) {
           const totalUnits = paidUnits + freeUnits;
           if (totalUnits <= 0) continue;
 
-          receivedCasesByProduct.set(
-            line.productId,
-            (receivedCasesByProduct.get(line.productId) ?? 0) + line.paidCases + line.freeBonusCases
-          );
+          const prevSum = receivedSummaryByProduct.get(line.productId) ?? {
+            cases: 0,
+            totalUnits: 0,
+            invoiceCents: 0,
+          };
+          receivedSummaryByProduct.set(line.productId, {
+            cases: prevSum.cases + line.paidCases + line.freeBonusCases,
+            totalUnits: prevSum.totalUnits + totalUnits,
+            invoiceCents: prevSum.invoiceCents + line.invoiceLineTotalCents,
+          });
 
           const effectiveUnitCost = computeEffectiveUnitCostCents(
             line.invoiceLineTotalCents,
@@ -786,6 +798,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
           }
         }
 
+        let variancesCreated = 0;
         if (data.poId) {
           const poLines = await tx
             .select()
@@ -795,13 +808,61 @@ export async function inventoryRoutes(app: FastifyInstance) {
 
           let allReceived = poLines.length > 0;
           for (const pl of poLines) {
-            const added = receivedCasesByProduct.get(pl.productId) ?? 0;
+            const summary = receivedSummaryByProduct.get(pl.productId);
+            const added = summary?.cases ?? 0;
             const nextReceived = pl.receivedCases + added;
             if (added > 0) {
               await tx
                 .update(purchaseOrderLines)
                 .set({ receivedCases: nextReceived })
                 .where(eq(purchaseOrderLines.id, pl.id));
+
+              const orderedUnits = pl.orderedCases * pl.caseQty;
+              const receivedUnitsTotal = nextReceived * pl.caseQty;
+              const invUnitCost =
+                summary && summary.totalUnits > 0
+                  ? Math.round(summary.invoiceCents / summary.totalUnits)
+                  : pl.unitCostCents;
+
+              if (nextReceived !== pl.orderedCases) {
+                const isShort = nextReceived < pl.orderedCases;
+                const unitDiff = Math.abs(orderedUnits - receivedUnitsTotal);
+                await tx.insert(grnVariances).values({
+                  grnId: grn.id,
+                  poId: data.poId,
+                  supplierId: data.supplierId,
+                  productId: pl.productId,
+                  varianceType: isShort ? "short_delivery" : "over_delivery",
+                  orderedQtyUnits: orderedUnits,
+                  receivedQtyUnits: receivedUnitsTotal,
+                  poUnitCostCents: pl.unitCostCents,
+                  invoiceUnitCostCents: invUnitCost,
+                  financialImpactCents: unitDiff * (isShort ? pl.unitCostCents : invUnitCost),
+                  status: "open",
+                });
+                variancesCreated++;
+              }
+
+              const costDiff = invUnitCost - pl.unitCostCents;
+              if (
+                pl.unitCostCents > 0 &&
+                Math.abs(costDiff) > Math.max(2, Math.round(pl.unitCostCents * 0.01))
+              ) {
+                await tx.insert(grnVariances).values({
+                  grnId: grn.id,
+                  poId: data.poId,
+                  supplierId: data.supplierId,
+                  productId: pl.productId,
+                  varianceType: costDiff > 0 ? "cost_overcharge" : "cost_savings",
+                  orderedQtyUnits: orderedUnits,
+                  receivedQtyUnits: summary?.totalUnits ?? added * pl.caseQty,
+                  poUnitCostCents: pl.unitCostCents,
+                  invoiceUnitCostCents: invUnitCost,
+                  financialImpactCents: Math.abs(costDiff) * (summary?.totalUnits ?? added * pl.caseQty),
+                  status: "open",
+                });
+                variancesCreated++;
+              }
             }
             if (nextReceived < pl.orderedCases) {
               allReceived = false;
@@ -823,17 +884,19 @@ export async function inventoryRoutes(app: FastifyInstance) {
             invoiceNumber: data.invoiceNumber,
             totalInvoiceCents,
             marginAlertsTriggered: createdAlerts.length,
+            variancesCreated,
           },
         });
 
-        return grn.id;
+        return { grnId: grn.id, variancesCreated };
       });
 
       return reply.status(201).send({
-        grnId,
+        grnId: grnOutcome.grnId,
         totalInvoiceCents,
         marginAlertsTriggered: createdAlerts.length,
         createdAlerts,
+        variancesCreated: grnOutcome.variancesCreated,
       });
     }
   );
@@ -935,6 +998,221 @@ export async function inventoryRoutes(app: FastifyInstance) {
 
       if (!result) return reply.status(404).send({ error: "Product not found" });
       return result;
+    }
+  );
+
+  // Milestone 1: Supplier OTIF Scorecards (90-day performance + open variance exposure)
+  app.get(
+    "/api/purchasing/supplier-scorecards",
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    async () => {
+      const rows = await db
+        .select({
+          supplierId: suppliers.id,
+          supplierName: suppliers.name,
+          leadTimeDays: suppliers.defaultLeadTimeDays,
+          paymentTermsDays: suppliers.paymentTermsDays,
+          contactEmail: suppliers.contactEmail,
+          poCount90d: analyticsSupplierScorecards.poCount90d,
+          grnCount90d: analyticsSupplierScorecards.grnCount90d,
+          onTimeRatePct: analyticsSupplierScorecards.onTimeRatePct,
+          inFullRatePct: analyticsSupplierScorecards.inFullRatePct,
+          otifRatePct: analyticsSupplierScorecards.otifRatePct,
+          costVarianceRatePct: analyticsSupplierScorecards.costVarianceRatePct,
+          avgLeadTimeDays: analyticsSupplierScorecards.avgLeadTimeDays,
+          leadTimeStdDays: analyticsSupplierScorecards.leadTimeStdDays,
+          totalVarianceCents: analyticsSupplierScorecards.totalVarianceCents,
+          grade: analyticsSupplierScorecards.grade,
+          computedAt: analyticsSupplierScorecards.computedAt,
+        })
+        .from(analyticsSupplierScorecards)
+        .innerJoin(suppliers, eq(analyticsSupplierScorecards.supplierId, suppliers.id))
+        .orderBy(asc(analyticsSupplierScorecards.otifRatePct));
+
+      const openVarRows = await db
+        .select({
+          supplierId: grnVariances.supplierId,
+          openCount: sql<number>`count(*)::int`,
+          openImpactCents: sql<number>`coalesce(sum(${grnVariances.financialImpactCents}), 0)::bigint`,
+        })
+        .from(grnVariances)
+        .where(inArray(grnVariances.status, ["open", "disputed"]))
+        .groupBy(grnVariances.supplierId);
+
+      const openVarMap = new Map(
+        openVarRows.map((r) => [
+          r.supplierId,
+          { openCount: Number(r.openCount), openImpactCents: Number(r.openImpactCents) },
+        ])
+      );
+
+      const scorecards = rows.map((r) => {
+        const exposure = openVarMap.get(r.supplierId) ?? { openCount: 0, openImpactCents: 0 };
+        return {
+          ...r,
+          paymentTerms: `Net ${r.paymentTermsDays}d`,
+          contactEmail: r.contactEmail ?? "—",
+          openVarianceCount: exposure.openCount,
+          openVarianceImpactCents: exposure.openImpactCents,
+        };
+      });
+
+      const avgOtifPct =
+        scorecards.length > 0
+          ? Number(
+              (
+                scorecards.reduce((s, r) => s + r.otifRatePct, 0) / scorecards.length
+              ).toFixed(1)
+            )
+          : 0;
+
+      return {
+        summary: {
+          supplierCount: scorecards.length,
+          avgOtifPct,
+          atRiskSuppliers: scorecards.filter((s) => s.grade === "C" || s.grade === "D").length,
+          totalOpenVarianceImpactCents: scorecards.reduce(
+            (s, r) => s + r.openVarianceImpactCents,
+            0
+          ),
+        },
+        scorecards,
+      };
+    }
+  );
+
+  // Milestone 1: 3-Way PO vs GRN vs Invoice Dock Variances
+  app.get(
+    "/api/purchasing/variances",
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    async (req, reply) => {
+      const q = req.query as { status?: string; supplierId?: string };
+      const conditions = [];
+      if (q.status && q.status !== "all") {
+        const validStatuses = ["open", "disputed", "resolved_credit_note", "written_off"];
+        if (!validStatuses.includes(q.status)) {
+          return reply.status(400).send({ error: "Invalid variance status filter." });
+        }
+        conditions.push(eq(grnVariances.status, q.status));
+      }
+      if (q.supplierId) {
+        if (!UuidSchema.safeParse(q.supplierId).success) {
+          return reply.status(400).send({ error: "Invalid supplierId filter." });
+        }
+        conditions.push(eq(grnVariances.supplierId, q.supplierId));
+      }
+
+      const rows = await db
+        .select({
+          id: grnVariances.id,
+          grnId: grnVariances.grnId,
+          poId: grnVariances.poId,
+          supplierId: grnVariances.supplierId,
+          supplierName: suppliers.name,
+          productId: grnVariances.productId,
+          sku: products.sku,
+          productName: products.name,
+          invoiceNumber: goodsReceipts.invoiceNumber,
+          poNumber: purchaseOrders.poNumber,
+          varianceType: grnVariances.varianceType,
+          orderedQtyUnits: grnVariances.orderedQtyUnits,
+          receivedQtyUnits: grnVariances.receivedQtyUnits,
+          poUnitCostCents: grnVariances.poUnitCostCents,
+          invoiceUnitCostCents: grnVariances.invoiceUnitCostCents,
+          financialImpactCents: grnVariances.financialImpactCents,
+          status: grnVariances.status,
+          resolutionNote: grnVariances.resolutionNote,
+          createdAt: grnVariances.createdAt,
+          resolvedAt: grnVariances.resolvedAt,
+        })
+        .from(grnVariances)
+        .innerJoin(suppliers, eq(grnVariances.supplierId, suppliers.id))
+        .innerJoin(products, eq(grnVariances.productId, products.id))
+        .innerJoin(goodsReceipts, eq(grnVariances.grnId, goodsReceipts.id))
+        .leftJoin(purchaseOrders, eq(grnVariances.poId, purchaseOrders.id))
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(grnVariances.createdAt))
+        .limit(120);
+
+      const summaryRows = await db
+        .select({
+          status: grnVariances.status,
+          cnt: sql<number>`count(*)::int`,
+          impactCents: sql<number>`coalesce(sum(${grnVariances.financialImpactCents}), 0)::bigint`,
+        })
+        .from(grnVariances)
+        .groupBy(grnVariances.status);
+
+      const summary = {
+        openCount: 0,
+        disputedCount: 0,
+        resolvedCount: 0,
+        openImpactCents: 0,
+      };
+      for (const s of summaryRows) {
+        const cnt = Number(s.cnt);
+        const imp = Number(s.impactCents);
+        if (s.status === "open") {
+          summary.openCount += cnt;
+          summary.openImpactCents += imp;
+        } else if (s.status === "disputed") {
+          summary.disputedCount += cnt;
+          summary.openImpactCents += imp;
+        } else {
+          summary.resolvedCount += cnt;
+        }
+      }
+
+      return { summary, variances: rows };
+    }
+  );
+
+  // Resolve, Dispute, or Write Off a 3-Way GRN Dock Variance
+  app.patch(
+    "/api/purchasing/variances/:id",
+    { preHandler: [requireRole(["owner", "manager"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid variance ID format." });
+      }
+      const parsed = UpdateVarianceStatusSchema.safeParse(req.body);
+      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+
+      const actorName = req.authUser!.fullName;
+      const isResolved =
+        parsed.data.status === "resolved_credit_note" || parsed.data.status === "written_off";
+
+      const [updated] = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(grnVariances)
+          .set({
+            status: parsed.data.status,
+            resolutionNote: parsed.data.resolutionNote ?? null,
+            resolvedAt: isResolved ? new Date() : null,
+          })
+          .where(eq(grnVariances.id, id))
+          .returning();
+
+        if (!row) return [];
+
+        await tx.insert(auditLogs).values({
+          actor: actorName,
+          action: "grn_variance_update",
+          entityType: "grn_variance",
+          entityId: row.id,
+          detailsJson: {
+            status: parsed.data.status,
+            resolutionNote: parsed.data.resolutionNote ?? null,
+            financialImpactCents: row.financialImpactCents,
+          },
+        });
+
+        return [row];
+      });
+
+      if (!updated) return reply.status(404).send({ error: "GRN variance not found." });
+      return { variance: updated };
     }
   );
 }

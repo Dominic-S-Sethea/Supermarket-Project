@@ -3,6 +3,7 @@ import type { UserRole } from "@supermarket/shared";
 import {
   BarChart3,
   Boxes,
+  Gift,
   Grid3X3,
   LogOut,
   PackageCheck,
@@ -17,6 +18,7 @@ import { LoginScreen, type SessionUser } from "./components/LoginScreen";
 import { AbcLossView } from "./views/AbcLossView";
 import { CatalogView } from "./views/CatalogView";
 import { ForecastingBasketView } from "./views/ForecastingBasketView";
+import { LoyaltyPromosView } from "./views/LoyaltyPromosView";
 import { OperationsView } from "./views/OperationsView";
 import { OverviewView } from "./views/OverviewView";
 import { PosTerminalView } from "./views/PosTerminalView";
@@ -27,6 +29,7 @@ type TabId =
   | "catalog"
   | "pos"
   | "operations"
+  | "loyalty"
   | "abc-lp"
   | "forecasting"
   | "shift-diagnostics";
@@ -37,11 +40,11 @@ interface MetaPayload {
 }
 
 const ROLE_TABS: Record<UserRole, TabId[]> = {
-  owner: ["overview", "pos", "catalog", "operations", "abc-lp", "forecasting", "shift-diagnostics"],
-  manager: ["overview", "pos", "catalog", "operations", "abc-lp", "forecasting", "shift-diagnostics"],
+  owner: ["overview", "pos", "catalog", "operations", "loyalty", "abc-lp", "forecasting", "shift-diagnostics"],
+  manager: ["overview", "pos", "catalog", "operations", "loyalty", "abc-lp", "forecasting", "shift-diagnostics"],
   cashier: ["pos", "catalog"],
   stock_clerk: ["catalog", "operations"],
-  accountant: ["overview", "abc-lp", "forecasting", "shift-diagnostics"],
+  accountant: ["overview", "loyalty", "abc-lp", "forecasting", "shift-diagnostics"],
 };
 
 export function App() {
@@ -211,6 +214,16 @@ export function App() {
               )}
             </button>
           )}
+          {allowedTabs.includes("loyalty") && (
+            <button
+              id="nav-loyalty"
+              className={`nav-btn ${activeTab === "loyalty" ? "active" : ""}`}
+              onClick={() => setActiveTab("loyalty")}
+            >
+              <Gift size={16} />
+              <span>Loyalty &amp; Promos</span>
+            </button>
+          )}
         </nav>
 
         {(allowedTabs.includes("abc-lp") ||
@@ -301,7 +314,11 @@ export function App() {
         {/* Keep PosTerminalView mounted across tab switches so active basket & offline state persist */}
         {allowedTabs.includes("pos") && (
           <div style={{ display: activeTab === "pos" ? "block" : "none" }}>
-            <PosTerminalView cashierName={user.fullName} isActive={activeTab === "pos"} />
+            <PosTerminalView
+              cashierName={user.fullName}
+              userRole={user.role}
+              isActive={activeTab === "pos"}
+            />
           </div>
         )}
         {activeTab === "operations" && (
@@ -311,6 +328,9 @@ export function App() {
             userRole={user.role}
             onCountsChanged={() => void loadMetaAndAlerts(user)}
           />
+        )}
+        {activeTab === "loyalty" && (
+          <LoyaltyPromosView key={`loy-${refreshTick}`} userRole={user.role} />
         )}
         {activeTab === "abc-lp" && (
           <AbcLossView key={`abc-${refreshTick}`} userRole={user.role} />

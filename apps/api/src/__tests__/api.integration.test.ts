@@ -7,23 +7,32 @@ import {
   aiBriefings,
   aiConversations,
   aiProposedActions,
+  analyticsDynamicMarkdowns,
+  analyticsPhantomStock,
   auditLogs,
+  customers,
   db,
   goodsReceipts,
+  grnVariances,
   hourlyStockSnapshots,
   inventoryBatches,
+  loyaltyLedger,
   marginAlerts,
   pool,
   posShifts,
   productBarcodes,
   products,
+  promotions,
   purchaseOrderLines,
   purchaseOrders,
   sales,
   shelfTagQueue,
   shiftExperiments,
+  shiftRosters,
   stockMovements,
   storeFootfall,
+  storeTasks,
+  targetedCoupons,
   users,
 } from "../db/index.js";
 import { SESSION_COOKIE_NAME } from "../plugins/auth.js";
@@ -1010,6 +1019,657 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const promoAction = chatData.actions.find((a) => a.actionType === "create_promo");
     expect(promoAction).toBeDefined();
     expect(promoAction?.previewJson.daypartWindow).toBe("08:00-12:00");
+    await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
+  });
+
+  it("Milestone 1: serves Supplier OTIF scorecards, auto-detects PO vs GRN short/cost variances, and resolves them with RBAC", async () => {
+    // 1. Cashier blocked from scorecards & variances
+    const cashierSc = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/supplier-scorecards",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierSc.statusCode).toBe(403);
+
+    const cashierVar = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/variances",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierVar.statusCode).toBe(403);
+
+    // 2. Owner reads seeded Supplier OTIF Scorecards
+    const scRes = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/supplier-scorecards",
+      headers: authHeaders(),
+    });
+    expect(scRes.statusCode).toBe(200);
+    const scBody = scRes.json() as {
+      summary: { supplierCount: number; avgOtifPct: number };
+      scorecards: { supplierId: string; grade: string; otifRatePct: number }[];
+    };
+    expect(scBody.summary.supplierCount).toBeGreaterThanOrEqual(5);
+    expect(scBody.scorecards.length).toBeGreaterThanOrEqual(5);
+
+    // 3. Create PO (4 cases @ origAvgCost) and receive short (2 cases) at +20% unit cost overcharge
+    const prodRes = await app.inject({
+      method: "GET",
+      url: "/api/products?page=1&pageSize=1",
+      headers: authHeaders(),
+    });
+    const prod = prodRes.json().items[0] as { id: string; avgCostCents: number };
+    const origAvgCost = prod.avgCostCents;
+    const supplierId = scBody.scorecards[0].supplierId;
+
+    const poRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/orders",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        notes: "M1 3-way variance test PO",
+        lines: [
+          {
+            productId: prod.id,
+            caseQty: 10,
+            orderedCases: 4,
+            unitCostCents: Math.max(100, origAvgCost),
+          },
+        ],
+      },
+    });
+    expect(poRes.statusCode).toBe(201);
+    const po = poRes.json() as { id: string };
+
+    const poUnitCost = Math.max(100, origAvgCost);
+    const overchargedUnitCost = Math.round(poUnitCost * 1.25);
+    const invNo = `TEST-M1-VAR-${Date.now()}`;
+    const grnRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/grn",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        poId: po.id,
+        invoiceNumber: invNo,
+        lines: [
+          {
+            productId: prod.id,
+            caseQty: 10,
+            paidCases: 2,
+            freeBonusCases: 0,
+            invoiceLineTotalCents: 20 * overchargedUnitCost,
+          },
+        ],
+      },
+    });
+    expect(grnRes.statusCode).toBe(201);
+    const grnBody = grnRes.json() as { grnId: string; variancesCreated: number };
+    expect(grnBody.variancesCreated).toBe(2); // short_delivery + cost_overcharge
+
+    // 4. Query variances endpoint and verify both variance types exist
+    const varListRes = await app.inject({
+      method: "GET",
+      url: `/api/purchasing/variances?status=open&supplierId=${supplierId}`,
+      headers: authHeaders(),
+    });
+    expect(varListRes.statusCode).toBe(200);
+    const createdVars = (
+      varListRes.json().variances as { id: string; grnId: string; varianceType: string }[]
+    ).filter((v) => v.grnId === grnBody.grnId);
+    expect(createdVars.map((v) => v.varianceType).sort()).toEqual([
+      "cost_overcharge",
+      "short_delivery",
+    ]);
+
+    // 5. Resolve one variance via PATCH (credit note), verify resolvedAt & audit; cashier blocked
+    const targetVar = createdVars[0];
+    const cashierPatch = await app.inject({
+      method: "PATCH",
+      url: `/api/purchasing/variances/${targetVar.id}`,
+      headers: authHeaders(cashierToken),
+      payload: { status: "disputed" },
+    });
+    expect(cashierPatch.statusCode).toBe(403);
+
+    const resolveRes = await app.inject({
+      method: "PATCH",
+      url: `/api/purchasing/variances/${targetVar.id}`,
+      headers: authHeaders(),
+      payload: {
+        status: "resolved_credit_note",
+        resolutionNote: "Credit memo CN-9921 issued by distributor",
+      },
+    });
+    expect(resolveRes.statusCode).toBe(200);
+    expect(resolveRes.json().variance.status).toBe("resolved_credit_note");
+    expect(resolveRes.json().variance.resolvedAt).toBeTruthy();
+
+    // Cleanup test rows and restore avgCostCents
+    await db.delete(marginAlerts).where(eq(marginAlerts.grnId, grnBody.grnId));
+    await db.delete(stockMovements).where(eq(stockMovements.refId, grnBody.grnId));
+    await db.delete(grnVariances).where(eq(grnVariances.grnId, grnBody.grnId));
+    await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnBody.grnId));
+    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, po.id));
+    await db.update(products).set({ avgCostCents: origAvgCost }).where(eq(products.id, prod.id));
+  });
+
+  it("Milestone 2: supports Phantom Stock verification, Dynamic Markdown application (promo + tag), and 07:30 Shelf Tag ZPL print queue with RBAC", async () => {
+    const clerkLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "clerk1", pin: "2222" },
+    });
+    expect(clerkLogin.statusCode).toBe(200);
+    const clerkToken = (clerkLogin.json() as { token: string }).token;
+
+    // 1. Phantom stock listing: cashier blocked, clerk allowed
+    const cashierPh = await app.inject({
+      method: "GET",
+      url: "/api/inventory/phantom-stock",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierPh.statusCode).toBe(403);
+
+    const phRes = await app.inject({
+      method: "GET",
+      url: "/api/inventory/phantom-stock",
+      headers: authHeaders(clerkToken),
+    });
+    expect(phRes.statusCode).toBe(200);
+    const phBody = phRes.json() as {
+      summary: { totalFlagged: number };
+      items: {
+        productId: string;
+        status: string;
+        bookStockUnits: number;
+        estimatedValueAtRiskCents: number;
+      }[];
+    };
+    expect(phBody.summary.totalFlagged).toBeGreaterThan(0);
+    const samplePh = phBody.items[0];
+
+    // Clerk verifies phantom stock OK (non-destructive check, restored right after)
+    const verifyRes = await app.inject({
+      method: "POST",
+      url: `/api/inventory/phantom-stock/${samplePh.productId}/verify`,
+      headers: authHeaders(clerkToken),
+      payload: { markVerifiedOk: true, note: "Integration test shelf spot-check" },
+    });
+    expect(verifyRes.statusCode).toBe(200);
+    expect(verifyRes.json().status).toBe("verified_ok");
+
+    // Restore original phantom row state
+    await db
+      .update(analyticsPhantomStock)
+      .set({
+        status: samplePh.status,
+        bookStockUnits: samplePh.bookStockUnits,
+        estimatedValueAtRiskCents: samplePh.estimatedValueAtRiskCents,
+      })
+      .where(eq(analyticsPhantomStock.productId, samplePh.productId));
+
+    // 2. Dynamic markdowns: clerk can view, clerk CANNOT apply (403), owner CAN apply (201)
+    const mdRes = await app.inject({
+      method: "GET",
+      url: "/api/inventory/dynamic-markdowns",
+      headers: authHeaders(clerkToken),
+    });
+    expect(mdRes.statusCode).toBe(200);
+    const mdBody = mdRes.json() as {
+      items: { batchId: string; recommendedDiscountBp: number; status: string }[];
+    };
+    expect(mdBody.items.length).toBeGreaterThan(0);
+    const sampleMd = mdBody.items[0];
+    const [origBatch] = await db
+      .select({ status: inventoryBatches.status })
+      .from(inventoryBatches)
+      .where(eq(inventoryBatches.id, sampleMd.batchId));
+
+    const clerkApply = await app.inject({
+      method: "POST",
+      url: `/api/inventory/dynamic-markdowns/${sampleMd.batchId}/apply`,
+      headers: authHeaders(clerkToken),
+      payload: { discountBp: sampleMd.recommendedDiscountBp },
+    });
+    expect(clerkApply.statusCode).toBe(403);
+
+    const ownerApply = await app.inject({
+      method: "POST",
+      url: `/api/inventory/dynamic-markdowns/${sampleMd.batchId}/apply`,
+      headers: authHeaders(),
+      payload: { discountBp: sampleMd.recommendedDiscountBp, minMarginGuardBp: 0 },
+    });
+    expect(ownerApply.statusCode).toBe(201);
+    const applied = ownerApply.json() as {
+      promotionId: string;
+      shelfTagId: string | null;
+      status: string;
+    };
+    expect(applied.status).toBe("applied");
+    expect(applied.shelfTagId).toBeTruthy();
+
+    // 3. 07:30 Shelf Tag Queue: clerk lists pending & prints the newly queued clearance tag -> ZPL
+    const queueRes = await app.inject({
+      method: "GET",
+      url: "/api/labels/queue?status=pending",
+      headers: authHeaders(clerkToken),
+    });
+    expect(queueRes.statusCode).toBe(200);
+    const queuedTags = queueRes.json().tags as { id: string }[];
+    expect(queuedTags.some((t) => t.id === applied.shelfTagId)).toBe(true);
+
+    const printRes = await app.inject({
+      method: "POST",
+      url: "/api/labels/queue/print",
+      headers: authHeaders(clerkToken),
+      payload: { tagIds: [applied.shelfTagId] },
+    });
+    expect(printRes.statusCode).toBe(200);
+    const printed = printRes.json() as { printedCount: number; zpl: string };
+    expect(printed.printedCount).toBe(1);
+    expect(printed.zpl).toContain("^XA");
+    expect(printed.zpl).toContain("CLEARANCE");
+    expect(printed.zpl).toContain("^XZ");
+
+    // Cleanup M2 test mutations
+    if (applied.shelfTagId) {
+      await db.delete(shelfTagQueue).where(eq(shelfTagQueue.id, applied.shelfTagId));
+    }
+    await db.delete(promotions).where(eq(promotions.id, applied.promotionId));
+    await db
+      .update(analyticsDynamicMarkdowns)
+      .set({ status: sampleMd.status })
+      .where(eq(analyticsDynamicMarkdowns.batchId, sampleMd.batchId));
+    if (origBatch) {
+      await db
+        .update(inventoryBatches)
+        .set({ status: origBatch.status })
+        .where(eq(inventoryBatches.id, sampleMd.batchId));
+    }
+  });
+
+  it("Milestone 3: supports Loyalty CRM enrollment, single-use coupon concurrency locking, points accrual/clawback, and promo toggling", async () => {
+    // 1. Enroll new loyalty customer + duplicate phone 409 check
+    const uniquePhone = `555-${String(Date.now()).slice(-7)}`;
+    const enrollRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(cashierToken),
+      payload: {
+        phone: uniquePhone,
+        fullName: "Test Shopper Loyalty",
+        email: "loyalty.test@example.com",
+      },
+    });
+    expect(enrollRes.statusCode).toBe(201);
+    const customer = enrollRes.json().customer as { id: string; phone: string };
+
+    const dupEnroll = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(cashierToken),
+      payload: { phone: uniquePhone, fullName: "Duplicate Phone" },
+    });
+    expect(dupEnroll.statusCode).toBe(409);
+
+    // 2. Cashier cannot issue coupons (403); owner issues single-use $2 coupon (min $5)
+    const couponCode = `TESTC-${String(Date.now()).slice(-6)}`;
+    const cashierIssue = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(cashierToken),
+      payload: { code: couponCode, discountCents: 200, minBasketCents: 500, validDays: 7 },
+    });
+    expect(cashierIssue.statusCode).toBe(403);
+
+    const issueRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(),
+      payload: {
+        code: couponCode,
+        customerId: customer.id,
+        discountCents: 200,
+        minBasketCents: 500,
+        validDays: 7,
+      },
+    });
+    expect(issueRes.statusCode).toBe(201);
+    const issuedCoupon = issueRes.json().coupon as { id: string; code: string };
+
+    // 3. Validate coupon: fails below min basket, passes at $10 with matching customer
+    const valLow = await app.inject({
+      method: "GET",
+      url: `/api/loyalty/coupons/validate/${couponCode}?basketCents=300&customerId=${customer.id}`,
+      headers: authHeaders(cashierToken),
+    });
+    expect(valLow.statusCode).toBe(200);
+    expect(valLow.json().valid).toBe(false);
+
+    const valOk = await app.inject({
+      method: "GET",
+      url: `/api/loyalty/coupons/validate/${couponCode}?basketCents=1000&customerId=${customer.id}`,
+      headers: authHeaders(cashierToken),
+    });
+    expect(valOk.statusCode).toBe(200);
+    expect(valOk.json().valid).toBe(true);
+    expect(valOk.json().coupon.discountCents).toBe(200);
+
+    // 4. Concurrent double-redemption race on single-use coupon -> strictly one 201 and one 409!
+    const bootRes = await app.inject({
+      method: "GET",
+      url: "/api/pos/bootstrap",
+      headers: authHeaders(cashierToken),
+    });
+    const boot = bootRes.json() as {
+      products: { id: string; taxRateId: string; avgCostCents: number; requiresAgeCheck: boolean }[];
+      barcodes: { productId: string; barcode: string; packQty: number; packLabel: string; sellPriceCents: number }[];
+      taxRates: { id: string; rateBp: number; isInclusive: boolean }[];
+    };
+    const safeProd = boot.products.find((p) => !p.requiresAgeCheck)!;
+    const bc = boot.barcodes.find((b) => b.productId === safeProd.id)!;
+    const tax = boot.taxRates.find((t) => t.id === safeProd.taxRateId)!;
+
+    const unitPrice = 1000;
+    const discountCents = 200;
+    const afterDiscount = unitPrice - discountCents; // 800c
+    const lineTax = tax.isInclusive
+      ? Math.round((afterDiscount * tax.rateBp) / (10000 + tax.rateBp))
+      : Math.round((afterDiscount * tax.rateBp) / 10000);
+    const lineTotal = tax.isInclusive ? afterDiscount : afterDiscount + lineTax;
+
+    const makeSalePayload = (saleId: string, rcpt: string) => ({
+      id: saleId,
+      registerCode: "REG-01",
+      receiptNo: rcpt,
+      kind: "sale" as const,
+      soldAt: new Date().toISOString(),
+      ageVerified: false,
+      customerId: customer.id,
+      couponCode,
+      lines: [
+        {
+          id: generateUuidV7(),
+          productId: safeProd.id,
+          scannedBarcode: bc.barcode,
+          packLabel: bc.packLabel,
+          packQty: bc.packQty,
+          qtyPacks: 1,
+          unitPriceCents: unitPrice,
+          unitCostCents: safeProd.avgCostCents,
+          discountCents,
+          taxRateBp: tax.rateBp,
+          taxCents: lineTax,
+          lineTotalCents: lineTotal,
+        },
+      ],
+      payments: [
+        {
+          id: generateUuidV7(),
+          method: "card" as const,
+          amountCents: lineTotal,
+          tenderedCents: lineTotal,
+          changeCents: 0,
+        },
+      ],
+    });
+
+    const raceAId = generateUuidV7();
+    const raceBId = generateUuidV7();
+    const payloadA = makeSalePayload(raceAId, `TEST-CPN-A-${raceAId.slice(-6)}`);
+    const payloadB = makeSalePayload(raceBId, `TEST-CPN-B-${raceBId.slice(-6)}`);
+
+    const [resA, resB] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: payloadA,
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: payloadB,
+      }),
+    ]);
+    expect([resA.statusCode, resB.statusCode].sort()).toEqual([201, 409]);
+
+    const winnerPayload = resA.statusCode === 201 ? payloadA : payloadB;
+    const winnerBody = (resA.statusCode === 201 ? resA : resB).json() as {
+      id: string;
+      pointsEarned: number;
+    };
+    expect(winnerBody.pointsEarned).toBe(Math.floor(lineTotal / 100));
+
+    // Idempotent retry of winning sale ID still returns 200 duplicate: true!
+    const retryWin = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(cashierToken),
+      payload: winnerPayload,
+    });
+    expect(retryWin.statusCode).toBe(200);
+    expect(retryWin.json().duplicate).toBe(true);
+
+    // 5. Verify customer accrued points and recent-sales includes lines + alreadyVoided=false
+    const [custAfterSale] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.id, customer.id));
+    expect(custAfterSale.pointsBalance).toBe(Math.floor(lineTotal / 100));
+
+    const recentRes = await app.inject({
+      method: "GET",
+      url: "/api/pos/recent-sales",
+      headers: authHeaders(),
+    });
+    expect(recentRes.statusCode).toBe(200);
+    const recentRow = (
+      recentRes.json().sales as { id: string; alreadyVoided: boolean; lines: unknown[] }[]
+    ).find((s) => s.id === winnerPayload.id);
+    expect(recentRow).toBeDefined();
+    expect(recentRow?.alreadyVoided).toBe(false);
+    expect(recentRow?.lines.length).toBe(1);
+
+    // 6. Owner voids the sale -> points clawed back to 0
+    const voidId = generateUuidV7();
+    const voidRes = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(),
+      payload: {
+        ...winnerPayload,
+        id: voidId,
+        receiptNo: `TEST-CPN-VOID-${voidId.slice(-6)}`,
+        kind: "void",
+        originalSaleId: winnerPayload.id,
+        couponCode: null,
+        lines: [{ ...winnerPayload.lines[0], id: generateUuidV7() }],
+        payments: [{ ...winnerPayload.payments[0], id: generateUuidV7() }],
+      },
+    });
+    expect(voidRes.statusCode).toBe(201);
+    const [custAfterVoid] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.id, customer.id));
+    expect(custAfterVoid.pointsBalance).toBe(0);
+
+    // 7. Create & toggle a promotion via PATCH /api/promotions/:id
+    const promoCreate = await app.inject({
+      method: "POST",
+      url: "/api/promotions",
+      headers: authHeaders(),
+      payload: {
+        name: "Test M3 Morning Basket Promo",
+        promoType: "basket_threshold",
+        priority: 30,
+        combinable: true,
+        minMarginGuardBp: 500,
+        daypartStartHour: 8,
+        daypartEndHour: 12,
+        rulesJson: { minBasketCents: 2000, flatDiscountCents: 200 },
+      },
+    });
+    expect(promoCreate.statusCode).toBe(201);
+    const createdPromoId = (promoCreate.json() as { id: string }).id;
+
+    const promoPause = await app.inject({
+      method: "PATCH",
+      url: `/api/promotions/${createdPromoId}`,
+      headers: authHeaders(),
+      payload: { active: false },
+    });
+    expect(promoPause.statusCode).toBe(200);
+    expect(promoPause.json().promotion.active).toBe(false);
+
+    // Cleanup test rows
+    await db.delete(promotions).where(eq(promotions.id, createdPromoId));
+    await db.delete(loyaltyLedger).where(eq(loyaltyLedger.customerId, customer.id));
+    await db.delete(targetedCoupons).where(eq(targetedCoupons.id, issuedCoupon.id));
+    await db
+      .delete(stockMovements)
+      .where(inArray(stockMovements.refId, [winnerPayload.id, voidId]));
+    await db.delete(sales).where(inArray(sales.id, [voidId, winnerPayload.id]));
+    await db.delete(customers).where(eq(customers.id, customer.id));
+  });
+
+  it("Milestone 3: supports Hourly Lane Staffing Plan generation/assignment and Daily Floor Task Checklist completion with RBAC", async () => {
+    const clerkLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "clerk1", pin: "2222" },
+    });
+    expect(clerkLogin.statusCode).toBe(200);
+    const clerkToken = (clerkLogin.json() as { token: string }).token;
+
+    // 1. Cashier blocked from staffing plan & tasks
+    const cashierStaff = await app.inject({
+      method: "GET",
+      url: "/api/operations/staffing-plan",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierStaff.statusCode).toBe(403);
+
+    const cashierTasks = await app.inject({
+      method: "GET",
+      url: "/api/operations/tasks",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierTasks.statusCode).toBe(403);
+
+    // 2. Generate staffing plan for a dedicated test date, assign a cashier, and confirm
+    const testPlanDate = "2027-01-15";
+    const genRes = await app.inject({
+      method: "POST",
+      url: "/api/operations/staffing-plan/generate",
+      headers: authHeaders(),
+      payload: { planDate: testPlanDate },
+    });
+    expect(genRes.statusCode).toBe(201);
+    expect(genRes.json().generatedCount).toBe(14);
+
+    const listPlan = await app.inject({
+      method: "GET",
+      url: `/api/operations/staffing-plan?date=${testPlanDate}`,
+      headers: authHeaders(),
+    });
+    expect(listPlan.statusCode).toBe(200);
+    const planBody = listPlan.json() as {
+      staffOptions: { id: string; fullName: string }[];
+      slots: { id: string; hour: number }[];
+    };
+    expect(planBody.slots.length).toBe(14);
+    expect(planBody.staffOptions.length).toBeGreaterThan(0);
+
+    const patchSlot = await app.inject({
+      method: "PATCH",
+      url: `/api/operations/staffing-plan/${planBody.slots[0].id}`,
+      headers: authHeaders(),
+      payload: {
+        assignedStaffId: planBody.staffOptions[0].id,
+        status: "confirmed",
+        recommendedLanes: 2,
+      },
+    });
+    expect(patchSlot.statusCode).toBe(200);
+    expect(patchSlot.json().slot.status).toBe("confirmed");
+    expect(patchSlot.json().slot.assignedCashierName).toBe(planBody.staffOptions[0].fullName);
+
+    // 3. Daily Floor Tasks: clerk lists tasks & completes one, then restore original state
+    const tasksRes = await app.inject({
+      method: "GET",
+      url: "/api/operations/tasks?date=all",
+      headers: authHeaders(clerkToken),
+    });
+    expect(tasksRes.statusCode).toBe(200);
+    const taskList = tasksRes.json().tasks as {
+      id: string;
+      status: string;
+      completedBy: string | null;
+      completedAt: string | null;
+      completionNote: string | null;
+    }[];
+    expect(taskList.length).toBeGreaterThan(0);
+    const sampleTask = taskList[0];
+
+    const compRes = await app.inject({
+      method: "POST",
+      url: `/api/operations/tasks/${sampleTask.id}/complete`,
+      headers: authHeaders(clerkToken),
+      payload: { note: "Restocked top shelf before 08:00" },
+    });
+    expect(compRes.statusCode).toBe(200);
+    expect(compRes.json().task.status).toBe("completed");
+    expect(compRes.json().task.completedBy).toContain("Marcus");
+
+    // Cleanup test staffing plan & restore task state
+    await db.delete(shiftRosters).where(eq(shiftRosters.planDate, testPlanDate));
+    await db
+      .update(storeTasks)
+      .set({
+        status: sampleTask.status,
+        completedBy: sampleTask.completedBy,
+        completedAt: sampleTask.completedAt ? new Date(sampleTask.completedAt) : null,
+        completionNote: sampleTask.completionNote,
+      })
+      .where(eq(storeTasks.id, sampleTask.id));
+  });
+
+  it("Production Hardening: verifies live DB /api/health readiness probe and M1-M3 AI Copilot read tools", async () => {
+    const liveRes = await app.inject({ method: "GET", url: "/api/health/live" });
+    expect(liveRes.statusCode).toBe(200);
+    expect(liveRes.json().status).toBe("ok");
+
+    const healthRes = await app.inject({ method: "GET", url: "/api/health" });
+    expect(healthRes.statusCode).toBe(200);
+    const hBody = healthRes.json() as { status: string; db: string; dbLatencyMs: number };
+    expect(hBody.status).toBe("ok");
+    expect(hBody.db).toBe("connected");
+    expect(hBody.dbLatencyMs).toBeGreaterThanOrEqual(0);
+
+    // Exercise all 4 new M1-M3 Copilot tools through the chat fallback router
+    const chatRes = await app.inject({
+      method: "POST",
+      url: "/api/ai/chat",
+      headers: authHeaders(),
+      payload: {
+        message: "Show supplier OTIF scorecards, phantom stock ghost SKUs, dynamic markdowns, and today's floor task checklist",
+      },
+    });
+    expect(chatRes.statusCode).toBe(200);
+    const chatData = chatRes.json() as {
+      conversationId: string;
+      toolTraces: { tool: string }[];
+    };
+    const toolsCalled = new Set(chatData.toolTraces.map((t) => t.tool));
+    expect(toolsCalled.has("get_supplier_scorecards")).toBe(true);
+    expect(toolsCalled.has("get_phantom_stock_alerts")).toBe(true);
+    expect(toolsCalled.has("get_dynamic_markdowns")).toBe(true);
+    expect(toolsCalled.has("get_floor_tasks")).toBe(true);
     await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
   });
 });

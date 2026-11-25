@@ -6,6 +6,7 @@ import {
   generateUuidV7,
   type CartInputLine,
   type PromotionRule,
+  type UserRole,
 } from "@supermarket/shared";
 import {
   AlertTriangle,
@@ -13,12 +14,18 @@ import {
   CloudOff,
   CreditCard,
   DollarSign,
+  History,
+  Play,
   Receipt,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   Sparkles,
+  Ticket,
   Trash2,
+  UserCheck,
   Wifi,
+  X,
 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import {
@@ -37,13 +44,69 @@ type BootstrapBarcode = PosBootstrapSnapshot["barcodes"][number];
 type BootstrapTax = PosBootstrapSnapshot["taxRates"][number];
 type BasketRule = NonNullable<PosBootstrapSnapshot["basketRules"]>[number];
 
+interface PosCustomer {
+  id: string;
+  phone: string;
+  fullName: string;
+  pointsBalance: number;
+  rfmSegment: string;
+}
+
+interface AppliedCoupon {
+  id: string;
+  code: string;
+  discountCents: number;
+  minBasketCents: number;
+  customerId: string | null;
+}
+
+interface RecentSaleLine {
+  id: string;
+  productId: string;
+  productName: string;
+  scannedBarcode: string;
+  packLabel: string;
+  packQty: number;
+  qtyPacks: number;
+  unitPriceCents: number;
+  unitCostCents: number;
+  discountCents: number;
+  taxRateBp: number;
+  taxCents: number;
+  lineTotalCents: number;
+}
+
+interface RecentSalePayment {
+  id: string;
+  method: "cash" | "card" | "mobile_pay" | "voucher";
+  amountCents: number;
+}
+
+interface RecentSaleRow {
+  id: string;
+  registerCode: string;
+  receiptNo: string;
+  kind: "sale" | "refund" | "void";
+  originalSaleId: string | null;
+  customerId: string | null;
+  cashierName: string;
+  totalCents: number;
+  soldAt: string;
+  alreadyVoided: boolean;
+  lines: RecentSaleLine[];
+  payments: RecentSalePayment[];
+}
+
 export function PosTerminalView({
   cashierName = "Elena Morales",
+  userRole = "owner",
   isActive = true,
 }: {
   cashierName?: string;
+  userRole?: UserRole;
   isActive?: boolean;
 }) {
+  const canVoidOrRefund = userRole === "owner" || userRole === "manager";
   const [productsMap, setProductsMap] = useState<Map<string, BootstrapProduct>>(new Map());
   const [barcodesMap, setBarcodesMap] = useState<Map<string, BootstrapBarcode>>(new Map());
   const [primaryByProductMap, setPrimaryByProductMap] = useState<Map<string, BootstrapBarcode>>(
@@ -72,6 +135,28 @@ export function PosTerminalView({
   const [submittingSale, setSubmittingSale] = useState(false);
   const [syncingQueue, setSyncingQueue] = useState(false);
   const [daypartPreview, setDaypartPreview] = useState<"live" | "morning" | "evening">("live");
+
+  // Loyalty Customer & Single-Use Coupon
+  const [customerLookupInput, setCustomerLookupInput] = useState("");
+  const [customerResults, setCustomerResults] = useState<PosCustomer[]>([]);
+  const [attachedCustomer, setAttachedCustomer] = useState<PosCustomer | null>(null);
+  const [couponInput, setCouponInput] = useState("");
+  const [appliedCoupon, setAppliedCoupon] = useState<AppliedCoupon | null>(null);
+  const [couponFeedback, setCouponFeedback] = useState<string | null>(null);
+  const [validatingCoupon, setValidatingCoupon] = useState(false);
+
+  // Open Shift Modal
+  const [showShiftOpen, setShowShiftOpen] = useState(false);
+  const [openFloatInput, setOpenFloatInput] = useState("300.00");
+  const [openingShift, setOpeningShift] = useState(false);
+  const [openShiftBanner, setOpenShiftBanner] = useState<string | null>(null);
+
+  // Recent Receipts & Manager Void/Refund Modal
+  const [showRecentReceipts, setShowRecentReceipts] = useState(false);
+  const [recentSales, setRecentSales] = useState<RecentSaleRow[]>([]);
+  const [loadingRecent, setLoadingRecent] = useState(false);
+  const [busyReceiptId, setBusyReceiptId] = useState<string | null>(null);
+  const [recentError, setRecentError] = useState<string | null>(null);
 
   // Blind Shift Close Modal
   const [showShiftClose, setShowShiftClose] = useState(false);
@@ -107,25 +192,29 @@ export function PosTerminalView({
     }
   }, [cart.length, ageVerified]);
 
+  const anyModalOpen = Boolean(pendingAgeItem || showShiftClose || showShiftOpen || showRecentReceipts);
+
   // Re-focus barcode scanner input when POS tab becomes active and no modal is open
   useEffect(() => {
-    if (isActive && !pendingAgeItem && !showShiftClose) {
+    if (isActive && !anyModalOpen) {
       scanRef.current?.focus();
     }
-  }, [isActive, pendingAgeItem, showShiftClose]);
+  }, [isActive, anyModalOpen]);
 
   // Escape closes modals and restores scanner focus
   useEffect(() => {
-    if (!pendingAgeItem && !showShiftClose) return;
+    if (!anyModalOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setPendingAgeItem(null);
         setShowShiftClose(false);
+        setShowShiftOpen(false);
+        setShowRecentReceipts(false);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [pendingAgeItem, showShiftClose]);
+  }, [anyModalOpen]);
 
   const hydrateFromSnapshot = (
     data: PosBootstrapSnapshot,
@@ -236,9 +325,25 @@ export function PosTerminalView({
   const evalHour =
     daypartPreview === "morning" ? 9 : daypartPreview === "evening" ? 18 : new Date().getHours();
 
+  const rawBasketSubtotalCents = useMemo(
+    () => cart.reduce((s, l) => s + l.unitPriceCents * l.qtyPacks, 0),
+    [cart]
+  );
+
+  const couponEligibleNow = Boolean(
+    appliedCoupon &&
+      rawBasketSubtotalCents >= appliedCoupon.minBasketCents &&
+      (!appliedCoupon.customerId || appliedCoupon.customerId === attachedCustomer?.id)
+  );
+
   const evaluated = useMemo(
-    () => evaluateCart(cart, promos, { evalHour, evalNow: new Date() }),
-    [cart, promos, evalHour]
+    () =>
+      evaluateCart(cart, promos, {
+        evalHour,
+        evalNow: new Date(),
+        couponDiscountCents: couponEligibleNow ? appliedCoupon!.discountCents : 0,
+      }),
+    [cart, promos, evalHour, couponEligibleNow, appliedCoupon]
   );
 
   // Offline-safe Basket Upsell Nudges derived from cached analytics_basket_rules
@@ -404,6 +509,9 @@ export function PosTerminalView({
       "        SUPERMARKET OS — LANE 01        ",
       `Receipt: ${receiptNo}   ${statusTag}`,
       `Cashier: ${cashierName}   ${new Date().toLocaleTimeString()}`,
+      attachedCustomer
+        ? `Loyalty: ${attachedCustomer.fullName} (${attachedCustomer.phone})`
+        : "",
       "----------------------------------------",
       ...evaluated.lines.map(
         (l) =>
@@ -411,7 +519,10 @@ export function PosTerminalView({
       ),
       "----------------------------------------",
       `Subtotal:           ${formatMoney(evaluated.subtotalBeforeDiscountCents).padStart(20)}`,
-      `Promo Savings:     -${formatMoney(evaluated.totalDiscountCents).padStart(19)}`,
+      `Promo & Coupon:    -${formatMoney(evaluated.totalDiscountCents).padStart(19)}`,
+      couponEligibleNow && appliedCoupon
+        ? `Coupon Applied:     ${appliedCoupon.code.padStart(20)}`
+        : "",
       `${taxLabel}${formatMoney(evaluated.totalTaxCents).padStart(20)}`,
       `TOTAL PAID (${method.toUpperCase()}): ${formatMoney(evaluated.grandTotalCents).padStart(16)}`,
       evaluated.requiresAgeCheck ? "** ALCOHOL AGE VERIFIED (ID CHECKED) **" : "",
@@ -420,6 +531,57 @@ export function PosTerminalView({
     ]
       .filter(Boolean)
       .join("\n");
+  };
+
+  const handleLookupCustomer = async () => {
+    const q = customerLookupInput.trim();
+    if (!q || simulatedOffline) return;
+    try {
+      const res = await apiGet<{ customers: PosCustomer[] }>(
+        `/api/loyalty/customers?search=${encodeURIComponent(q)}`
+      );
+      setCustomerResults(res.customers.slice(0, 5));
+      if (res.customers.length === 1) {
+        setAttachedCustomer(res.customers[0]);
+        setCustomerResults([]);
+        setCustomerLookupInput("");
+      } else if (res.customers.length === 0) {
+        setCouponFeedback(`No loyalty member matching "${q}".`);
+      }
+    } catch (err) {
+      setCouponFeedback(err instanceof Error ? err.message : "Failed looking up customer");
+    }
+  };
+
+  const handleApplyCoupon = async () => {
+    const code = couponInput.trim().toUpperCase();
+    if (!code || validatingCoupon) return;
+    if (simulatedOffline) {
+      setCouponFeedback("Coupon validation requires live API connectivity.");
+      return;
+    }
+    setValidatingCoupon(true);
+    setCouponFeedback(null);
+    try {
+      const qs = new URLSearchParams({ basketCents: String(rawBasketSubtotalCents) });
+      if (attachedCustomer) qs.set("customerId", attachedCustomer.id);
+      const res = await apiGet<{ valid: boolean; reason?: string; coupon?: AppliedCoupon }>(
+        `/api/loyalty/coupons/validate/${encodeURIComponent(code)}?${qs.toString()}`
+      );
+      if (!res.valid || !res.coupon) {
+        setCouponFeedback(res.reason ?? "Invalid coupon code.");
+        return;
+      }
+      setAppliedCoupon(res.coupon);
+      setCouponInput("");
+      setCouponFeedback(
+        `Applied coupon ${res.coupon.code} (-${formatMoney(res.coupon.discountCents)}).`
+      );
+    } catch (err) {
+      setCouponFeedback(err instanceof Error ? err.message : "Failed validating coupon");
+    } finally {
+      setValidatingCoupon(false);
+    }
   };
 
   const completeSale = async (method: "cash" | "card" | "mobile_pay") => {
@@ -441,6 +603,8 @@ export function PosTerminalView({
         soldAt: nowIso,
         cashierName,
         ageVerified: evaluated.requiresAgeCheck && ageVerified,
+        customerId: attachedCustomer?.id ?? null,
+        couponCode: couponEligibleNow && appliedCoupon ? appliedCoupon.code : null,
         lines: evaluated.lines.map((l) => ({
           id: generateUuidV7(),
           productId: l.productId,
@@ -472,9 +636,13 @@ export function PosTerminalView({
         setSyncMessage(`Saved offline locally (${receiptNo}). Checkout uninterrupted!`);
       } else {
         try {
-          await apiPost("/api/pos/sales", payload);
+          const res = await apiPost<{ pointsEarned?: number }>("/api/pos/sales", payload);
           setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[SYNCED]"));
-          setSyncMessage(`Completed & synced ${receiptNo} directly to PostgreSQL ledger.`);
+          const ptsNote =
+            res.pointsEarned && res.pointsEarned > 0
+              ? ` (+${res.pointsEarned} loyalty pts earned)`
+              : "";
+          setSyncMessage(`Completed & synced ${receiptNo} directly to PostgreSQL ledger.${ptsNote}`);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           const kind = classifySaleSyncError(err);
@@ -494,10 +662,109 @@ export function PosTerminalView({
 
       setCart([]);
       setAgeVerified(false);
+      setAttachedCustomer(null);
+      setAppliedCoupon(null);
+      setCouponFeedback(null);
       scanRef.current?.focus();
     } finally {
       saleLockRef.current = false;
       setSubmittingSale(false);
+    }
+  };
+
+  const handleOpenShift = async () => {
+    if (openingShift) return;
+    setShiftError(null);
+    setOpenShiftBanner(null);
+    const parsedFloat = Number(openFloatInput);
+    if (!Number.isFinite(parsedFloat) || parsedFloat < 0) {
+      setShiftError("Enter a valid non-negative opening float amount.");
+      return;
+    }
+    setOpeningShift(true);
+    try {
+      const res = await apiPost<{ id: string; registerCode: string; openingFloatCents: number }>(
+        "/api/pos/shifts/open",
+        {
+          registerCode: "REG-01",
+          openingFloatCents: Math.round(parsedFloat * 100),
+        }
+      );
+      setOpenShiftBanner(
+        `Shift active on ${res.registerCode} with opening float ${formatMoney(res.openingFloatCents)}.`
+      );
+    } catch (err) {
+      setShiftError(err instanceof Error ? err.message : "Failed opening shift");
+    } finally {
+      setOpeningShift(false);
+    }
+  };
+
+  const loadRecentSales = async () => {
+    setLoadingRecent(true);
+    setRecentError(null);
+    try {
+      const res = await apiGet<{ sales: RecentSaleRow[] }>("/api/pos/recent-sales");
+      setRecentSales(res.sales);
+    } catch (err) {
+      setRecentError(err instanceof Error ? err.message : "Failed loading recent receipts");
+    } finally {
+      setLoadingRecent(false);
+    }
+  };
+
+  const handleVoidOrRefund = async (sale: RecentSaleRow, kind: "void" | "refund") => {
+    if (busyReceiptId || sale.lines.length === 0) return;
+    setBusyReceiptId(`${sale.id}-${kind}`);
+    setRecentError(null);
+    try {
+      const reversalId = generateUuidV7();
+      const suffix = kind === "void" ? "VOID" : "RFND";
+      const receiptNo = `${suffix}-${reversalId.slice(-8).toUpperCase()}`;
+      const payMethod = sale.payments[0]?.method ?? "cash";
+
+      await apiPost("/api/pos/sales", {
+        id: reversalId,
+        registerCode: sale.registerCode,
+        receiptNo,
+        kind,
+        originalSaleId: sale.id,
+        soldAt: new Date().toISOString(),
+        cashierName,
+        ageVerified: true,
+        customerId: sale.customerId ?? null,
+        lines: sale.lines.map((l) => ({
+          id: generateUuidV7(),
+          productId: l.productId,
+          scannedBarcode: l.scannedBarcode,
+          packLabel: l.packLabel,
+          packQty: l.packQty,
+          qtyPacks: l.qtyPacks,
+          unitPriceCents: l.unitPriceCents,
+          unitCostCents: l.unitCostCents,
+          discountCents: l.discountCents,
+          taxRateBp: l.taxRateBp,
+          taxCents: l.taxCents,
+          lineTotalCents: l.lineTotalCents,
+        })),
+        payments: [
+          {
+            id: generateUuidV7(),
+            method: payMethod,
+            amountCents: sale.totalCents,
+            tenderedCents: sale.totalCents,
+            changeCents: 0,
+          },
+        ],
+      });
+      setSyncMessage(
+        `${kind === "void" ? "Voided" : "Refunded"} receipt ${sale.receiptNo} → posted ${receiptNo} (${formatMoney(sale.totalCents)} restocked to ledger).`
+      );
+      await loadRecentSales();
+    } catch (err) {
+      setRecentError(err instanceof Error ? err.message : `Failed posting ${kind}`);
+    } finally {
+      setBusyReceiptId(null);
     }
   };
 
@@ -586,6 +853,27 @@ export function PosTerminalView({
             </button>
           )}
           <button
+            id="open-shift-btn"
+            className="btn"
+            onClick={() => {
+              setShowShiftOpen(true);
+              setShiftError(null);
+              setOpenShiftBanner(null);
+            }}
+          >
+            <Play size={14} /> Open Shift
+          </button>
+          <button
+            id="recent-receipts-btn"
+            className="btn"
+            onClick={() => {
+              setShowRecentReceipts(true);
+              void loadRecentSales();
+            }}
+          >
+            <History size={14} /> Receipts
+          </button>
+          <button
             id="open-shift-close-btn"
             className="btn"
             onClick={() => {
@@ -594,7 +882,7 @@ export function PosTerminalView({
               setShiftError(null);
             }}
           >
-            <Receipt size={14} /> Blind Shift Close (Z-Report)
+            <Receipt size={14} /> Blind Close (Z-Report)
           </button>
         </div>
       </header>
@@ -846,15 +1134,156 @@ export function PosTerminalView({
             </div>
           )}
 
+          {/* Loyalty Customer & Single-Use Coupon Card */}
+          <div
+            style={{
+              border: "1px solid var(--border-hairline)",
+              borderRadius: "var(--radius-md)",
+              padding: "10px 11px",
+              background: "var(--bg-subtle)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            {attachedCustomer ? (
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
+                  <UserCheck size={14} style={{ color: "var(--accent-primary)" }} />
+                  <strong>{attachedCustomer.fullName}</strong>
+                  <span className="tag tag-blue mono" style={{ fontSize: 10 }}>
+                    {attachedCustomer.pointsBalance} pts
+                  </span>
+                </span>
+                <button
+                  className="btn btn-sm"
+                  aria-label="Detach loyalty customer"
+                  onClick={() => setAttachedCustomer(null)}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: 6 }}>
+                <input
+                  id="pos-customer-lookup"
+                  className="input"
+                  style={{ fontSize: 12, padding: "5px 8px" }}
+                  placeholder="Loyalty phone or name..."
+                  value={customerLookupInput}
+                  onChange={(e) => setCustomerLookupInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleLookupCustomer();
+                    }
+                  }}
+                />
+                <button
+                  id="pos-customer-lookup-btn"
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={simulatedOffline || !customerLookupInput.trim()}
+                  onClick={() => void handleLookupCustomer()}
+                >
+                  Find
+                </button>
+              </div>
+            )}
+
+            {customerResults.length > 0 && !attachedCustomer && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {customerResults.map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    className="btn btn-sm"
+                    style={{ justifyContent: "space-between", fontSize: 11.5 }}
+                    onClick={() => {
+                      setAttachedCustomer(c);
+                      setCustomerResults([]);
+                      setCustomerLookupInput("");
+                    }}
+                  >
+                    <span>
+                      {c.fullName} ({c.phone})
+                    </span>
+                    <span className="mono">{c.pointsBalance} pts</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {appliedCoupon ? (
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
+                  <Ticket size={14} style={{ color: couponEligibleNow ? "var(--accent-primary)" : "var(--accent-amber)" }} />
+                  <strong className="mono">{appliedCoupon.code}</strong>
+                  <span className={`tag ${couponEligibleNow ? "tag-green" : "tag-amber"} mono`} style={{ fontSize: 10 }}>
+                    {couponEligibleNow
+                      ? `-${formatMoney(appliedCoupon.discountCents)}`
+                      : `Min ${formatMoney(appliedCoupon.minBasketCents)}`}
+                  </span>
+                </span>
+                <button
+                  className="btn btn-sm"
+                  aria-label="Remove coupon"
+                  onClick={() => {
+                    setAppliedCoupon(null);
+                    setCouponFeedback(null);
+                  }}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: 6 }}>
+                <input
+                  id="pos-coupon-input"
+                  className="input mono"
+                  style={{ fontSize: 12, padding: "5px 8px" }}
+                  placeholder="Coupon code (e.g., SAVE5-...)..."
+                  value={couponInput}
+                  onChange={(e) => setCouponInput(e.target.value.toUpperCase())}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleApplyCoupon();
+                    }
+                  }}
+                />
+                <button
+                  id="pos-apply-coupon-btn"
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={validatingCoupon || simulatedOffline || !couponInput.trim()}
+                  onClick={() => void handleApplyCoupon()}
+                >
+                  {validatingCoupon ? "..." : "Apply"}
+                </button>
+              </div>
+            )}
+
+            {couponFeedback && (
+              <div style={{ fontSize: 11.5, color: "var(--ink-secondary)" }}>{couponFeedback}</div>
+            )}
+          </div>
+
           <div className="totals-box">
             <div className="total-row">
               <span>Subtotal</span>
               <span className="mono">{formatMoney(evaluated.subtotalBeforeDiscountCents)}</span>
             </div>
             <div className="total-row" style={{ color: "var(--accent-primary)", fontWeight: 600 }}>
-              <span>Auto Promotions</span>
+              <span>Auto Promotions &amp; Coupons</span>
               <span className="mono">-{formatMoney(evaluated.totalDiscountCents)}</span>
             </div>
+            {evaluated.couponDiscountCents > 0 && (
+              <div className="total-row" style={{ fontSize: 11.5, color: "var(--accent-primary)" }}>
+                <span>↳ Loyalty Coupon ({appliedCoupon?.code})</span>
+                <span className="mono">-{formatMoney(evaluated.couponDiscountCents)}</span>
+              </div>
+            )}
             <div className="total-row">
               <span>VAT / Excise Tax</span>
               <span className="mono">{formatMoney(evaluated.totalTaxCents)}</span>
@@ -928,6 +1357,147 @@ export function PosTerminalView({
               >
                 <ShieldCheck size={14} /> ID Verified — Add to Basket
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Open Shift Modal */}
+      {showShiftOpen && (
+        <div className="overlay centered" onClick={() => setShowShiftOpen(false)}>
+          <div className="modal" style={{ maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ margin: 0, fontSize: 18 }}>Open Register Shift (Lane 01)</h2>
+            <p className="page-subtitle" style={{ margin: 0 }}>
+              Record starting drawer float for blind Z-Report reconciliation at end of shift.
+            </p>
+            {shiftError && <div className="banner banner-red">{shiftError}</div>}
+            {openShiftBanner && <div className="banner banner-green">{openShiftBanner}</div>}
+            <div className="field">
+              <label htmlFor="open-float-input">Opening Cash Float ($ USD)</label>
+              <input
+                id="open-float-input"
+                className="input mono"
+                value={openFloatInput}
+                onChange={(e) => setOpenFloatInput(e.target.value)}
+                disabled={openingShift}
+              />
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                id="confirm-open-shift-btn"
+                className="btn btn-primary"
+                disabled={openingShift}
+                onClick={() => void handleOpenShift()}
+              >
+                {openingShift ? "Opening..." : "Open Shift on REG-01"}
+              </button>
+              <button className="btn" onClick={() => setShowShiftOpen(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Recent Receipts & Manager Void/Refund Modal */}
+      {showRecentReceipts && (
+        <div className="overlay centered" onClick={() => setShowRecentReceipts(false)}>
+          <div className="modal" style={{ maxWidth: 760, width: "92vw" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: 18 }}>Recent POS Receipts (Lane Feed)</h2>
+                <p className="page-subtitle" style={{ margin: 0 }}>
+                  {canVoidOrRefund
+                    ? "Managers & Owners can post append-only Voids or Refunds that atomically restock ledger inventory and claw back loyalty points."
+                    : "Read-only receipt feed. Voids and Refunds require Store Manager or Owner login."}
+                </p>
+              </div>
+              <button className="btn btn-sm" onClick={() => setShowRecentReceipts(false)}>
+                <X size={14} /> Close
+              </button>
+            </div>
+            {recentError && <div className="banner banner-red">{recentError}</div>}
+            <div className="table-wrap" style={{ maxHeight: 420, overflowY: "auto" }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Receipt</th>
+                    <th>Type</th>
+                    <th>Cashier &amp; Time</th>
+                    <th className="text-right">Items</th>
+                    <th className="text-right">Total</th>
+                    {canVoidOrRefund && <th className="text-right">Manager Action</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {loadingRecent ? (
+                    <tr>
+                      <td colSpan={canVoidOrRefund ? 6 : 5}>Loading recent receipts...</td>
+                    </tr>
+                  ) : recentSales.length === 0 ? (
+                    <tr>
+                      <td colSpan={canVoidOrRefund ? 6 : 5} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
+                        No receipts recorded yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    recentSales.map((s) => (
+                      <tr key={s.id}>
+                        <td className="mono" style={{ fontWeight: 600 }}>
+                          {s.receiptNo}
+                        </td>
+                        <td>
+                          <span
+                            className={`tag ${
+                              s.kind === "sale"
+                                ? s.alreadyVoided
+                                  ? "tag-neutral"
+                                  : "tag-green"
+                                : "tag-red"
+                            }`}
+                          >
+                            {s.kind === "sale" && s.alreadyVoided ? "voided" : s.kind}
+                          </span>
+                        </td>
+                        <td>
+                          <div style={{ fontSize: 12.5 }}>{s.cashierName}</div>
+                          <div className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                            {new Date(s.soldAt).toLocaleString()}
+                          </div>
+                        </td>
+                        <td className="text-right mono">{s.lines.length}</td>
+                        <td className="text-right mono" style={{ fontWeight: 700 }}>
+                          {s.kind === "sale" ? formatMoney(s.totalCents) : `-${formatMoney(s.totalCents)}`}
+                        </td>
+                        {canVoidOrRefund && (
+                          <td className="text-right">
+                            {s.kind === "sale" && !s.alreadyVoided && s.lines.length > 0 ? (
+                              <div style={{ display: "inline-flex", gap: 6 }}>
+                                <button
+                                  className="btn btn-amber btn-sm"
+                                  disabled={busyReceiptId !== null}
+                                  onClick={() => void handleVoidOrRefund(s, "refund")}
+                                >
+                                  <RotateCcw size={12} /> Refund
+                                </button>
+                                <button
+                                  className="btn btn-sm"
+                                  disabled={busyReceiptId !== null}
+                                  onClick={() => void handleVoidOrRefund(s, "void")}
+                                >
+                                  Void
+                                </button>
+                              </div>
+                            ) : (
+                              <span style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>—</span>
+                            )}
+                          </td>
+                        )}
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>

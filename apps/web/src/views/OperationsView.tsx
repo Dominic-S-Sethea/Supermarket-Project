@@ -5,8 +5,11 @@ import {
   formatMoney,
   type UserRole,
 } from "@supermarket/shared";
-import { AlertTriangle, Check, FileUp, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Award, Check, ClipboardList, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { FloorTasksTab } from "../components/FloorTasksTab";
+import { ShelfIntegrityTab } from "../components/ShelfIntegrityTab";
+import { SupplierMatchTab } from "../components/SupplierMatchTab";
 
 interface MarginAlert {
   id: string;
@@ -82,6 +85,8 @@ interface ParsedInvoiceResponse {
   };
 }
 
+type OpsSubTab = "receiving" | "shelf" | "tasks" | "suppliers";
+
 export function OperationsView({
   suppliers,
   userRole = "owner",
@@ -92,6 +97,7 @@ export function OperationsView({
   onCountsChanged?: () => void;
 }) {
   const canManage = userRole === "owner" || userRole === "manager";
+  const [subTab, setSubTab] = useState<OpsSubTab>("receiving");
 
   const [marginAlerts, setMarginAlerts] = useState<MarginAlert[]>([]);
   const [expiryBatches, setExpiryBatches] = useState<ExpiryBatch[]>([]);
@@ -378,19 +384,59 @@ export function OperationsView({
     <div>
       <header className="page-header">
         <div>
-          <h1>Receiving (GRN), FEFO Expiry &amp; Margin Protection</h1>
+          <h1>Receiving (GRN), FEFO Expiry &amp; Operations</h1>
           <p className="page-subtitle">
             {canManage
-              ? "Protect your 1–3% supermarket net profit by catching vendor wholesale price creep, accounting for free bonus cases, and clearing near-expiry packaged stock."
+              ? "Protect your 1–3% supermarket net profit across receiving, vendor OTIF scorecards, 3-way dock variance matching, and FEFO expiry control."
               : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."}
           </p>
+        </div>
+        <div className="subtab-bar" role="tablist">
+          <button
+            id="ops-subtab-receiving"
+            role="tab"
+            aria-selected={subTab === "receiving"}
+            className={`subtab-btn ${subTab === "receiving" ? "active" : ""}`}
+            onClick={() => setSubTab("receiving")}
+          >
+            <PackageCheck size={14} /> Receiving &amp; FEFO
+          </button>
+          <button
+            id="ops-subtab-shelf"
+            role="tab"
+            aria-selected={subTab === "shelf"}
+            className={`subtab-btn ${subTab === "shelf" ? "active" : ""}`}
+            onClick={() => setSubTab("shelf")}
+          >
+            <Ghost size={14} /> Shelf Integrity &amp; 07:30 Tags
+          </button>
+          <button
+            id="ops-subtab-tasks"
+            role="tab"
+            aria-selected={subTab === "tasks"}
+            className={`subtab-btn ${subTab === "tasks" ? "active" : ""}`}
+            onClick={() => setSubTab("tasks")}
+          >
+            <ClipboardList size={14} /> Daily Floor Tasks
+          </button>
+          {canManage && (
+            <button
+              id="ops-subtab-suppliers"
+              role="tab"
+              aria-selected={subTab === "suppliers"}
+              className={`subtab-btn ${subTab === "suppliers" ? "active" : ""}`}
+              onClick={() => setSubTab("suppliers")}
+            >
+              <Award size={14} /> Supplier OTIF &amp; 3-Way Match
+            </button>
+          )}
         </div>
       </header>
 
       {!canManage && (
         <div className="banner banner-amber" style={{ marginBottom: 14 }}>
           <span>
-            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring is enabled. GRN receiving, vendor margin price overrides, and batch write-offs require Store Manager or Owner approval.
+            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, phantom stock blind counts, 07:30 shelf tag batch printing, and daily floor checklist completion are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
           </span>
         </div>
       )}
@@ -413,7 +459,36 @@ export function OperationsView({
         </div>
       )}
 
-      {canManage && (
+      {subTab === "suppliers" && canManage ? (
+        <SupplierMatchTab
+          canManage={canManage}
+          onFeedback={(msg) => {
+            setErrorMsg(null);
+            setFeedback(msg);
+          }}
+          onError={(msg) => setErrorMsg(msg)}
+        />
+      ) : subTab === "shelf" ? (
+        <ShelfIntegrityTab
+          canManage={canManage}
+          onFeedback={(msg) => {
+            setErrorMsg(null);
+            setFeedback(msg);
+            onCountsChanged?.();
+          }}
+          onError={(msg) => setErrorMsg(msg)}
+        />
+      ) : subTab === "tasks" ? (
+        <FloorTasksTab
+          onFeedback={(msg) => {
+            setErrorMsg(null);
+            setFeedback(msg);
+          }}
+          onError={(msg) => setErrorMsg(msg)}
+        />
+      ) : (
+        <>
+          {canManage && (
         <>
           {/* Multimodal AI Invoice -> GRN Scanner */}
           <section className="panel" style={{ marginBottom: 20 }}>
@@ -878,6 +953,8 @@ export function OperationsView({
           </table>
         </div>
       </section>
+        </>
+      )}
     </div>
   );
 }

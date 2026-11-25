@@ -169,6 +169,25 @@ describe("POS offline queue and sync classification", () => {
     };
     assert.equal(saveOfflineQueue([sampleSale], throwingStorage), false);
   });
+
+  it("preserves optional loyalty customerId and couponCode across offline queue round-trips", () => {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+    };
+    const loyaltySale: QueuedPosSale = {
+      ...sampleSale,
+      customerId: "11111111-1111-4111-8111-111111111111",
+      couponCode: "SAVE5-ABC123",
+    };
+    assert.equal(saveOfflineQueue([loyaltySale], mockStorage), true);
+    const [loaded] = loadOfflineQueue(mockStorage);
+    assert.equal(loaded.customerId, loyaltySale.customerId);
+    assert.equal(loaded.couponCode, "SAVE5-ABC123");
+  });
 });
 
 describe("POS IndexedDB snapshot validation and promotion mapping", () => {

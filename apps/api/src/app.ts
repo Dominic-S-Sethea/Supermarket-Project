@@ -9,6 +9,8 @@ import { analyticsRoutes } from "./routes/analytics.js";
 import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { inventoryRoutes } from "./routes/inventory.js";
+import { loyaltyRoutes } from "./routes/loyalty.js";
+import { operationsRoutes } from "./routes/operations.js";
 import { posRoutes } from "./routes/pos.js";
 
 declare module "fastify" {
@@ -88,16 +90,42 @@ export async function buildApp(logger = true) {
     return reply.status(500).send({ error: "Internal server error." });
   });
 
-  app.get("/api/health", async () => ({
+  app.get("/api/health/live", async () => ({
     status: "ok",
     service: "supermarket-os-api",
+    uptimeSec: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
   }));
+
+  app.get("/api/health", async (_req, reply) => {
+    const startMs = Date.now();
+    try {
+      await db.execute(sql`SELECT 1`);
+      return {
+        status: "ok",
+        service: "supermarket-os-api",
+        db: "connected",
+        dbLatencyMs: Date.now() - startMs,
+        uptimeSec: Math.round(process.uptime()),
+        timestamp: new Date().toISOString(),
+      };
+    } catch (err) {
+      app.log.error({ err }, "Database readiness probe failed");
+      return reply.status(503).send({
+        status: "degraded",
+        service: "supermarket-os-api",
+        db: "disconnected",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
 
   await app.register(authRoutes);
   await app.register(catalogRoutes);
   await app.register(posRoutes);
   await app.register(inventoryRoutes);
+  await app.register(loyaltyRoutes);
+  await app.register(operationsRoutes);
   await app.register(analyticsRoutes);
   await app.register(aiRoutes);
 
