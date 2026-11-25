@@ -14,6 +14,7 @@ import {
   analyticsBasketRules,
   analyticsDemandForecasts,
   analyticsLpAnomalies,
+  analyticsPromoRoi,
   analyticsShiftDiagnostics,
   auditLogs,
   categories,
@@ -786,4 +787,28 @@ export async function analyticsRoutes(app: FastifyInstance) {
       return csv;
     }
   );
+
+  // Wave 2 Phase 3: Promotion ROI & Margin Attribution
+  app.get("/api/analytics/promo-roi", { preHandler: analyticsReadOnly }, async () => {
+    const rows = await db
+      .select()
+      .from(analyticsPromoRoi)
+      .orderBy(desc(analyticsPromoRoi.estimatedProfitDeltaCents));
+
+    const totalDiscountGivenCents = rows.reduce((s, r) => s + r.discountGivenCents, 0);
+    const totalProfitDeltaCents = rows.reduce((s, r) => s + r.estimatedProfitDeltaCents, 0);
+    const accretiveCount = rows.filter((r) => r.verdict === "profit_accretive").length;
+    const dilutiveCount = rows.filter((r) => r.verdict === "margin_dilutive").length;
+
+    return {
+      summary: {
+        promotionsEvaluated: rows.length,
+        accretiveCount,
+        dilutiveCount,
+        totalDiscountGivenCents,
+        totalProfitDeltaCents,
+      },
+      items: rows,
+    };
+  });
 }

@@ -4,7 +4,14 @@ import { and, desc, eq, gt, ilike, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getPgErrorCode } from "../app.js";
 import { env } from "../config/env.js";
-import { auditLogs, db, posShifts, userSessions, users } from "../db/index.js";
+import {
+  analyticsPipelineRuns,
+  auditLogs,
+  db,
+  posShifts,
+  userSessions,
+  users,
+} from "../db/index.js";
 import { hashPin, requireRole } from "../plugins/auth.js";
 import { createRateLimiter } from "../plugins/security.js";
 
@@ -367,6 +374,27 @@ export async function adminRoutes(app: FastifyInstance) {
           (a, b) => b.maxAbsVarianceCents - a.maxAbsVarianceCents
         ),
         shifts,
+      };
+    }
+  );
+
+  // =========================================================================
+  // ML PIPELINE RUN TELEMETRY & 12-CHECK DATA-QUALITY CONTRACTS
+  // =========================================================================
+  app.get(
+    "/api/admin/pipeline-runs",
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    async () => {
+      const runs = await db
+        .select()
+        .from(analyticsPipelineRuns)
+        .orderBy(desc(analyticsPipelineRuns.finishedAt))
+        .limit(20);
+
+      const latest = runs[0] ?? null;
+      return {
+        latest,
+        runs,
       };
     }
   );

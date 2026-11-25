@@ -935,3 +935,45 @@ export const storeTasks = pgTable(
     index("idx_store_tasks_type").on(t.taskType),
   ]
 );
+
+// ============================================================================
+// 10. WAVE 2: PROMOTION ROI ATTRIBUTION & ML PIPELINE DATA-QUALITY TELEMETRY
+// ============================================================================
+
+export const analyticsPromoRoi = pgTable(
+  "analytics_promo_roi",
+  {
+    promotionId: uuid("promotion_id")
+      .primaryKey()
+      .references(() => promotions.id, { onDelete: "cascade" }),
+    promotionName: text("promotion_name").notNull(),
+    promoType: text("promo_type").notNull(),
+    discountedUnits60d: integer("discounted_units_60d").notNull(),
+    discountedRevenueCents: bigint("discounted_revenue_cents", { mode: "number" }).notNull(),
+    discountGivenCents: bigint("discount_given_cents", { mode: "number" }).notNull(),
+    baselineDailyUnits: doublePrecision("baseline_daily_units").notNull(),
+    promoDailyUnits: doublePrecision("promo_daily_units").notNull(),
+    velocityLiftPct: doublePrecision("velocity_lift_pct").notNull(),
+    netMarginBp: integer("net_margin_bp").notNull(),
+    estimatedProfitDeltaCents: bigint("estimated_profit_delta_cents", { mode: "number" }).notNull(),
+    verdict: text("verdict").notNull(), // profit_accretive | margin_neutral | margin_dilutive | insufficient_data
+    computedAt: timestamp("computed_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index("idx_promo_roi_verdict").on(t.verdict)]
+);
+
+export const analyticsPipelineRuns = pgTable(
+  "analytics_pipeline_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }).notNull(),
+    elapsedSec: doublePrecision("elapsed_sec").notNull(),
+    status: text("status").notNull(), // ok | dq_failed | error
+    stagesJson: jsonb("stages_json").notNull(),
+    dqPassed: boolean("dq_passed").notNull().default(true),
+    dqChecksJson: jsonb("dq_checks_json").notNull(),
+  },
+  (t) => [index("idx_pipeline_runs_finished").on(t.finishedAt)]
+);
+

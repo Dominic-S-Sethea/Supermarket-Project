@@ -29,6 +29,12 @@ export async function exportRoutes(app: FastifyInstance) {
     { preHandler: financeRoles },
     async (_req, reply) => {
       const res = await db.execute(sql`
+        WITH unfolded AS (
+          SELECT product_id, COALESCE(SUM(qty_delta), 0)::int AS delta
+          FROM stock_movements
+          WHERE folded = false
+          GROUP BY product_id
+        )
         SELECT
           p.sku,
           p.name,
@@ -37,13 +43,14 @@ export async function exportRoutes(app: FastifyInstance) {
           c.name AS category_name,
           p.aisle_location,
           COALESCE(ax.segment, 'UNSCORED') AS abc_xyz_segment,
-          COALESCE(ls.on_hand_units, 0)::int AS on_hand_units,
+          (COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::int AS on_hand_units,
           p.avg_cost_cents::bigint AS avg_cost_cents,
-          (GREATEST(0, COALESCE(ls.on_hand_units, 0)) * p.avg_cost_cents)::bigint AS valuation_cents
+          (GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0)) * p.avg_cost_cents)::bigint AS valuation_cents
         FROM products p
         JOIN categories c ON c.id = p.category_id
         JOIN departments d ON d.id = c.department_id
-        LEFT JOIN v_product_live_stock ls ON ls.product_id = p.id
+        LEFT JOIN stock_baselines sb ON sb.product_id = p.id
+        LEFT JOIN unfolded u ON u.product_id = p.id
         LEFT JOIN analytics_abc_xyz ax ON ax.product_id = p.id
         WHERE p.active = true
         ORDER BY valuation_cents DESC, p.sku ASC
@@ -304,6 +311,8 @@ export async function exportRoutes(app: FastifyInstance) {
       "/admin/users/{id}": { patch: { summary: "Update staff role/status or reset PIN", tags: ["Admin"] } },
       "/admin/users/{id}/revoke-sessions": { post: { summary: "Revoke all active sessions for user", tags: ["Admin"] } },
       "/admin/audit-logs": { get: { summary: "Paginated immutable audit trail", tags: ["Admin"] } },
+      "/admin/pipeline-runs": { get: { summary: "ML analytics pipeline run telemetry & 12-check data-quality contracts", tags: ["Admin", "Analytics"] } },
+      "/analytics/promo-roi": { get: { summary: "Promotion ROI velocity lift & margin attribution", tags: ["Analytics", "Promotions"] } },
       "/exports/accounting.csv": { get: { summary: "Accounting journal CSV", tags: ["Exports"] } },
       "/exports/inventory-valuation.csv": { get: { summary: "Live 3,120-SKU inventory valuation CSV", tags: ["Exports"] } },
       "/exports/supplier-variances.csv": { get: { summary: "3-way supplier variance register CSV", tags: ["Exports"] } },

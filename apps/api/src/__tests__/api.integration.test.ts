@@ -1875,5 +1875,26 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(specRes.statusCode).toBe(200);
     expect(specRes.json().openapi).toBe("3.1.0");
     expect(specRes.json().paths["/admin/users"]).toBeTruthy();
+
+    // 5. Wave 2 Phase 3: Promo ROI Attribution & ML Pipeline 12-Check Data-Quality Contracts
+    const [promoRoiRes, pipeRes] = await Promise.all([
+      app.inject({
+        method: "GET",
+        url: "/api/analytics/promo-roi",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/admin/pipeline-runs",
+        headers: authHeaders(accountantToken),
+      }),
+    ]);
+    expect(promoRoiRes.statusCode).toBe(200);
+    expect(promoRoiRes.json().items.length).toBeGreaterThan(0);
+
+    expect(pipeRes.statusCode).toBe(200);
+    expect(pipeRes.json().latest).toBeTruthy();
+    expect(pipeRes.json().latest.dqPassed).toBe(true);
+    expect(pipeRes.json().latest.dqChecksJson.length).toBe(12);
   });
 });

@@ -72,7 +72,30 @@ interface ShiftSummaryPayload {
   }[];
 }
 
-type AdminSubTab = "audit" | "reconciliation" | "users" | "security";
+interface PipelineStageTiming {
+  stage: string;
+  elapsed_s: number;
+}
+
+interface PipelineDqCheck {
+  name: string;
+  passed: boolean;
+  observed: number;
+  expected: string;
+}
+
+interface PipelineRunRow {
+  id: string;
+  startedAt: string;
+  finishedAt: string;
+  elapsedSec: number;
+  status: string;
+  stagesJson: PipelineStageTiming[];
+  dqPassed: boolean;
+  dqChecksJson: PipelineDqCheck[];
+}
+
+type AdminSubTab = "audit" | "reconciliation" | "pipeline" | "users" | "security";
 
 const EXPORT_CARDS: {
   title: string;
@@ -147,6 +170,10 @@ export function AdminAuditView({
   const [shiftSummary, setShiftSummary] = useState<ShiftSummaryPayload | null>(null);
   const [loadingShifts, setLoadingShifts] = useState(false);
 
+  // ML Pipeline Health & Data-Quality state
+  const [pipelineRuns, setPipelineRuns] = useState<PipelineRunRow[]>([]);
+  const [loadingPipeline, setLoadingPipeline] = useState(false);
+
   // Self-Service Change My PIN state
   const [currentPin, setCurrentPin] = useState("");
   const [nextPin, setNextPin] = useState("");
@@ -202,10 +229,25 @@ export function AdminAuditView({
     }
   };
 
+  const loadPipelineRuns = async (signal?: AbortSignal) => {
+    setLoadingPipeline(true);
+    try {
+      const res = await apiGet<{ runs: PipelineRunRow[] }>("/api/admin/pipeline-runs", signal);
+      if (!signal?.aborted) setPipelineRuns(res.runs);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading ML pipeline runs.");
+      }
+    } finally {
+      if (!signal?.aborted) setLoadingPipeline(false);
+    }
+  };
+
   useEffect(() => {
     const controller = new AbortController();
     if (subTab === "users" && isOwner) void loadUsers(controller.signal);
     if (subTab === "reconciliation") void loadShiftSummary(controller.signal);
+    if (subTab === "pipeline") void loadPipelineRuns(controller.signal);
     return () => controller.abort();
   }, [subTab, isOwner]);
 
@@ -386,6 +428,15 @@ export function AdminAuditView({
             onClick={() => setSubTab("reconciliation")}
           >
             <Receipt size={14} /> Z-Reports &amp; Exports
+          </button>
+          <button
+            id="admin-subtab-pipeline"
+            role="tab"
+            aria-selected={subTab === "pipeline"}
+            className={`subtab-btn ${subTab === "pipeline" ? "active" : ""}`}
+            onClick={() => setSubTab("pipeline")}
+          >
+            <Activity size={14} /> ML Pipeline Health
           </button>
           <button
             id="admin-subtab-security"
@@ -906,6 +957,147 @@ export function AdminAuditView({
                   </tbody>
                 </table>
               </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {subTab === "pipeline" && (
+        <div className="stack-md">
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <h2 className="panel-title">
+                  <Activity size={15} style={{ verticalAlign: "middle", marginRight: 6 }} />
+                  Python ML Pipeline Health &amp; 12-Check Data-Quality Contracts
+                </h2>
+                <p className="panel-desc">
+                  Audits every nightly/on-demand Python analytics run across ABC-XYZ, Demand Forecasts, Market Basket, LP, Supplier OTIF, Phantom Stock, Dynamic Markdowns, and Promo ROI.
+                </p>
+              </div>
+              <button
+                className="btn btn-sm"
+                disabled={loadingPipeline}
+                onClick={() => void loadPipelineRuns()}
+              >
+                <RefreshCw size={13} /> Refresh
+              </button>
+            </div>
+
+            {loadingPipeline && pipelineRuns.length === 0 ? (
+              <div style={{ padding: "14px 0", color: "var(--ink-muted)" }}>
+                Loading ML pipeline runs...
+              </div>
+            ) : pipelineRuns.length === 0 ? (
+              <div className="banner banner-amber">
+                No ML pipeline runs recorded yet. Execute the Python analytics worker to populate.
+              </div>
+            ) : (
+              (() => {
+                const latest = pipelineRuns[0];
+                const passedCount = latest.dqChecksJson.filter((c) => c.passed).length;
+                return (
+                  <div className="stack-md">
+                    <div
+                      className="kpi-grid"
+                      style={{ gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))" }}
+                    >
+                      <div className="kpi-card">
+                        <div className="kpi-label">Latest Run Status</div>
+                        <div className="kpi-value">
+                          <span className={`tag mono ${latest.dqPassed ? "tag-green" : "tag-red"}`}>
+                            {latest.status.toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="kpi-meta">
+                          {new Date(latest.finishedAt).toLocaleString()}
+                        </div>
+                      </div>
+                      <div className="kpi-card">
+                        <div className="kpi-label">Data-Quality Contracts</div>
+                        <div className="kpi-value mono">
+                          {passedCount} / {latest.dqChecksJson.length}
+                        </div>
+                        <div className="kpi-meta">Post-run PostgreSQL invariant assertions</div>
+                      </div>
+                      <div className="kpi-card">
+                        <div className="kpi-label">Total Pipeline Duration</div>
+                        <div className="kpi-value mono">{latest.elapsedSec.toFixed(2)}s</div>
+                        <div className="kpi-meta">{latest.stagesJson.length} stages executed</div>
+                      </div>
+                      <div className="kpi-card">
+                        <div className="kpi-label">Tracked History</div>
+                        <div className="kpi-value mono">{pipelineRuns.length} runs</div>
+                        <div className="kpi-meta">Bounded latest 50 executions</div>
+                      </div>
+                    </div>
+
+                    <div className="grid-asymmetric">
+                      <div>
+                        <h3 style={{ fontSize: 13.5, margin: "0 0 8px" }}>
+                          12-Check Data-Quality Contract Matrix
+                        </h3>
+                        <div className="table-wrap">
+                          <table className="data-table">
+                            <thead>
+                              <tr>
+                                <th>Contract Check</th>
+                                <th className="text-right">Observed</th>
+                                <th>Expectation</th>
+                                <th>Status</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {latest.dqChecksJson.map((chk) => (
+                                <tr key={chk.name}>
+                                  <td className="mono" style={{ fontSize: 12 }}>
+                                    {chk.name}
+                                  </td>
+                                  <td className="text-right mono">{chk.observed}</td>
+                                  <td style={{ fontSize: 12, color: "var(--ink-secondary)" }}>
+                                    {chk.expected}
+                                  </td>
+                                  <td>
+                                    <span className={`tag mono ${chk.passed ? "tag-green" : "tag-red"}`}>
+                                      {chk.passed ? "PASS" : "FAIL"}
+                                    </span>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+
+                      <div>
+                        <h3 style={{ fontSize: 13.5, margin: "0 0 8px" }}>
+                          Stage Execution Timings
+                        </h3>
+                        <div className="table-wrap">
+                          <table className="data-table">
+                            <thead>
+                              <tr>
+                                <th>ML Stage</th>
+                                <th className="text-right">Elapsed (s)</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {latest.stagesJson.map((st) => (
+                                <tr key={st.stage}>
+                                  <td className="mono" style={{ fontSize: 12 }}>
+                                    {st.stage}
+                                  </td>
+                                  <td className="text-right mono">{st.elapsed_s.toFixed(3)}s</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()
             )}
           </section>
         </div>

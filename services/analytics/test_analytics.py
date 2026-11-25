@@ -8,9 +8,11 @@ from run_all import (
     chronological_ridge_attribution,
     compute_did_evaluation,
     compute_phantom_prob,
+    compute_promo_roi_metrics,
     compute_supplier_otif_metrics,
     croston_holdout_wmape,
     croston_sba_forecast,
+    evaluate_data_quality_contracts,
     kmeans_missions,
     recommend_abc_xyz_action,
     recommend_hourly_lanes,
@@ -309,4 +311,189 @@ def test_otif_phantom_markdown_rfm_lanes_and_json_sanitizer_edge_cases():
     parsed = json.loads(safe_json_dumps(raw))
     assert parsed == {"a": 0.0, "b": 0.0, "c": 0.0, "d": 42, "e": [True]}
     assert safe_float(float("nan"), default=1.5) == 1.5
+
+
+# ============================================================================
+# WAVE 2 PHASE 3: PROMO ROI ATTRIBUTION & 12-CHECK DATA-QUALITY CONTRACTS
+# ============================================================================
+
+
+def test_promo_roi_profit_accretive_with_strong_velocity_lift():
+    res = compute_promo_roi_metrics(
+        discounted_units=200,
+        discounted_revenue_cents=100_000,
+        discounted_tax_cents=9_000,
+        discounted_cogs_cents=55_000,
+        discount_given_cents=8_000,
+        promo_active_days=10,
+        baseline_units=100,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "profit_accretive"
+    assert res["velocity_lift_pct"] == 100.0
+    assert res["net_margin_bp"] > 3000
+    assert res["estimated_profit_delta_cents"] > 0
+
+
+def test_promo_roi_margin_dilutive_when_discount_destroys_profit():
+    res = compute_promo_roi_metrics(
+        discounted_units=100,
+        discounted_revenue_cents=25_000,
+        discounted_tax_cents=2_000,
+        discounted_cogs_cents=22_000,
+        discount_given_cents=12_000,
+        promo_active_days=10,
+        baseline_units=95,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "margin_dilutive"
+    assert res["estimated_profit_delta_cents"] < 0
+    assert res["net_margin_bp"] < 500
+
+
+def test_promo_roi_insufficient_data_on_low_volume():
+    res = compute_promo_roi_metrics(
+        discounted_units=3,
+        discounted_revenue_cents=1200,
+        discounted_tax_cents=100,
+        discounted_cogs_cents=600,
+        discount_given_cents=200,
+        promo_active_days=2,
+        baseline_units=20,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "insufficient_data"
+
+
+def test_promo_roi_handles_zero_baseline_zero_revenue_and_non_finite():
+    res_zero = compute_promo_roi_metrics(0, 0, 0, 0, 0, 0, 0, 0)
+    assert res_zero["verdict"] == "insufficient_data"
+    assert res_zero["velocity_lift_pct"] == 0.0
+    assert res_zero["net_margin_bp"] == 0
+
+    res_no_base = compute_promo_roi_metrics(
+        discounted_units=50,
+        discounted_revenue_cents=25_000,
+        discounted_tax_cents=2_000,
+        discounted_cogs_cents=12_000,
+        discount_given_cents=1_500,
+        promo_active_days=5,
+        baseline_units=0,
+        baseline_days=0,
+    )
+    assert res_no_base["velocity_lift_pct"] == 100.0
+    assert res_no_base["verdict"] == "profit_accretive"
+
+
+def test_promo_roi_margin_neutral_boundary():
+    res = compute_promo_roi_metrics(
+        discounted_units=100,
+        discounted_revenue_cents=50_000,
+        discounted_tax_cents=4_000,
+        discounted_cogs_cents=40_000,
+        discount_given_cents=200,
+        promo_active_days=10,
+        baseline_units=100,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "margin_neutral"
+    assert res["net_margin_bp"] >= 500
+
+
+def _clean_dq_snapshot() -> dict[str, int]:
+    return {
+        "abc_xyz_count": 3120,
+        "abc_xyz_invalid_classes": 0,
+        "abc_xyz_non_finite": 0,
+        "forecasts_count": 3120,
+        "forecasts_bad_rows": 0,
+        "basket_bad_rows": 0,
+        "lp_bad_rows": 0,
+        "supplier_count": 7,
+        "supplier_bad_rows": 0,
+        "phantom_bad_rows": 0,
+        "markdown_bad_rows": 0,
+        "promo_roi_bad_rows": 0,
+        "shift_diag_count": 1,
+        "negative_batches": 0,
+    }
+
+
+def test_dq_contracts_pass_on_healthy_snapshot():
+    passed, checks = evaluate_data_quality_contracts(_clean_dq_snapshot())
+    assert passed is True
+    assert len(checks) == 12
+    assert all(c["passed"] is True for c in checks)
+
+
+def test_dq_contracts_fail_on_empty_abc_xyz_or_nan_values():
+    snap = _clean_dq_snapshot()
+    snap["abc_xyz_count"] = 0
+    snap["abc_xyz_non_finite"] = 2
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["abc_xyz_non_empty"] is False
+    assert by_name["abc_xyz_finite_values"] is False
+
+
+def test_dq_contracts_fail_on_negative_fefo_batch_and_invalid_phantom_prob():
+    snap = _clean_dq_snapshot()
+    snap["negative_batches"] = 1
+    snap["phantom_bad_rows"] = 3
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["inventory_batches_non_negative"] is False
+    assert by_name["phantom_stock_valid_prob"] is False
+
+
+def test_dq_contracts_fail_on_invalid_supplier_grade_and_basket_bounds():
+    snap = _clean_dq_snapshot()
+    snap["supplier_bad_rows"] = 1
+    snap["basket_bad_rows"] = 4
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["supplier_scorecards_valid_grades"] is False
+    assert by_name["basket_rules_valid_bounds"] is False
+
+
+def test_dq_contracts_fail_on_bad_promo_roi_and_missing_shift_diagnostics():
+    snap = _clean_dq_snapshot()
+    snap["promo_roi_bad_rows"] = 1
+    snap["shift_diag_count"] = 0
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["promo_roi_valid_verdicts"] is False
+    assert by_name["shift_diagnostics_fresh"] is False
+
+
+def test_markdown_elasticity_never_recommends_below_zero_recovery():
+    sol = solve_optimal_markdown(
+        qty_remaining=100,
+        days_left=1,
+        avg_daily_units=10.0,
+        sell_price_cents=150,
+        unit_cost_cents=140,
+        elasticity=2.5,
+    )
+    assert sol["expected_recovery_cents"] >= 0
+    assert sol["recommended_promo_price_cents"] >= 1
+    assert 0 <= sol["recommended_discount_bp"] <= 9500
+
+
+def test_supplier_otif_handles_partial_and_cost_savings_deliveries():
+    deliveries = [
+        {"lead_days": 3.0, "ordered_units": 100, "received_units": 98, "po_cost_cents": 50_000, "invoice_cost_cents": 49_000},
+        {"lead_days": 2.5, "ordered_units": 100, "received_units": 100, "po_cost_cents": 50_000, "invoice_cost_cents": 50_000},
+    ]
+    res = compute_supplier_otif_metrics(deliveries, expected_lead_days=3)
+    assert res["on_time_rate_pct"] == 100.0
+    assert res["in_full_rate_pct"] == 50.0
+    assert res["otif_rate_pct"] == 50.0
+    assert res["cost_variance_rate_pct"] == 50.0
+    assert res["grade"] in ("C", "D")
+
 

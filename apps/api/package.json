@@ -8,7 +8,7 @@
     "start:prod": "node dist/server.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:push": "drizzle-kit push --force",
+    "db:push": "drizzle-kit push --force && tsx src/db/applyConstraints.ts",
     "db:seed": "tsx src/db/seed.ts",
     "test": "vitest run"
   },
