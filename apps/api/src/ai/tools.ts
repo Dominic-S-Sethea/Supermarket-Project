@@ -7,17 +7,21 @@ import {
   type CartInputLine,
   type PromotionRule,
 } from "@supermarket/shared";
-import { and, desc, eq, ilike, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import {
   aiProposedActions,
   analyticsAbcXyz,
   analyticsBasketRules,
   analyticsDemandForecasts,
+  analyticsDynamicMarkdowns,
   analyticsLpAnomalies,
+  analyticsPhantomStock,
   analyticsShiftDiagnostics,
+  analyticsSupplierScorecards,
   categories,
   db,
   departments,
+  grnVariances,
   inventoryBatches,
   marginAlerts,
   productBarcodes,
@@ -25,6 +29,7 @@ import {
   shiftExperiments,
   stockBaselines,
   stockMovements,
+  storeTasks,
   supplierProducts,
   suppliers,
   taxRates,
@@ -223,6 +228,49 @@ export const COPILOT_TOOLS: CopilotToolDefinition[] = [
         },
       },
       required: ["name", "promoType"],
+    },
+  },
+  {
+    type: "function",
+    name: "get_supplier_scorecards",
+    description:
+      "Get 90-day Supplier OTIF scorecards (on-time, in-full, lead-time variability, A-D grade) and open 3-way PO/GRN/invoice dock variance exposure.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "get_phantom_stock_alerts",
+    description:
+      "Get open Poisson phantom-stock (silent zero-sales ghost inventory) alerts ranked by probability and estimated book value at risk.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max SKUs to return (default 10, max 25)." },
+      },
+    },
+  },
+  {
+    type: "function",
+    name: "get_dynamic_markdowns",
+    description:
+      "Get elasticity-optimized FEFO dynamic markdown recommendations for near-expiry batches with incremental cash recovery estimates.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max batches to return (default 10, max 25)." },
+      },
+    },
+  },
+  {
+    type: "function",
+    name: "get_floor_tasks",
+    description:
+      "Get today's pending store floor task checklist (pre-open restocks, blind cycle counts, 07:30 shelf tags, expiry markdowns) ranked by priority.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max tasks to return (default 12, max 30)." },
+      },
     },
   },
 ];
@@ -1084,6 +1132,146 @@ async function executeCopilotToolInner(
         proposedActionId: action.id,
         status: "pending_approval",
         ...previewJson,
+      };
+    }
+
+    case "get_supplier_scorecards": {
+      const rows = await db
+        .select({
+          supplierName: suppliers.name,
+          grade: analyticsSupplierScorecards.grade,
+          otifRatePct: analyticsSupplierScorecards.otifRatePct,
+          onTimeRatePct: analyticsSupplierScorecards.onTimeRatePct,
+          inFullRatePct: analyticsSupplierScorecards.inFullRatePct,
+          avgLeadTimeDays: analyticsSupplierScorecards.avgLeadTimeDays,
+          leadTimeStdDays: analyticsSupplierScorecards.leadTimeStdDays,
+          costVarianceRatePct: analyticsSupplierScorecards.costVarianceRatePct,
+          totalVarianceCents: analyticsSupplierScorecards.totalVarianceCents,
+        })
+        .from(analyticsSupplierScorecards)
+        .innerJoin(suppliers, eq(analyticsSupplierScorecards.supplierId, suppliers.id))
+        .orderBy(asc(analyticsSupplierScorecards.otifRatePct));
+
+      const [openVars] = await db
+        .select({
+          cnt: sql<number>`count(*)::int`,
+          impactCents: sql<number>`coalesce(sum(${grnVariances.financialImpactCents}), 0)::bigint`,
+        })
+        .from(grnVariances)
+        .where(inArray(grnVariances.status, ["open", "disputed"]));
+
+      return {
+        supplierCount: rows.length,
+        openVarianceCount: Number(openVars?.cnt ?? 0),
+        openVarianceImpactUsd: formatMoney(Number(openVars?.impactCents ?? 0)),
+        scorecards: rows.map((r) => ({
+          supplierName: r.supplierName,
+          grade: r.grade,
+          otifPct: Number(r.otifRatePct.toFixed(1)),
+          onTimePct: Number(r.onTimeRatePct.toFixed(1)),
+          inFullPct: Number(r.inFullRatePct.toFixed(1)),
+          leadTimeDays: `${r.avgLeadTimeDays.toFixed(1)}±${r.leadTimeStdDays.toFixed(1)}d`,
+          costVariancePct: Number(r.costVarianceRatePct.toFixed(1)),
+        })),
+      };
+    }
+
+    case "get_phantom_stock_alerts": {
+      const limit = finiteIntInRange(args.limit, 1, 25) ?? 10;
+      const rows = await db
+        .select({
+          sku: products.sku,
+          name: products.name,
+          aisleLocation: products.aisleLocation,
+          bookStockUnits: analyticsPhantomStock.bookStockUnits,
+          daysSinceLastSale: analyticsPhantomStock.daysSinceLastSale,
+          phantomProb: analyticsPhantomStock.phantomProb,
+          estimatedValueAtRiskCents: analyticsPhantomStock.estimatedValueAtRiskCents,
+        })
+        .from(analyticsPhantomStock)
+        .innerJoin(products, eq(analyticsPhantomStock.productId, products.id))
+        .where(eq(analyticsPhantomStock.status, "open"))
+        .orderBy(desc(analyticsPhantomStock.phantomProb))
+        .limit(limit);
+
+      const totalAtRisk = rows.reduce((s, r) => s + r.estimatedValueAtRiskCents, 0);
+      return {
+        openAlerts: rows.length,
+        totalAtRiskUsd: formatMoney(totalAtRisk),
+        items: rows.map((r) => ({
+          sku: r.sku,
+          name: r.name,
+          aisle: r.aisleLocation,
+          bookStock: r.bookStockUnits,
+          silentDays: Number(r.daysSinceLastSale.toFixed(1)),
+          phantomProbPct: Math.round(r.phantomProb * 100),
+          atRiskUsd: formatMoney(r.estimatedValueAtRiskCents),
+        })),
+      };
+    }
+
+    case "get_dynamic_markdowns": {
+      const limit = finiteIntInRange(args.limit, 1, 25) ?? 10;
+      const rows = await db
+        .select({
+          sku: products.sku,
+          name: products.name,
+          daysLeft: analyticsDynamicMarkdowns.daysLeft,
+          qtyRemaining: analyticsDynamicMarkdowns.qtyRemaining,
+          recommendedDiscountBp: analyticsDynamicMarkdowns.recommendedDiscountBp,
+          recommendedPromoPriceCents: analyticsDynamicMarkdowns.recommendedPromoPriceCents,
+          expectedRecoveryCents: analyticsDynamicMarkdowns.expectedRecoveryCents,
+          baselineNoPromoRecoveryCents: analyticsDynamicMarkdowns.baselineNoPromoRecoveryCents,
+        })
+        .from(analyticsDynamicMarkdowns)
+        .innerJoin(products, eq(analyticsDynamicMarkdowns.productId, products.id))
+        .where(eq(analyticsDynamicMarkdowns.status, "recommended"))
+        .orderBy(asc(analyticsDynamicMarkdowns.daysLeft), desc(analyticsDynamicMarkdowns.expectedRecoveryCents))
+        .limit(limit);
+
+      const totalLift = rows.reduce(
+        (s, r) => s + Math.max(0, r.expectedRecoveryCents - r.baselineNoPromoRecoveryCents),
+        0
+      );
+      return {
+        recommendedCount: rows.length,
+        totalIncrementalRecoveryUsd: formatMoney(totalLift),
+        items: rows.map((r) => ({
+          sku: r.sku,
+          name: r.name,
+          daysLeft: r.daysLeft,
+          qtyRemaining: r.qtyRemaining,
+          recommendedDiscount: formatBp(r.recommendedDiscountBp),
+          promoPriceUsd: formatMoney(r.recommendedPromoPriceCents),
+          incrementalRecoveryUsd: formatMoney(
+            Math.max(0, r.expectedRecoveryCents - r.baselineNoPromoRecoveryCents)
+          ),
+        })),
+      };
+    }
+
+    case "get_floor_tasks": {
+      const limit = finiteIntInRange(args.limit, 1, 30) ?? 12;
+      const rows = await db
+        .select({
+          taskDate: storeTasks.taskDate,
+          shiftBucket: storeTasks.shiftBucket,
+          taskType: storeTasks.taskType,
+          priority: storeTasks.priority,
+          title: storeTasks.title,
+          aisleLocation: storeTasks.aisleLocation,
+          targetQty: storeTasks.targetQty,
+          status: storeTasks.status,
+        })
+        .from(storeTasks)
+        .where(eq(storeTasks.status, "pending"))
+        .orderBy(asc(storeTasks.priority), desc(storeTasks.taskDate))
+        .limit(limit);
+
+      return {
+        pendingTasks: rows.length,
+        urgentCount: rows.filter((r) => r.priority === 1).length,
+        tasks: rows,
       };
     }
 

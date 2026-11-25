@@ -1638,4 +1638,38 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       })
       .where(eq(storeTasks.id, sampleTask.id));
   });
+
+  it("Production Hardening: verifies live DB /api/health readiness probe and M1-M3 AI Copilot read tools", async () => {
+    const liveRes = await app.inject({ method: "GET", url: "/api/health/live" });
+    expect(liveRes.statusCode).toBe(200);
+    expect(liveRes.json().status).toBe("ok");
+
+    const healthRes = await app.inject({ method: "GET", url: "/api/health" });
+    expect(healthRes.statusCode).toBe(200);
+    const hBody = healthRes.json() as { status: string; db: string; dbLatencyMs: number };
+    expect(hBody.status).toBe("ok");
+    expect(hBody.db).toBe("connected");
+    expect(hBody.dbLatencyMs).toBeGreaterThanOrEqual(0);
+
+    // Exercise all 4 new M1-M3 Copilot tools through the chat fallback router
+    const chatRes = await app.inject({
+      method: "POST",
+      url: "/api/ai/chat",
+      headers: authHeaders(),
+      payload: {
+        message: "Show supplier OTIF scorecards, phantom stock ghost SKUs, dynamic markdowns, and today's floor task checklist",
+      },
+    });
+    expect(chatRes.statusCode).toBe(200);
+    const chatData = chatRes.json() as {
+      conversationId: string;
+      toolTraces: { tool: string }[];
+    };
+    const toolsCalled = new Set(chatData.toolTraces.map((t) => t.tool));
+    expect(toolsCalled.has("get_supplier_scorecards")).toBe(true);
+    expect(toolsCalled.has("get_phantom_stock_alerts")).toBe(true);
+    expect(toolsCalled.has("get_dynamic_markdowns")).toBe(true);
+    expect(toolsCalled.has("get_floor_tasks")).toBe(true);
+    await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
+  });
 });

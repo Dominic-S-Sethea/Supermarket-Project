@@ -90,11 +90,35 @@ export async function buildApp(logger = true) {
     return reply.status(500).send({ error: "Internal server error." });
   });
 
-  app.get("/api/health", async () => ({
+  app.get("/api/health/live", async () => ({
     status: "ok",
     service: "supermarket-os-api",
+    uptimeSec: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
   }));
+
+  app.get("/api/health", async (_req, reply) => {
+    const startMs = Date.now();
+    try {
+      await db.execute(sql`SELECT 1`);
+      return {
+        status: "ok",
+        service: "supermarket-os-api",
+        db: "connected",
+        dbLatencyMs: Date.now() - startMs,
+        uptimeSec: Math.round(process.uptime()),
+        timestamp: new Date().toISOString(),
+      };
+    } catch (err) {
+      app.log.error({ err }, "Database readiness probe failed");
+      return reply.status(503).send({
+        status: "degraded",
+        service: "supermarket-os-api",
+        db: "disconnected",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
 
   await app.register(authRoutes);
   await app.register(catalogRoutes);
