@@ -73,9 +73,11 @@ interface DeptRow {
 
 export function OverviewView({
   userRole = "owner",
+  allowedTabs,
   onNavigate,
 }: {
   userRole?: UserRole;
+  allowedTabs?: string[];
   onNavigate?: (tab: "operations" | "forecasting" | "abc-lp" | "catalog") => void;
 }) {
   const [days, setDays] = useState(30);
@@ -84,42 +86,70 @@ export function OverviewView({
   const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
   const [refreshingBriefing, setRefreshingBriefing] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
-  const load = async (windowDays: number) => {
+  const load = async (windowDays: number, signal?: AbortSignal) => {
     setLoading(true);
+    setErrorMsg(null);
     try {
       const [ov, dp, br] = await Promise.all([
-        apiGet<OverviewData>(`/api/analytics/overview?days=${windowDays}`),
-        apiGet<{ departments: DeptRow[] }>("/api/analytics/departments"),
-        apiGet<DailyBriefing>("/api/ai/briefing").catch(() => null),
+        apiGet<OverviewData>(`/api/analytics/overview?days=${windowDays}`, signal),
+        apiGet<{ departments: DeptRow[] }>("/api/analytics/departments", signal),
+        apiGet<DailyBriefing>("/api/ai/briefing", signal).catch(() => null),
       ]);
+      if (signal?.aborted) return;
       setOverview(ov);
       setDepts(dp.departments);
       if (br) setBriefing(br);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading store overview analytics.");
+      }
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
     }
   };
 
   const handleRefreshBriefing = async () => {
     setRefreshingBriefing(true);
+    setErrorMsg(null);
     try {
       const br = await apiPost<DailyBriefing>("/api/ai/briefing/refresh", {});
       setBriefing(br);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed refreshing AI morning briefing.");
     } finally {
       setRefreshingBriefing(false);
     }
   };
 
   useEffect(() => {
-    void load(days);
+    const controller = new AbortController();
+    void load(days, controller.signal);
+    return () => controller.abort();
   }, [days]);
 
   if (loading && !overview) {
     return <div className="panel">Loading store analytics from PostgreSQL...</div>;
   }
-  if (!overview) return null;
+
+  if (!overview) {
+    return (
+      <div className="panel stack-md" style={{ gap: 12 }}>
+        <div className="banner banner-red">
+          <span>{errorMsg ?? "Unable to load store executive overview."}</span>
+        </div>
+        <div>
+          <button className="btn btn-primary" onClick={() => void load(days)}>
+            <RefreshCw size={14} /> Retry Loading Overview
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const { kpis, dailyTrend, hourlyTraffic, paymentMix } = overview;
   const maxSales = Math.max(1, ...dailyTrend.map((d) => d.salesCents));
@@ -176,9 +206,10 @@ export function OverviewView({
           <button
             id="overview-refresh-btn"
             className="btn"
+            disabled={loading}
             onClick={() => void load(days)}
           >
-            <RefreshCw size={14} /> Refresh
+            <RefreshCw size={14} /> {loading ? "Refreshing..." : "Refresh"}
           </button>
           <a
             id="export-accounting-csv-link"
@@ -190,6 +221,15 @@ export function OverviewView({
           </a>
         </div>
       </header>
+
+      {errorMsg && (
+        <div className="banner banner-red" style={{ marginBottom: 16 }}>
+          <span>{errorMsg}</span>
+          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {briefing && (
         <section className="panel briefing-card" style={{ marginBottom: 20 }}>
@@ -216,37 +256,42 @@ export function OverviewView({
             )}
           </div>
           <div className="briefing-grid">
-            {briefing.bullets.map((b, idx) => (
-              <div key={`${b.title}-${idx}`} className="briefing-bullet">
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-                  <span
-                    className={`tag ${
-                      b.severity === "critical"
-                        ? "tag-red"
-                        : b.severity === "warning"
-                          ? "tag-amber"
-                          : "tag-blue"
-                    }`}
-                  >
-                    {b.severity.toUpperCase()}
-                  </span>
-                  <span className="mono" style={{ fontSize: 12, fontWeight: 700 }}>{b.metric}</span>
+            {briefing.bullets.map((b, idx) => {
+              const canInspect = Boolean(
+                onNavigate && (!allowedTabs || allowedTabs.includes(b.targetTab))
+              );
+              return (
+                <div key={`${b.title}-${idx}`} className="briefing-bullet">
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                    <span
+                      className={`tag ${
+                        b.severity === "critical"
+                          ? "tag-red"
+                          : b.severity === "warning"
+                            ? "tag-amber"
+                            : "tag-blue"
+                      }`}
+                    >
+                      {b.severity.toUpperCase()}
+                    </span>
+                    <span className="mono" style={{ fontSize: 12, fontWeight: 700 }}>{b.metric}</span>
+                  </div>
+                  <strong style={{ fontSize: 13 }}>{b.title}</strong>
+                  <div style={{ fontSize: 12, color: "var(--ink-secondary)", lineHeight: 1.45 }}>
+                    {b.detail}
+                  </div>
+                  {canInspect && onNavigate && (
+                    <button
+                      className="btn btn-sm"
+                      style={{ width: "fit-content", marginTop: "auto" }}
+                      onClick={() => onNavigate(b.targetTab)}
+                    >
+                      Inspect <ArrowRight size={12} />
+                    </button>
+                  )}
                 </div>
-                <strong style={{ fontSize: 13 }}>{b.title}</strong>
-                <div style={{ fontSize: 12, color: "var(--ink-secondary)", lineHeight: 1.45 }}>
-                  {b.detail}
-                </div>
-                {onNavigate && (
-                  <button
-                    className="btn btn-sm"
-                    style={{ width: "fit-content", marginTop: "auto" }}
-                    onClick={() => onNavigate(b.targetTab)}
-                  >
-                    Inspect <ArrowRight size={12} />
-                  </button>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       )}
@@ -306,76 +351,82 @@ export function OverviewView({
               </div>
             )}
           </div>
-          <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="img" aria-label="Daily sales and profit trend">
-            {[0, 0.25, 0.5, 0.75, 1].map((t) => {
-              const y = padT + plotH - t * plotH;
-              return (
-                <g key={t}>
-                  <line
-                    x1={padL}
-                    y1={y}
-                    x2={chartW - padR}
-                    y2={y}
-                    stroke="hsl(36, 14%, 89%)"
-                    strokeDasharray={t === 0 ? undefined : "3 3"}
-                  />
-                  <text
-                    x={padL - 8}
-                    y={y + 4}
-                    textAnchor="end"
-                    fontSize="10"
-                    fill="hsl(215, 10%, 54%)"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    ${Math.round((maxSales * t) / 100)}
-                  </text>
-                </g>
-              );
-            })}
-            {dailyTrend.map((d, i) => {
-              const x = padL + i * barStep + (barStep - barW) / 2;
-              const h = (d.salesCents / maxSales) * plotH;
-              const y = padT + plotH - h;
-              const isHover = hoveredIdx === i;
-              return (
-                <g
-                  key={d.day}
-                  onMouseEnter={() => setHoveredIdx(i)}
-                  onMouseLeave={() => setHoveredIdx(null)}
-                  style={{ cursor: "pointer" }}
-                >
-                  <rect
-                    x={x}
-                    y={y}
-                    width={barW}
-                    height={Math.max(1, h)}
-                    rx={2}
-                    fill={isHover ? "hsl(158, 62%, 27%)" : "hsl(158, 30%, 76%)"}
-                  />
-                  {(i === 0 || i === Math.floor(dailyTrend.length / 2) || i === dailyTrend.length - 1) && (
+          {dailyTrend.length === 0 ? (
+            <div style={{ color: "var(--ink-muted)", padding: "24px 0", textAlign: "center" }}>
+              No completed sales recorded in the last {days} days.
+            </div>
+          ) : (
+            <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="img" aria-label="Daily sales and profit trend">
+              {[0, 0.25, 0.5, 0.75, 1].map((t) => {
+                const y = padT + plotH - t * plotH;
+                return (
+                  <g key={t}>
+                    <line
+                      x1={padL}
+                      y1={y}
+                      x2={chartW - padR}
+                      y2={y}
+                      stroke="hsl(36, 14%, 89%)"
+                      strokeDasharray={t === 0 ? undefined : "3 3"}
+                    />
                     <text
-                      x={x + barW / 2}
-                      y={chartH - 7}
-                      textAnchor="middle"
+                      x={padL - 8}
+                      y={y + 4}
+                      textAnchor="end"
                       fontSize="10"
-                      fill="hsl(215, 10%, 50%)"
+                      fill="hsl(215, 10%, 54%)"
                       fontFamily="JetBrains Mono, monospace"
                     >
-                      {d.day.slice(5)}
+                      ${Math.round((maxSales * t) / 100)}
                     </text>
-                  )}
-                </g>
-              );
-            })}
-            {profitPoints && (
-              <polyline
-                fill="none"
-                stroke="hsl(158, 64%, 24%)"
-                strokeWidth="2.2"
-                points={profitPoints}
-              />
-            )}
-          </svg>
+                  </g>
+                );
+              })}
+              {dailyTrend.map((d, i) => {
+                const x = padL + i * barStep + (barStep - barW) / 2;
+                const h = (d.salesCents / maxSales) * plotH;
+                const y = padT + plotH - h;
+                const isHover = hoveredIdx === i;
+                return (
+                  <g
+                    key={d.day}
+                    onMouseEnter={() => setHoveredIdx(i)}
+                    onMouseLeave={() => setHoveredIdx(null)}
+                    style={{ cursor: "pointer" }}
+                  >
+                    <rect
+                      x={x}
+                      y={y}
+                      width={barW}
+                      height={Math.max(1, h)}
+                      rx={2}
+                      fill={isHover ? "hsl(158, 62%, 27%)" : "hsl(158, 30%, 76%)"}
+                    />
+                    {(i === 0 || i === Math.floor(dailyTrend.length / 2) || i === dailyTrend.length - 1) && (
+                      <text
+                        x={x + barW / 2}
+                        y={chartH - 7}
+                        textAnchor="middle"
+                        fontSize="10"
+                        fill="hsl(215, 10%, 50%)"
+                        fontFamily="JetBrains Mono, monospace"
+                      >
+                        {d.day.slice(5)}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+              {profitPoints && (
+                <polyline
+                  fill="none"
+                  stroke="hsl(158, 64%, 24%)"
+                  strokeWidth="2.2"
+                  points={profitPoints}
+                />
+              )}
+            </svg>
+          )}
         </section>
 
         <section className="panel">
@@ -386,49 +437,55 @@ export function OverviewView({
             </div>
           </div>
           <div className="stack-md" style={{ gap: 12 }}>
-            {paymentMix.map((p) => {
-              const pct = Math.round((p.totalCents / totalPayCents) * 100);
-              return (
-                <div key={p.method}>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      fontSize: 13,
-                      marginBottom: 4,
-                    }}
-                  >
-                    <span style={{ fontWeight: 600, textTransform: "capitalize" }}>
-                      {p.method.replace("_", " ")}
-                    </span>
-                    <span className="mono">
-                      {formatMoney(p.totalCents)} ({pct}%)
-                    </span>
-                  </div>
-                  <div
-                    style={{
-                      height: 8,
-                      borderRadius: 4,
-                      background: "var(--bg-subtle)",
-                      overflow: "hidden",
-                    }}
-                  >
+            {paymentMix.length === 0 ? (
+              <div style={{ color: "var(--ink-muted)", padding: "12px 0" }}>
+                No settled payments in this period.
+              </div>
+            ) : (
+              paymentMix.map((p) => {
+                const pct = Math.round((p.totalCents / totalPayCents) * 100);
+                return (
+                  <div key={p.method}>
                     <div
                       style={{
-                        width: `${pct}%`,
-                        height: "100%",
-                        background:
-                          p.method === "card"
-                            ? "var(--accent-primary)"
-                            : p.method === "cash"
-                              ? "hsl(214, 24%, 28%)"
-                              : "var(--accent-blue)",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontSize: 13,
+                        marginBottom: 4,
                       }}
-                    />
+                    >
+                      <span style={{ fontWeight: 600, textTransform: "capitalize" }}>
+                        {p.method.replace("_", " ")}
+                      </span>
+                      <span className="mono">
+                        {formatMoney(p.totalCents)} ({pct}%)
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        height: 8,
+                        borderRadius: 4,
+                        background: "var(--bg-subtle)",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${pct}%`,
+                          height: "100%",
+                          background:
+                            p.method === "card"
+                              ? "var(--accent-primary)"
+                              : p.method === "cash"
+                                ? "hsl(214, 24%, 28%)"
+                                : "var(--accent-blue)",
+                        }}
+                      />
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
             <div
               style={{
                 marginTop: 8,
@@ -456,24 +513,30 @@ export function OverviewView({
             </p>
           </div>
         </div>
-        <div className="heatmap-row">
-          {hourlyTraffic.map((h) => {
-            const intensity = h.receipts / maxHourReceipts;
-            const bg = `hsl(158, ${Math.round(28 + intensity * 38)}%, ${Math.round(95 - intensity * 52)}%)`;
-            const fg = intensity > 0.58 ? "#fff" : "var(--ink-primary)";
-            return (
-              <div
-                key={h.hour}
-                className="heat-cell"
-                style={{ background: bg, color: fg }}
-                title={`${h.hour}:00 — ${h.receipts} receipts, ${formatMoney(h.salesCents)}`}
-              >
-                <span className="heat-hour">{String(h.hour).padStart(2, "0")}:00</span>
-                <span className="heat-val">{h.receipts}</span>
-              </div>
-            );
-          })}
-        </div>
+        {hourlyTraffic.length === 0 ? (
+          <div style={{ color: "var(--ink-muted)", padding: "12px 0" }}>
+            No hourly checkout traffic recorded in this window.
+          </div>
+        ) : (
+          <div className="heatmap-row">
+            {hourlyTraffic.map((h) => {
+              const intensity = h.receipts / maxHourReceipts;
+              const bg = `hsl(158, ${Math.round(28 + intensity * 38)}%, ${Math.round(95 - intensity * 52)}%)`;
+              const fg = intensity > 0.58 ? "#fff" : "var(--ink-primary)";
+              return (
+                <div
+                  key={h.hour}
+                  className="heat-cell"
+                  style={{ background: bg, color: fg }}
+                  title={`${h.hour}:00 — ${h.receipts} receipts, ${formatMoney(h.salesCents)}`}
+                >
+                  <span className="heat-hour">{String(h.hour).padStart(2, "0")}:00</span>
+                  <span className="heat-val">{h.receipts}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       <section className="panel">
@@ -501,34 +564,42 @@ export function OverviewView({
               </tr>
             </thead>
             <tbody>
-              {depts.map((d) => {
-                const marginOk = d.grossMarginBp >= d.targetMarginBp - 150;
-                return (
-                  <tr key={d.id}>
-                    <td>
-                      <strong>{d.name}</strong>{" "}
-                      <span className="tag tag-neutral mono">{d.code}</span>
-                    </td>
-                    <td className="text-right mono">{d.skuCount}</td>
-                    <td className="text-right mono">{d.units60d.toLocaleString()}</td>
-                    <td className="text-right mono">{formatMoney(d.netSales60dCents)}</td>
-                    <td className="text-right mono">{formatMoney(d.grossProfit60dCents)}</td>
-                    <td className="text-right">
-                      <span className={`tag mono ${marginOk ? "tag-green" : "tag-amber"}`}>
-                        {formatBp(d.grossMarginBp)}
-                      </span>{" "}
-                      <span style={{ fontSize: 11.5, color: "var(--ink-muted)" }} className="mono">
-                        / {formatBp(d.targetMarginBp)}
-                      </span>
-                    </td>
-                    <td className="text-right mono">{formatMoney(d.stockCostCents)}</td>
-                    <td className="text-right mono">
-                      <strong>${d.gmroii.toFixed(2)}</strong>
-                    </td>
-                    <td className="text-right mono">{d.annualTurns.toFixed(1)}×</td>
-                  </tr>
-                );
-              })}
+              {depts.length === 0 ? (
+                <tr>
+                  <td colSpan={9} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
+                    No department profitability metrics available yet.
+                  </td>
+                </tr>
+              ) : (
+                depts.map((d) => {
+                  const marginOk = d.grossMarginBp >= d.targetMarginBp - 150;
+                  return (
+                    <tr key={d.id}>
+                      <td>
+                        <strong>{d.name}</strong>{" "}
+                        <span className="tag tag-neutral mono">{d.code}</span>
+                      </td>
+                      <td className="text-right mono">{d.skuCount}</td>
+                      <td className="text-right mono">{d.units60d.toLocaleString()}</td>
+                      <td className="text-right mono">{formatMoney(d.netSales60dCents)}</td>
+                      <td className="text-right mono">{formatMoney(d.grossProfit60dCents)}</td>
+                      <td className="text-right">
+                        <span className={`tag mono ${marginOk ? "tag-green" : "tag-amber"}`}>
+                          {formatBp(d.grossMarginBp)}
+                        </span>{" "}
+                        <span style={{ fontSize: 11.5, color: "var(--ink-muted)" }} className="mono">
+                          / {formatBp(d.targetMarginBp)}
+                        </span>
+                      </td>
+                      <td className="text-right mono">{formatMoney(d.stockCostCents)}</td>
+                      <td className="text-right mono">
+                        <strong>${d.gmroii.toFixed(2)}</strong>
+                      </td>
+                      <td className="text-right mono">{d.annualTurns.toFixed(1)}×</td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>

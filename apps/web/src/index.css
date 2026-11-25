@@ -367,6 +367,7 @@ body,
 
 .panel-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -926,6 +927,32 @@ body,
   }
   .heatmap-row {
     grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+  .abc-grid {
+    min-width: 560px;
+  }
+}
+
+@media (max-width: 600px) {
+  .form-grid,
+  .persona-grid,
+  .tender-grid {
+    grid-template-columns: 1fr;
+  }
+  .pos-scan-bar {
+    flex-wrap: wrap;
+  }
+  .pos-scan-bar .input {
+    min-width: 0;
+    width: 100%;
+  }
+  .pagination {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .banner {
+    flex-wrap: wrap;
   }
 }
 

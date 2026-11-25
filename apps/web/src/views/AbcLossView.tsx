@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
-import { formatMoney } from "@supermarket/shared";
-import { ShieldAlert, Sparkles } from "lucide-react";
+import { formatMoney, type UserRole } from "@supermarket/shared";
+import { RefreshCw, ShieldAlert, Sparkles } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 
 interface MatrixCell {
@@ -66,19 +66,53 @@ interface TriageResult {
   }[];
 }
 
-export function AbcLossView() {
+export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
+  const canTriage = userRole === "owner" || userRole === "manager";
+
   const [selectedSegment, setSelectedSegment] = useState<string>("");
   const [matrix, setMatrix] = useState<MatrixCell[]>([]);
   const [skus, setSkus] = useState<AbcSkuRow[]>([]);
   const [cashiers, setCashiers] = useState<CashierAnomaly[]>([]);
   const [deadStock, setDeadStock] = useState<DeadStockRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [triageLoading, setTriageLoading] = useState<string | null>(null);
   const [triageResult, setTriageResult] = useState<{
     cashierName: string;
     data: TriageResult;
   } | null>(null);
 
+  const loadData = async (segmentFilter = selectedSegment, signal?: AbortSignal) => {
+    setLoading(true);
+    setErrorMsg(null);
+    try {
+      const qs = segmentFilter ? `?segment=${encodeURIComponent(segmentFilter)}` : "";
+      const [abc, lp] = await Promise.all([
+        apiGet<{ matrix: MatrixCell[]; skus: AbcSkuRow[] }>(`/api/analytics/abc-xyz${qs}`, signal),
+        apiGet<{
+          cashierAnomalies: CashierAnomaly[];
+          deadStockTraps: DeadStockRow[];
+        }>("/api/analytics/loss-prevention", signal),
+      ]);
+      if (signal?.aborted) return;
+      setMatrix(abc.matrix);
+      setSkus(abc.skus);
+      setCashiers(lp.cashierAnomalies);
+      setDeadStock(lp.deadStockTraps);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading ABC-XYZ & Loss Prevention data.");
+      }
+    } finally {
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
+    }
+  };
+
   const runCashierTriage = async (c: CashierAnomaly) => {
+    if (!canTriage || triageLoading) return;
+    setErrorMsg(null);
     setTriageLoading(c.id);
     try {
       const data = await apiPost<TriageResult>("/api/ai/triage", {
@@ -96,26 +130,17 @@ export function AbcLossView() {
         },
       });
       setTriageResult({ cashierName: c.cashierName, data });
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed running AI cashier risk triage.");
     } finally {
       setTriageLoading(null);
     }
   };
 
   useEffect(() => {
-    void (async () => {
-      const qs = selectedSegment ? `?segment=${selectedSegment}` : "";
-      const [abc, lp] = await Promise.all([
-        apiGet<{ matrix: MatrixCell[]; skus: AbcSkuRow[] }>(`/api/analytics/abc-xyz${qs}`),
-        apiGet<{
-          cashierAnomalies: CashierAnomaly[];
-          deadStockTraps: DeadStockRow[];
-        }>("/api/analytics/loss-prevention"),
-      ]);
-      setMatrix(abc.matrix);
-      setSkus(abc.skus);
-      setCashiers(lp.cashierAnomalies);
-      setDeadStock(lp.deadStockTraps);
-    })();
+    const controller = new AbortController();
+    void loadData(selectedSegment, controller.signal);
+    return () => controller.abort();
   }, [selectedSegment]);
 
   const cellMap = new Map(matrix.map((m) => [m.segment, m]));
@@ -130,12 +155,26 @@ export function AbcLossView() {
             Computed by the Python Analytics Worker across all 3,120 SKUs — triage high-profit staples vs. dead-stock cash traps and flag cashier anomalies.
           </p>
         </div>
-        {selectedSegment && (
-          <button className="btn" onClick={() => setSelectedSegment("")}>
-            Clear Filter ({selectedSegment})
+        <div className="header-actions">
+          {selectedSegment && (
+            <button className="btn" onClick={() => setSelectedSegment("")}>
+              Clear Filter ({selectedSegment})
+            </button>
+          )}
+          <button className="btn" disabled={loading} onClick={() => void loadData(selectedSegment)}>
+            <RefreshCw size={14} /> {loading ? "Loading..." : "Refresh"}
           </button>
-        )}
+        </div>
       </header>
+
+      {errorMsg && (
+        <div className="banner banner-red" style={{ marginBottom: 16 }}>
+          <span>{errorMsg}</span>
+          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
 
       <section className="panel" style={{ marginBottom: 20 }}>
         <div className="panel-header">
@@ -148,55 +187,57 @@ export function AbcLossView() {
           </div>
         </div>
 
-        <div className="abc-grid">
-          <div />
-          <div className="abc-axis-head">X · Steady / Smooth</div>
-          <div className="abc-axis-head">Y · Seasonal / Variable</div>
-          <div className="abc-axis-head">Z · Intermittent / Lumpy</div>
+        <div className="table-wrap">
+          <div className="abc-grid">
+            <div />
+            <div className="abc-axis-head">X · Steady / Smooth</div>
+            <div className="abc-axis-head">Y · Seasonal / Variable</div>
+            <div className="abc-axis-head">Z · Intermittent / Lumpy</div>
 
-          {(["A", "B", "C"] as const).map((abc) => (
-            <Fragment key={`row-${abc}`}>
-              <div className="abc-row-head">
-                <span>Class {abc}</span>
-                <span style={{ fontSize: 11, fontWeight: 400, color: "var(--ink-muted)" }}>
-                  {abc === "A" ? "Top 78% Profit" : abc === "B" ? "Next 16%" : "Bottom 6%"}
-                </span>
-              </div>
-              {(["X", "Y", "Z"] as const).map((xyz) => {
-                const seg = `${abc}${xyz}`;
-                const cell = cellMap.get(seg);
-                const tint =
-                  abc === "A" && xyz === "X"
-                    ? "hsl(156, 44%, 95%)"
-                    : abc === "C" && xyz === "Z"
-                      ? "hsl(4, 58%, 96%)"
-                      : abc === "A"
-                        ? "hsl(156, 26%, 97%)"
-                        : "var(--bg-surface)";
-                return (
-                  <button
-                    key={seg}
-                    className={`abc-cell ${selectedSegment === seg ? "selected" : ""}`}
-                    style={{ background: tint }}
-                    onClick={() => setSelectedSegment(selectedSegment === seg ? "" : seg)}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <strong className="mono" style={{ fontSize: 15 }}>
-                        {seg}
-                      </strong>
-                      <span className="tag tag-neutral mono">{cell?.skuCount ?? 0} SKUs</span>
-                    </div>
-                    <div className="mono" style={{ fontSize: 17, fontWeight: 700, marginTop: 8 }}>
-                      {formatMoney(cell?.profitCents ?? 0)}
-                    </div>
-                    <div style={{ fontSize: 11.5, color: "var(--ink-secondary)", marginTop: 3 }}>
-                      60d Profit · Avg GMROII <strong className="mono">${(cell?.avgGmroii ?? 0).toFixed(2)}</strong>
-                    </div>
-                  </button>
-                );
-              })}
-            </Fragment>
-          ))}
+            {(["A", "B", "C"] as const).map((abc) => (
+              <Fragment key={`row-${abc}`}>
+                <div className="abc-row-head">
+                  <span>Class {abc}</span>
+                  <span style={{ fontSize: 11, fontWeight: 400, color: "var(--ink-muted)" }}>
+                    {abc === "A" ? "Top 78% Profit" : abc === "B" ? "Next 16%" : "Bottom 6%"}
+                  </span>
+                </div>
+                {(["X", "Y", "Z"] as const).map((xyz) => {
+                  const seg = `${abc}${xyz}`;
+                  const cell = cellMap.get(seg);
+                  const tint =
+                    abc === "A" && xyz === "X"
+                      ? "hsl(156, 44%, 95%)"
+                      : abc === "C" && xyz === "Z"
+                        ? "hsl(4, 58%, 96%)"
+                        : abc === "A"
+                          ? "hsl(156, 26%, 97%)"
+                          : "var(--bg-surface)";
+                  return (
+                    <button
+                      key={seg}
+                      className={`abc-cell ${selectedSegment === seg ? "selected" : ""}`}
+                      style={{ background: tint }}
+                      onClick={() => setSelectedSegment(selectedSegment === seg ? "" : seg)}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <strong className="mono" style={{ fontSize: 15 }}>
+                          {seg}
+                        </strong>
+                        <span className="tag tag-neutral mono">{cell?.skuCount ?? 0} SKUs</span>
+                      </div>
+                      <div className="mono" style={{ fontSize: 17, fontWeight: 700, marginTop: 8 }}>
+                        {formatMoney(cell?.profitCents ?? 0)}
+                      </div>
+                      <div style={{ fontSize: 11.5, color: "var(--ink-secondary)", marginTop: 3 }}>
+                        60d Profit · Avg GMROII <strong className="mono">${(cell?.avgGmroii ?? 0).toFixed(2)}</strong>
+                      </div>
+                    </button>
+                  );
+                })}
+              </Fragment>
+            ))}
+          </div>
         </div>
       </section>
 
@@ -223,41 +264,53 @@ export function AbcLossView() {
               </tr>
             </thead>
             <tbody>
-              {skus.slice(0, 20).map((s) => (
-                <tr key={s.productId}>
-                  <td>
-                    <span
-                      className={`tag mono ${
-                        s.segment.startsWith("A")
-                          ? "tag-green"
-                          : s.segment.startsWith("B")
-                            ? "tag-blue"
-                            : "tag-red"
-                      }`}
-                    >
-                      {s.segment}
-                    </span>
-                  </td>
-                  <td>
-                    <div style={{ fontWeight: 600 }}>{s.name}</div>
-                    <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                      {s.sku} · {s.departmentName}
-                    </div>
-                  </td>
-                  <td className="text-right mono">{s.units60d.toLocaleString()}</td>
-                  <td className="text-right mono" style={{ fontWeight: 600 }}>
-                    {formatMoney(s.profit60dCents)}
-                  </td>
-                  <td className="text-right mono">{s.demandCv.toFixed(2)}</td>
-                  <td className="text-right mono">${s.gmroii.toFixed(2)}</td>
-                  <td className="text-right mono">
-                    {s.daysOfStock >= 999 ? "∞" : `${s.daysOfStock.toFixed(0)}d`}
-                  </td>
-                  <td style={{ fontSize: 12.5, color: "var(--ink-secondary)" }}>
-                    {s.recommendedAction}
+              {loading && skus.length === 0 ? (
+                <tr>
+                  <td colSpan={8}>Loading ABC-XYZ segmentation...</td>
+                </tr>
+              ) : skus.length === 0 ? (
+                <tr>
+                  <td colSpan={8} style={{ textAlign: "center", color: "var(--ink-muted)", padding: "20px 12px" }}>
+                    No ABC-XYZ records found{selectedSegment ? ` in segment ${selectedSegment}` : ""}. Run the Python analytics worker to compute segmentation.
                   </td>
                 </tr>
-              ))}
+              ) : (
+                skus.slice(0, 20).map((s) => (
+                  <tr key={s.productId}>
+                    <td>
+                      <span
+                        className={`tag mono ${
+                          s.segment.startsWith("A")
+                            ? "tag-green"
+                            : s.segment.startsWith("B")
+                              ? "tag-blue"
+                              : "tag-red"
+                        }`}
+                      >
+                        {s.segment}
+                      </span>
+                    </td>
+                    <td>
+                      <div style={{ fontWeight: 600 }}>{s.name}</div>
+                      <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                        {s.sku} · {s.departmentName}
+                      </div>
+                    </td>
+                    <td className="text-right mono">{s.units60d.toLocaleString()}</td>
+                    <td className="text-right mono" style={{ fontWeight: 600 }}>
+                      {formatMoney(s.profit60dCents)}
+                    </td>
+                    <td className="text-right mono">{s.demandCv.toFixed(2)}</td>
+                    <td className="text-right mono">${s.gmroii.toFixed(2)}</td>
+                    <td className="text-right mono">
+                      {s.daysOfStock >= 999 ? "∞" : `${s.daysOfStock.toFixed(0)}d`}
+                    </td>
+                    <td style={{ fontSize: 12.5, color: "var(--ink-secondary)" }}>
+                      {s.recommendedAction}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>
@@ -288,43 +341,57 @@ export function AbcLossView() {
                   <th className="text-right">Void %</th>
                   <th className="text-right">MAD Z</th>
                   <th>Risk</th>
-                  <th />
+                  {canTriage && <th />}
                 </tr>
               </thead>
               <tbody>
-                {cashiers.map((c) => (
-                  <tr key={c.id}>
-                    <td style={{ fontWeight: 600 }}>{c.cashierName}</td>
-                    <td className="text-right mono">{c.totalSalesCount.toLocaleString()}</td>
-                    <td className="text-right mono">{c.voidCount}</td>
-                    <td className="text-right mono">{c.refundCount}</td>
-                    <td className="text-right mono">{c.noSaleDrawerCount}</td>
-                    <td className="text-right mono">{c.voidRatePct.toFixed(2)}%</td>
-                    <td className="text-right mono">{c.zScore > 0 ? `+${c.zScore.toFixed(2)}` : c.zScore.toFixed(2)}</td>
-                    <td>
-                      <span
-                        className={`tag ${
-                          c.riskLevel === "high"
-                            ? "tag-red"
-                            : c.riskLevel === "elevated"
-                              ? "tag-amber"
-                              : "tag-green"
-                        }`}
-                      >
-                        {c.riskLevel.toUpperCase()}
-                      </span>
-                    </td>
-                    <td className="text-right">
-                      <button
-                        className="btn btn-sm"
-                        disabled={triageLoading === c.id}
-                        onClick={() => void runCashierTriage(c)}
-                      >
-                        <Sparkles size={11} /> {triageLoading === c.id ? "..." : "AI Triage"}
-                      </button>
+                {loading && cashiers.length === 0 ? (
+                  <tr>
+                    <td colSpan={canTriage ? 9 : 8}>Loading loss-prevention scorecard...</td>
+                  </tr>
+                ) : cashiers.length === 0 ? (
+                  <tr>
+                    <td colSpan={canTriage ? 9 : 8} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
+                      No cashier exception metrics computed yet.
                     </td>
                   </tr>
-                ))}
+                ) : (
+                  cashiers.map((c) => (
+                    <tr key={c.id}>
+                      <td style={{ fontWeight: 600 }}>{c.cashierName}</td>
+                      <td className="text-right mono">{c.totalSalesCount.toLocaleString()}</td>
+                      <td className="text-right mono">{c.voidCount}</td>
+                      <td className="text-right mono">{c.refundCount}</td>
+                      <td className="text-right mono">{c.noSaleDrawerCount}</td>
+                      <td className="text-right mono">{c.voidRatePct.toFixed(2)}%</td>
+                      <td className="text-right mono">{c.zScore > 0 ? `+${c.zScore.toFixed(2)}` : c.zScore.toFixed(2)}</td>
+                      <td>
+                        <span
+                          className={`tag ${
+                            c.riskLevel === "high"
+                              ? "tag-red"
+                              : c.riskLevel === "elevated"
+                                ? "tag-amber"
+                                : "tag-green"
+                          }`}
+                        >
+                          {c.riskLevel.toUpperCase()}
+                        </span>
+                      </td>
+                      {canTriage && (
+                        <td className="text-right">
+                          <button
+                            className="btn btn-sm"
+                            disabled={triageLoading !== null}
+                            onClick={() => void runCashierTriage(c)}
+                          >
+                            <Sparkles size={11} /> {triageLoading === c.id ? "..." : "AI Triage"}
+                          </button>
+                        </td>
+                      )}
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>
@@ -393,21 +460,33 @@ export function AbcLossView() {
                 </tr>
               </thead>
               <tbody>
-                {deadStock.slice(0, 12).map((d) => (
-                  <tr key={d.id}>
-                    <td>
-                      <div style={{ fontWeight: 600 }}>{d.name}</div>
-                      <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                        {d.sku} · {d.departmentName}
-                      </div>
-                    </td>
-                    <td className="text-right mono">{d.units60d}</td>
-                    <td className="text-right mono">{d.onHandUnits}</td>
-                    <td className="text-right mono" style={{ fontWeight: 600, color: "var(--accent-crimson)" }}>
-                      {formatMoney(d.tiedCapitalCents)}
+                {loading && deadStock.length === 0 ? (
+                  <tr>
+                    <td colSpan={4}>Loading dead-stock analysis...</td>
+                  </tr>
+                ) : deadStock.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
+                      No dead-stock capital traps detected!
                     </td>
                   </tr>
-                ))}
+                ) : (
+                  deadStock.slice(0, 12).map((d) => (
+                    <tr key={d.id}>
+                      <td>
+                        <div style={{ fontWeight: 600 }}>{d.name}</div>
+                        <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                          {d.sku} · {d.departmentName}
+                        </div>
+                      </td>
+                      <td className="text-right mono">{d.units60d}</td>
+                      <td className="text-right mono">{d.onHandUnits}</td>
+                      <td className="text-right mono" style={{ fontWeight: 600, color: "var(--accent-crimson)" }}>
+                        {formatMoney(d.tiedCapitalCents)}
+                      </td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>

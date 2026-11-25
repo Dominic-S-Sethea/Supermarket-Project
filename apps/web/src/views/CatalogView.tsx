@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { buildValidEan13, computeMarginBp, formatBp, formatMoney } from "@supermarket/shared";
+import {
+  buildValidEan13,
+  computeNetMarginBp,
+  formatBp,
+  formatMoney,
+  type UserRole,
+} from "@supermarket/shared";
 import { Barcode, Plus, Printer, Search, Sparkles, Upload, X } from "lucide-react";
 import { apiDelete, apiGet, apiPost } from "../api";
 
@@ -24,6 +30,8 @@ interface ProductItem {
   baseUnitLabel: string;
   avgCostCents: number;
   minMarginBp: number;
+  taxRateBp?: number;
+  taxInclusive?: boolean;
   requiresAgeCheck: boolean;
   onHandUnits: number;
   primaryBarcode: string;
@@ -64,6 +72,11 @@ interface CsvPreviewResponse {
   }[];
 }
 
+interface StatusNotice {
+  kind: "green" | "red";
+  text: string;
+}
+
 const SAMPLE_DIRTY_CSV = `sku,name,brand,barcode,pack_qty,pack_label,unit_cost,sell_price,category
 BEV-NEW1,Craft Ginger Beer 330ml Can,Bundaberg,${buildValidEan13("931", 700101)},1,Single Can,1.10,1.95,Cola & Sparkling Soda
 NDL-NEW2,Sapporo Tonkotsu Deluxe 110g,Sapporo Ichiban,${buildValidEan13("490", 700102)},1,Single Pack,0.85,1.45,Soup Packet Noodles
@@ -71,7 +84,17 @@ SNK-NEW3,Sea Salt Kettle Chips 150g,Kettle Brand,${buildValidEan13("084", 700103
 BAD-CHK1,Corrupt Check Digit Test,TestBrand,8851000001009,1,Single,0.90,1.50,Potato Chips
 BAD-MRG2,Below Cost Error Item,TestBrand,${buildValidEan13("885", 700105)},1,Single,2.50,1.99,Potato Chips`;
 
-export function CatalogView({ departments }: { departments: DepartmentOption[] }) {
+export function CatalogView({
+  departments,
+  userRole = "owner",
+}: {
+  departments: DepartmentOption[];
+  userRole?: UserRole;
+}) {
+  const canEditCatalog = userRole === "owner" || userRole === "manager";
+  const canCycleCount =
+    userRole === "owner" || userRole === "manager" || userRole === "stock_clerk";
+
   const [search, setSearch] = useState("");
   const [semanticMode, setSemanticMode] = useState(false);
   const [semanticEngine, setSemanticEngine] = useState<string | null>(null);
@@ -84,6 +107,7 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
     pageSize: 40,
   });
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selected, setSelected] = useState<ProductItem | null>(null);
 
   // Add Barcode form
@@ -91,7 +115,8 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
   const [newPackQty, setNewPackQty] = useState(6);
   const [newPackLabel, setNewPackLabel] = useState("6-Pack");
   const [newPackPrice, setNewPackPrice] = useState("9.50");
-  const [drawerMsg, setDrawerMsg] = useState<string | null>(null);
+  const [drawerNotice, setDrawerNotice] = useState<StatusNotice | null>(null);
+  const [drawerBusy, setDrawerBusy] = useState(false);
   const [zplOutput, setZplOutput] = useState<string | null>(null);
   const [cycleQty, setCycleQty] = useState("");
 
@@ -99,18 +124,37 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
   const [showImport, setShowImport] = useState(false);
   const [csvText, setCsvText] = useState(SAMPLE_DIRTY_CSV);
   const [preview, setPreview] = useState<CsvPreviewResponse | null>(null);
-  const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [importNotice, setImportNotice] = useState<StatusNotice | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+
+  useEffect(() => {
+    if (!selected && !showImport) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setSelected(null);
+        setShowImport(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selected, showImport]);
 
   const loadProducts = async (p = page, signal?: AbortSignal) => {
     setLoading(true);
+    setLoadError(null);
     try {
       if (semanticMode && search.trim().length >= 2) {
         const res = await apiGet<{ engine: string; items: ProductItem[] }>(
           `/api/ai/search/semantic?q=${encodeURIComponent(search.trim())}&limit=40`,
           signal
         );
+        if (signal?.aborted) return;
         setSemanticEngine(res.engine);
         setData({ items: res.items, total: res.items.length, pageSize: 40 });
+        if (selected) {
+          const refreshed = res.items.find((i) => i.id === selected.id);
+          if (refreshed) setSelected(refreshed);
+        }
         return;
       }
 
@@ -126,6 +170,7 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
         `/api/products?${qs.toString()}`,
         signal
       );
+      if (signal?.aborted) return;
       setData(res);
       if (selected) {
         const refreshed = res.items.find((i) => i.id === selected.id);
@@ -133,10 +178,12 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
       }
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        setDrawerMsg(err instanceof Error ? err.message : "Failed loading catalog");
+        setLoadError(err instanceof Error ? err.message : "Failed loading catalog");
       }
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
     }
   };
 
@@ -152,62 +199,86 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
   }, [search, deptId, segment, page, semanticMode]);
 
   const handleAddBarcode = async () => {
-    if (!selected) return;
-    setDrawerMsg(null);
+    if (!selected || drawerBusy) return;
+    setDrawerNotice(null);
     const parsedPrice = Number(newPackPrice);
     if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
-      setDrawerMsg("Pack sell price must be greater than $0.00.");
+      setDrawerNotice({ kind: "red", text: "Pack sell price must be greater than $0.00." });
+      return;
+    }
+    if (!Number.isInteger(newPackQty) || newPackQty < 1) {
+      setDrawerNotice({ kind: "red", text: "Base units in pack must be an integer >= 1." });
       return;
     }
     const cents = Math.round(parsedPrice * 100);
+    setDrawerBusy(true);
     try {
       await apiPost(`/api/products/${selected.id}/barcodes`, {
         barcode: newBc.trim(),
-        packQty: Number(newPackQty),
+        packQty: newPackQty,
         packLabel: newPackLabel.trim(),
         sellPriceCents: cents,
-        isOrderableCase: Number(newPackQty) >= 12,
+        isOrderableCase: newPackQty >= 12,
       });
       setNewBc("");
-      setDrawerMsg("Added new Multi-UOM barcode tier successfully.");
+      setDrawerNotice({ kind: "green", text: "Added new Multi-UOM barcode tier successfully." });
       await loadProducts(page);
     } catch (err) {
-      setDrawerMsg(err instanceof Error ? err.message : "Failed adding barcode");
+      setDrawerNotice({
+        kind: "red",
+        text: err instanceof Error ? err.message : "Failed adding barcode",
+      });
+    } finally {
+      setDrawerBusy(false);
     }
   };
 
   const handleDeleteBarcode = async (barcodeId: string) => {
-    if (!selected) return;
-    setDrawerMsg(null);
+    if (!selected || drawerBusy) return;
+    setDrawerNotice(null);
+    setDrawerBusy(true);
     try {
       await apiDelete(`/api/products/${selected.id}/barcodes/${barcodeId}`);
-      setDrawerMsg("Removed barcode tier.");
+      setDrawerNotice({ kind: "green", text: "Removed barcode tier." });
       await loadProducts(page);
     } catch (err) {
-      setDrawerMsg(err instanceof Error ? err.message : "Failed removing barcode");
+      setDrawerNotice({
+        kind: "red",
+        text: err instanceof Error ? err.message : "Failed removing barcode",
+      });
+    } finally {
+      setDrawerBusy(false);
     }
   };
 
   const handleGenerateZpl = async (productId: string) => {
-    setDrawerMsg(null);
+    if (drawerBusy) return;
+    setDrawerNotice(null);
+    setDrawerBusy(true);
     try {
       const res = await apiPost<{ zpl: string }>("/api/labels/zpl", {
         productIds: [productId],
       });
       setZplOutput(res.zpl);
     } catch (err) {
-      setDrawerMsg(err instanceof Error ? err.message : "Failed generating ZPL");
+      setDrawerNotice({
+        kind: "red",
+        text: err instanceof Error ? err.message : "Failed generating ZPL",
+      });
+    } finally {
+      setDrawerBusy(false);
     }
   };
 
   const handleCycleCount = async () => {
-    if (!selected || cycleQty === "") return;
-    setDrawerMsg(null);
+    if (!selected || cycleQty === "" || drawerBusy) return;
+    setDrawerNotice(null);
     const parsedQty = Number(cycleQty);
     if (!Number.isInteger(parsedQty) || parsedQty < 0) {
-      setDrawerMsg("Physical count must be a non-negative integer.");
+      setDrawerNotice({ kind: "red", text: "Physical count must be a non-negative integer." });
       return;
     }
+    setDrawerBusy(true);
     try {
       const res = await apiPost<{ expectedUnits: number; varianceUnits: number }>(
         "/api/inventory/cycle-count",
@@ -217,39 +288,62 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
         }
       );
       setCycleQty("");
-      setDrawerMsg(
-        `Blind cycle count posted to ledger (Expected ${res.expectedUnits}, Variance ${res.varianceUnits >= 0 ? "+" : ""}${res.varianceUnits} units).`
-      );
+      setDrawerNotice({
+        kind: "green",
+        text: `Blind cycle count posted to ledger (Expected ${res.expectedUnits}, Variance ${res.varianceUnits >= 0 ? "+" : ""}${res.varianceUnits} units).`,
+      });
       await loadProducts(page);
     } catch (err) {
-      setDrawerMsg(err instanceof Error ? err.message : "Failed posting cycle count");
+      setDrawerNotice({
+        kind: "red",
+        text: err instanceof Error ? err.message : "Failed posting cycle count",
+      });
+    } finally {
+      setDrawerBusy(false);
     }
   };
 
   const handlePreviewCsv = async () => {
-    setImportStatus(null);
+    if (importBusy) return;
+    setImportNotice(null);
+    setImportBusy(true);
     try {
       const res = await apiPost<CsvPreviewResponse>("/api/import/preview", { csvText });
       setPreview(res);
     } catch (err) {
-      setImportStatus(err instanceof Error ? err.message : "Failed previewing CSV");
+      setImportNotice({
+        kind: "red",
+        text: err instanceof Error ? err.message : "Failed previewing CSV",
+      });
+    } finally {
+      setImportBusy(false);
     }
   };
 
   const handleCommitCsv = async () => {
-    if (!preview) return;
+    if (!preview || importBusy) return;
     const readyRows = preview.rows.filter((r) => r.status === "ready");
     if (readyRows.length === 0) return;
+    setImportBusy(true);
+    setImportNotice(null);
     try {
       const res = await apiPost<{ imported: number; skipped: number }>("/api/import/commit", {
         rows: readyRows,
       });
-      setImportStatus(`Committed ${res.imported} new SKUs to PostgreSQL (${res.skipped} skipped).`);
+      setImportNotice({
+        kind: "green",
+        text: `Committed ${res.imported} new SKUs to PostgreSQL (${res.skipped} skipped).`,
+      });
       setPreview(null);
       setPage(1);
       await loadProducts(1);
     } catch (err) {
-      setImportStatus(err instanceof Error ? err.message : "Failed committing CSV");
+      setImportNotice({
+        kind: "red",
+        text: err instanceof Error ? err.message : "Failed committing CSV",
+      });
+    } finally {
+      setImportBusy(false);
     }
   };
 
@@ -264,20 +358,31 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
             Search <strong className="mono">{data.total.toLocaleString()}</strong> packaged SKUs by name, SKU, brand, or any Single / 6-Pack / Case barcode.
           </p>
         </div>
-        <div className="header-actions">
-          <button
-            id="open-csv-wizard-btn"
-            className="btn btn-primary"
-            onClick={() => {
-              setShowImport(true);
-              setPreview(null);
-              setImportStatus(null);
-            }}
-          >
-            <Upload size={14} /> Bulk CSV Onboarding Wizard
+        {canEditCatalog && (
+          <div className="header-actions">
+            <button
+              id="open-csv-wizard-btn"
+              className="btn btn-primary"
+              onClick={() => {
+                setShowImport(true);
+                setPreview(null);
+                setImportNotice(null);
+              }}
+            >
+              <Upload size={14} /> Bulk CSV Onboarding Wizard
+            </button>
+          </div>
+        )}
+      </header>
+
+      {loadError && (
+        <div className="banner banner-red" style={{ marginBottom: 14 }}>
+          <span>{loadError}</span>
+          <button className="btn btn-sm" onClick={() => void loadProducts(page)}>
+            Retry
           </button>
         </div>
-      </header>
+      )}
 
       <section className="panel">
         <div className="toolbar">
@@ -315,6 +420,7 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
             id="catalog-dept-filter"
             className="select"
             value={deptId}
+            disabled={semanticMode && search.trim().length >= 2}
             onChange={(e) => {
               setPage(1);
               setDeptId(e.target.value);
@@ -331,6 +437,7 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
             id="catalog-segment-filter"
             className="select"
             value={segment}
+            disabled={semanticMode && search.trim().length >= 2}
             onChange={(e) => {
               setPage(1);
               setSegment(e.target.value);
@@ -382,6 +489,12 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
                 <tr>
                   <td colSpan={9}>Searching catalog...</td>
                 </tr>
+              ) : data.items.length === 0 ? (
+                <tr>
+                  <td colSpan={9} style={{ textAlign: "center", color: "var(--ink-muted)", padding: "24px 12px" }}>
+                    No SKUs matched your current search or filter criteria.
+                  </td>
+                </tr>
               ) : (
                 data.items.map((item) => (
                   <tr
@@ -390,7 +503,7 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
                     onClick={() => {
                       setSelected(item);
                       setZplOutput(null);
-                      setDrawerMsg(null);
+                      setDrawerNotice(null);
                       setNewBc(buildValidEan13("887", Math.floor(100000 + Math.random() * 899999)));
                     }}
                   >
@@ -488,14 +601,14 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
           <div style={{ display: "flex", gap: 8 }}>
             <button
               className="btn btn-sm"
-              disabled={page <= 1}
+              disabled={page <= 1 || loading}
               onClick={() => setPage((p) => p - 1)}
             >
               Previous
             </button>
             <button
               className="btn btn-sm"
-              disabled={page >= totalPages}
+              disabled={page >= totalPages || loading}
               onClick={() => setPage((p) => p + 1)}
             >
               Next
@@ -518,12 +631,16 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
                   {selected.brand} · {selected.departmentName} / {selected.categoryName}
                 </div>
               </div>
-              <button className="btn btn-sm" onClick={() => setSelected(null)}>
+              <button className="btn btn-sm" aria-label="Close inspector" onClick={() => setSelected(null)}>
                 <X size={15} />
               </button>
             </div>
 
-            {drawerMsg && <div className="banner banner-green">{drawerMsg}</div>}
+            {drawerNotice && (
+              <div className={`banner ${drawerNotice.kind === "red" ? "banner-red" : "banner-green"}`}>
+                <span>{drawerNotice.text}</span>
+              </div>
+            )}
 
             <div className="kpi-strip" style={{ marginBottom: 0 }}>
               <div className="kpi-tile">
@@ -548,57 +665,65 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
                 </h3>
                 <button
                   className="btn btn-sm"
+                  disabled={drawerBusy}
                   onClick={() => void handleGenerateZpl(selected.id)}
                 >
                   <Printer size={13} /> ZPL Shelf Tag
                 </button>
               </div>
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Pack Tier</th>
-                    <th>GS1 Barcode</th>
-                    <th className="text-right">Price</th>
-                    <th className="text-right">Margin</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {selected.barcodes.map((b) => {
-                    const tierMargin = computeMarginBp(
-                      b.sellPriceCents,
-                      selected.avgCostCents * b.packQty
-                    );
-                    return (
-                      <tr key={b.id}>
-                        <td>
-                          <strong>{b.packLabel}</strong>{" "}
-                          <span className="mono" style={{ color: "var(--ink-muted)", fontSize: 11.5 }}>
-                            ({b.packQty}×)
-                          </span>
-                        </td>
-                        <td className="mono">{b.barcode}</td>
-                        <td className="text-right mono">{formatMoney(b.sellPriceCents)}</td>
-                        <td className="text-right">
-                          <span className={`tag mono ${tierMargin < selected.minMarginBp ? "tag-red" : "tag-green"}`}>
-                            {formatBp(tierMargin)}
-                          </span>
-                        </td>
-                        <td className="text-right">
-                          {!b.isPrimary && (
-                            <button
-                              className="btn btn-sm"
-                              onClick={() => void handleDeleteBarcode(b.id)}
-                            >
-                              Remove
-                            </button>
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Pack Tier</th>
+                      <th>GS1 Barcode</th>
+                      <th className="text-right">Price</th>
+                      <th className="text-right">Net Margin</th>
+                      {canEditCatalog && <th />}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selected.barcodes.map((b) => {
+                      const tierMargin = computeNetMarginBp(
+                        b.sellPriceCents,
+                        selected.avgCostCents * b.packQty,
+                        selected.taxRateBp ?? 0,
+                        selected.taxInclusive ?? true
+                      );
+                      return (
+                        <tr key={b.id}>
+                          <td>
+                            <strong>{b.packLabel}</strong>{" "}
+                            <span className="mono" style={{ color: "var(--ink-muted)", fontSize: 11.5 }}>
+                              ({b.packQty}×)
+                            </span>
+                          </td>
+                          <td className="mono">{b.barcode}</td>
+                          <td className="text-right mono">{formatMoney(b.sellPriceCents)}</td>
+                          <td className="text-right">
+                            <span className={`tag mono ${tierMargin < selected.minMarginBp ? "tag-red" : "tag-green"}`}>
+                              {formatBp(tierMargin)}
+                            </span>
+                          </td>
+                          {canEditCatalog && (
+                            <td className="text-right">
+                              {!b.isPrimary && (
+                                <button
+                                  className="btn btn-sm"
+                                  disabled={drawerBusy}
+                                  onClick={() => void handleDeleteBarcode(b.id)}
+                                >
+                                  Remove
+                                </button>
+                              )}
+                            </td>
                           )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
 
             {zplOutput && (
@@ -610,83 +735,97 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
               </div>
             )}
 
-            <div className="panel" style={{ background: "var(--bg-canvas)" }}>
-              <h3 className="panel-title" style={{ marginBottom: 10 }}>
-                Add New Pack / Carton Barcode Tier
-              </h3>
-              <div className="form-grid">
-                <div className="field">
-                  <label>GS1 Barcode (EAN-13 / UPC-A)</label>
-                  <input
-                    className="input mono"
-                    value={newBc}
-                    onChange={(e) => setNewBc(e.target.value)}
-                  />
+            {canEditCatalog && (
+              <div className="panel" style={{ background: "var(--bg-canvas)" }}>
+                <h3 className="panel-title" style={{ marginBottom: 10 }}>
+                  Add New Pack / Carton Barcode Tier
+                </h3>
+                <div className="form-grid">
+                  <div className="field">
+                    <label>GS1 Barcode (EAN-13 / UPC-A)</label>
+                    <input
+                      className="input mono"
+                      value={newBc}
+                      onChange={(e) => setNewBc(e.target.value)}
+                      disabled={drawerBusy}
+                    />
+                  </div>
+                  <div className="field">
+                    <label>Pack Label</label>
+                    <input
+                      className="input"
+                      value={newPackLabel}
+                      onChange={(e) => setNewPackLabel(e.target.value)}
+                      disabled={drawerBusy}
+                    />
+                  </div>
+                  <div className="field">
+                    <label>Base Units in Pack</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      min={1}
+                      value={newPackQty}
+                      onChange={(e) => setNewPackQty(Math.max(1, Math.trunc(Number(e.target.value) || 1)))}
+                      disabled={drawerBusy}
+                    />
+                  </div>
+                  <div className="field">
+                    <label>Pack Sell Price ($)</label>
+                    <input
+                      className="input mono"
+                      value={newPackPrice}
+                      onChange={(e) => setNewPackPrice(e.target.value)}
+                      disabled={drawerBusy}
+                    />
+                  </div>
                 </div>
-                <div className="field">
-                  <label>Pack Label</label>
-                  <input
-                    className="input"
-                    value={newPackLabel}
-                    onChange={(e) => setNewPackLabel(e.target.value)}
-                  />
-                </div>
-                <div className="field">
-                  <label>Base Units in Pack</label>
+                <button
+                  className="btn btn-primary btn-sm"
+                  style={{ marginTop: 12 }}
+                  disabled={drawerBusy}
+                  onClick={() => void handleAddBarcode()}
+                >
+                  <Plus size={13} /> Save Pack Barcode
+                </button>
+              </div>
+            )}
+
+            {canCycleCount && (
+              <div className="panel" style={{ background: "var(--bg-canvas)" }}>
+                <h3 className="panel-title" style={{ marginBottom: 6 }}>
+                  Quick Blind Cycle Count (Ledger Adjustment)
+                </h3>
+                <p className="panel-desc" style={{ marginBottom: 10 }}>
+                  Enter physical shelf count in base units ({selected.baseUnitLabel}s). System posts an immutable count variance entry.
+                </p>
+                <div style={{ display: "flex", gap: 8 }}>
                   <input
                     className="input mono"
                     type="number"
-                    min={1}
-                    value={newPackQty}
-                    onChange={(e) => setNewPackQty(Number(e.target.value))}
+                    min={0}
+                    placeholder={`Physical count (currently ${selected.onHandUnits})`}
+                    value={cycleQty}
+                    onChange={(e) => setCycleQty(e.target.value)}
+                    disabled={drawerBusy}
+                    style={{ flex: 1 }}
                   />
-                </div>
-                <div className="field">
-                  <label>Pack Sell Price ($)</label>
-                  <input
-                    className="input mono"
-                    value={newPackPrice}
-                    onChange={(e) => setNewPackPrice(e.target.value)}
-                  />
+                  <button
+                    className="btn btn-primary btn-sm"
+                    disabled={drawerBusy || cycleQty === ""}
+                    onClick={() => void handleCycleCount()}
+                  >
+                    Post Adjustment
+                  </button>
                 </div>
               </div>
-              <button
-                className="btn btn-primary btn-sm"
-                style={{ marginTop: 12 }}
-                onClick={() => void handleAddBarcode()}
-              >
-                <Plus size={13} /> Save Pack Barcode
-              </button>
-            </div>
-
-            <div className="panel" style={{ background: "var(--bg-canvas)" }}>
-              <h3 className="panel-title" style={{ marginBottom: 6 }}>
-                Quick Blind Cycle Count (Ledger Adjustment)
-              </h3>
-              <p className="panel-desc" style={{ marginBottom: 10 }}>
-                Enter physical shelf count in base units ({selected.baseUnitLabel}s). System posts an immutable count variance entry.
-              </p>
-              <div style={{ display: "flex", gap: 8 }}>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={0}
-                  placeholder={`Physical count (currently ${selected.onHandUnits})`}
-                  value={cycleQty}
-                  onChange={(e) => setCycleQty(e.target.value)}
-                  style={{ flex: 1 }}
-                />
-                <button className="btn btn-primary btn-sm" onClick={() => void handleCycleCount()}>
-                  Post Adjustment
-                </button>
-              </div>
-            </div>
+            )}
           </aside>
         </div>
       )}
 
       {/* Bulk CSV Onboarding Modal */}
-      {showImport && (
+      {showImport && canEditCatalog && (
         <div className="overlay centered" onClick={() => setShowImport(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -696,12 +835,16 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
                   Validates GS1 EAN-13/UPC-A check digits, flags duplicates &amp; negative margins before writing to PostgreSQL.
                 </p>
               </div>
-              <button className="btn btn-sm" onClick={() => setShowImport(false)}>
+              <button className="btn btn-sm" aria-label="Close import wizard" onClick={() => setShowImport(false)}>
                 <X size={15} />
               </button>
             </div>
 
-            {importStatus && <div className="banner banner-green">{importStatus}</div>}
+            {importNotice && (
+              <div className={`banner ${importNotice.kind === "red" ? "banner-red" : "banner-green"}`}>
+                <span>{importNotice.text}</span>
+              </div>
+            )}
 
             <div className="field">
               <label>Paste Distributor Price-List CSV (sample pre-loaded with 3 valid + 2 invalid test rows)</label>
@@ -711,21 +854,24 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
                 rows={7}
                 value={csvText}
                 onChange={(e) => setCsvText(e.target.value)}
+                disabled={importBusy}
               />
             </div>
 
-            <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
               <button
                 id="validate-csv-btn"
                 className="btn btn-primary"
+                disabled={importBusy || !csvText.trim()}
                 onClick={() => void handlePreviewCsv()}
               >
-                Validate Check Digits &amp; Preview
+                {importBusy ? "Working..." : "Validate Check Digits & Preview"}
               </button>
               {preview && preview.readyCount > 0 && (
                 <button
                   id="commit-csv-btn"
                   className="btn btn-amber"
+                  disabled={importBusy}
                   onClick={() => void handleCommitCsv()}
                 >
                   Commit {preview.readyCount} Valid SKUs to Database
@@ -735,7 +881,7 @@ export function CatalogView({ departments }: { departments: DepartmentOption[] }
 
             {preview && (
               <div>
-                <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
                   <span className="tag tag-green">Ready: {preview.readyCount}</span>
                   <span className="tag tag-amber">Duplicates: {preview.duplicateCount}</span>
                   <span className="tag tag-red">Errors Blocked: {preview.errorCount}</span>

@@ -21,47 +21,29 @@ import {
   Wifi,
 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
-import { loadPosCache, savePosCache, type PosBootstrapSnapshot } from "../lib/posCache";
+import {
+  classifySaleSyncError,
+  loadOfflineQueue,
+  loadPosCache,
+  mapBootstrapPromotions,
+  saveOfflineQueue,
+  savePosCache,
+  type PosBootstrapSnapshot,
+  type QueuedPosSale,
+} from "../lib/posCache";
 
 type BootstrapProduct = PosBootstrapSnapshot["products"][number];
 type BootstrapBarcode = PosBootstrapSnapshot["barcodes"][number];
 type BootstrapTax = PosBootstrapSnapshot["taxRates"][number];
 type BasketRule = NonNullable<PosBootstrapSnapshot["basketRules"]>[number];
 
-interface QueuedSale {
-  id: string;
-  registerCode: string;
-  receiptNo: string;
-  kind: "sale";
-  soldAt: string;
-  cashierName: string;
-  ageVerified: boolean;
-  lines: {
-    id: string;
-    productId: string;
-    scannedBarcode: string;
-    packLabel: string;
-    packQty: number;
-    qtyPacks: number;
-    unitPriceCents: number;
-    unitCostCents: number;
-    discountCents: number;
-    taxRateBp: number;
-    taxCents: number;
-    lineTotalCents: number;
-  }[];
-  payments: {
-    id: string;
-    method: "cash" | "card" | "mobile_pay";
-    amountCents: number;
-    tenderedCents?: number;
-    changeCents?: number;
-  }[];
-}
-
-const OFFLINE_QUEUE_KEY = "supermarket_os_offline_pos_queue_v1";
-
-export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName?: string }) {
+export function PosTerminalView({
+  cashierName = "Elena Morales",
+  isActive = true,
+}: {
+  cashierName?: string;
+  isActive?: boolean;
+}) {
   const [productsMap, setProductsMap] = useState<Map<string, BootstrapProduct>>(new Map());
   const [barcodesMap, setBarcodesMap] = useState<Map<string, BootstrapBarcode>>(new Map());
   const [primaryByProductMap, setPrimaryByProductMap] = useState<Map<string, BootstrapBarcode>>(
@@ -75,6 +57,8 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
   >([]);
   const [syncedAt, setSyncedAt] = useState<string | null>(null);
   const [cacheSource, setCacheSource] = useState<"live" | "indexeddb" | null>(null);
+  const [bootstrapLoading, setBootstrapLoading] = useState(true);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [simulatedOffline, setSimulatedOffline] = useState(false);
 
   const [scanInput, setScanInput] = useState("");
@@ -85,11 +69,14 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [submittingSale, setSubmittingSale] = useState(false);
+  const [syncingQueue, setSyncingQueue] = useState(false);
   const [daypartPreview, setDaypartPreview] = useState<"live" | "morning" | "evening">("live");
 
   // Blind Shift Close Modal
   const [showShiftClose, setShowShiftClose] = useState(false);
   const [blindCashInput, setBlindCashInput] = useState("420.00");
+  const [closingShift, setClosingShift] = useState(false);
   const [shiftError, setShiftError] = useState<string | null>(null);
   const [zReportResult, setZReportResult] = useState<{
     zReportNo: string;
@@ -98,21 +85,47 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
     varianceCents: number;
   } | null>(null);
 
-  const [offlineQueue, setOfflineQueue] = useState<QueuedSale[]>(() => {
-    try {
-      const raw = localStorage.getItem(OFFLINE_QUEUE_KEY);
-      return raw ? (JSON.parse(raw) as QueuedSale[]) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [offlineQueue, setOfflineQueue] = useState<QueuedPosSale[]>(() => loadOfflineQueue());
 
   const scanRef = useRef<HTMLInputElement>(null);
   const flushLockRef = useRef(false);
+  const saleLockRef = useRef(false);
+  const offlineQueueRef = useRef(offlineQueue);
+  const simulatedOfflineRef = useRef(simulatedOffline);
+
+  offlineQueueRef.current = offlineQueue;
+  simulatedOfflineRef.current = simulatedOffline;
 
   useEffect(() => {
-    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(offlineQueue));
+    saveOfflineQueue(offlineQueue);
   }, [offlineQueue]);
+
+  // Reset age verification automatically whenever basket becomes empty (prevents carryover to next customer)
+  useEffect(() => {
+    if (cart.length === 0 && ageVerified) {
+      setAgeVerified(false);
+    }
+  }, [cart.length, ageVerified]);
+
+  // Re-focus barcode scanner input when POS tab becomes active and no modal is open
+  useEffect(() => {
+    if (isActive && !pendingAgeItem && !showShiftClose) {
+      scanRef.current?.focus();
+    }
+  }, [isActive, pendingAgeItem, showShiftClose]);
+
+  // Escape closes modals and restores scanner focus
+  useEffect(() => {
+    if (!pendingAgeItem && !showShiftClose) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setPendingAgeItem(null);
+        setShowShiftClose(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pendingAgeItem, showShiftClose]);
 
   const hydrateFromSnapshot = (
     data: PosBootstrapSnapshot,
@@ -127,17 +140,7 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
       }
     }
     const tMap = new Map(data.taxRates.map((t) => [t.id, t]));
-    const parsedPromos: PromotionRule[] = data.promotions.map((pr) => ({
-      id: pr.id,
-      name: pr.name,
-      promoType: pr.promoType,
-      priority: pr.priority,
-      combinable: pr.combinable,
-      minMarginGuardBp: pr.minMarginGuardBp,
-      daypartStartHour: pr.daypartStartHour ?? null,
-      daypartEndHour: pr.daypartEndHour ?? null,
-      ...(pr.rulesJson as Record<string, unknown>),
-    }));
+    const parsedPromos = mapBootstrapPromotions(data.promotions);
 
     setProductsMap(pMap);
     setBarcodesMap(bMap);
@@ -147,6 +150,7 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
     setBasketRules(data.basketRules ?? []);
     setSyncedAt(data.syncedAt);
     setCacheSource(source);
+    setBootstrapError(null);
 
     const picks: typeof quickItems = [];
     const findMatching = (prefix: string, packQty: number, badge: string, limit: number) => {
@@ -178,34 +182,62 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
     setQuickItems(picks);
   };
 
-  // Load persisted IndexedDB cache immediately, then refresh from live API when reachable
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
+  const loadBootstrap = async (signal?: AbortSignal) => {
+    setBootstrapLoading(true);
+    setBootstrapError(null);
+    let hasCached = false;
+    try {
       const cached = await loadPosCache();
-      if (cached && !cancelled) {
+      if (cached && !signal?.aborted) {
+        hasCached = true;
         hydrateFromSnapshot(cached, "indexeddb");
       }
       try {
-        const live = await apiGet<PosBootstrapSnapshot>("/api/pos/bootstrap");
-        if (!cancelled) {
+        const live = await apiGet<PosBootstrapSnapshot>("/api/pos/bootstrap", signal);
+        if (!signal?.aborted) {
           hydrateFromSnapshot(live, "live");
           await savePosCache(live);
         }
-      } catch {
-        // Offline at startup — IndexedDB snapshot remains active
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        if (!hasCached) {
+          setBootstrapError(
+            err instanceof Error
+              ? err.message
+              : "Could not load POS catalog from API or local IndexedDB cache."
+          );
+        }
       }
-    })();
-    return () => {
-      cancelled = true;
+    } finally {
+      if (!signal?.aborted) {
+        setBootstrapLoading(false);
+      }
+    }
+  };
+
+  // Load persisted IndexedDB cache immediately, then refresh from live API when reachable
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadBootstrap(controller.signal);
+    return () => controller.abort();
+  }, []);
+
+  // Automatically flush offline queue when browser network connectivity returns
+  useEffect(() => {
+    const handleOnline = () => {
+      if (!simulatedOfflineRef.current && offlineQueueRef.current.length > 0) {
+        void flushOfflineQueue(offlineQueueRef.current);
+      }
     };
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
   }, []);
 
   const evalHour =
     daypartPreview === "morning" ? 9 : daypartPreview === "evening" ? 18 : new Date().getHours();
 
   const evaluated = useMemo(
-    () => evaluateCart(cart, promos, { evalHour }),
+    () => evaluateCart(cart, promos, { evalHour, evalNow: new Date() }),
     [cart, promos, evalHour]
   );
 
@@ -298,6 +330,8 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
     const bc = barcodesMap.get(clean);
     if (!bc) {
       setScanError(`Barcode "${clean}" not found in local POS catalog (${barcodesMap.size} cached).`);
+      scanRef.current?.focus();
+      scanRef.current?.select();
       return;
     }
     addBarcodeToCart(bc);
@@ -305,23 +339,31 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
     scanRef.current?.focus();
   };
 
-  const flushOfflineQueue = async (queueToFlush = offlineQueue) => {
+  const flushOfflineQueue = async (queueToFlush = offlineQueueRef.current) => {
     if (queueToFlush.length === 0 || flushLockRef.current) return;
     flushLockRef.current = true;
+    setSyncingQueue(true);
     setSyncError(null);
     let synced = 0;
-    const remaining: QueuedSale[] = [];
+    let authRequired = false;
+    const remaining: QueuedPosSale[] = [];
     const permanentErrors: string[] = [];
 
     try {
-      for (const sale of queueToFlush) {
+      for (let i = 0; i < queueToFlush.length; i++) {
+        const sale = queueToFlush[i];
         try {
           await apiPost("/api/pos/sales", sale);
           synced++;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes("(400)") || msg.includes("(403)") || msg.includes("(409)")) {
+          const kind = classifySaleSyncError(err);
+          if (kind === "permanent") {
             permanentErrors.push(`${sale.receiptNo}: ${msg}`);
+          } else if (kind === "auth") {
+            authRequired = true;
+            remaining.push(...queueToFlush.slice(i));
+            break;
           } else {
             remaining.push(sale);
           }
@@ -335,59 +377,32 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
       } else {
         setSyncMessage(null);
       }
-      if (permanentErrors.length > 0) {
+      if (authRequired) {
+        setSyncError(
+          `Session expired — ${remaining.length} receipt(s) remain safely queued locally until you sign back in.`
+        );
+      } else if (permanentErrors.length > 0) {
         setSyncError(`Rejected receipt(s): ${permanentErrors.join("; ")}`);
       } else if (remaining.length > 0 && synced === 0) {
         setSyncError(`Still offline — ${remaining.length} receipt(s) remain queued locally.`);
       }
     } finally {
       flushLockRef.current = false;
+      setSyncingQueue(false);
     }
   };
 
-  const completeSale = async (method: "cash" | "card" | "mobile_pay") => {
-    if (evaluated.lines.length === 0) return;
-    setSyncError(null);
-    const saleId = generateUuidV7();
-    const receiptNo = `REG-01-${saleId.slice(-8).toUpperCase()}`;
-    const nowIso = new Date().toISOString();
-
-    const payload: QueuedSale = {
-      id: saleId,
-      registerCode: "REG-01",
-      receiptNo,
-      kind: "sale",
-      soldAt: nowIso,
-      cashierName,
-      ageVerified: evaluated.requiresAgeCheck && ageVerified,
-      lines: evaluated.lines.map((l) => ({
-        id: generateUuidV7(),
-        productId: l.productId,
-        scannedBarcode: l.scannedBarcode,
-        packLabel: l.packLabel,
-        packQty: l.packQty,
-        qtyPacks: l.qtyPacks,
-        unitPriceCents: l.unitPriceCents,
-        unitCostCents: l.unitCostCents,
-        discountCents: l.discountCents,
-        taxRateBp: l.taxRateBp,
-        taxCents: l.taxCents,
-        lineTotalCents: l.lineTotalCents,
-      })),
-      payments: [
-        {
-          id: generateUuidV7(),
-          method,
-          amountCents: evaluated.grandTotalCents,
-          tenderedCents: evaluated.grandTotalCents,
-          changeCents: 0,
-        },
-      ],
-    };
-
-    const paperLines = [
+  const buildPaperReceipt = (
+    receiptNo: string,
+    saleId: string,
+    method: "cash" | "card" | "mobile_pay",
+    statusTag: "[OFFLINE QUEUED]" | "[SYNCED]"
+  ): string => {
+    const hasExclusiveTax = cart.some((c) => !c.taxInclusive && c.taxRateBp > 0);
+    const taxLabel = hasExclusiveTax ? "Tax (Incl./Excl.):  " : "Included Tax:       ";
+    return [
       "        SUPERMARKET OS — LANE 01        ",
-      `Receipt: ${receiptNo}   ${simulatedOffline ? "[OFFLINE QUEUED]" : "[SYNCED]"}`,
+      `Receipt: ${receiptNo}   ${statusTag}`,
       `Cashier: ${cashierName}   ${new Date().toLocaleTimeString()}`,
       "----------------------------------------",
       ...evaluated.lines.map(
@@ -397,45 +412,104 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
       "----------------------------------------",
       `Subtotal:           ${formatMoney(evaluated.subtotalBeforeDiscountCents).padStart(20)}`,
       `Promo Savings:     -${formatMoney(evaluated.totalDiscountCents).padStart(19)}`,
-      `Included Tax:       ${formatMoney(evaluated.totalTaxCents).padStart(20)}`,
+      `${taxLabel}${formatMoney(evaluated.totalTaxCents).padStart(20)}`,
       `TOTAL PAID (${method.toUpperCase()}): ${formatMoney(evaluated.grandTotalCents).padStart(16)}`,
       evaluated.requiresAgeCheck ? "** ALCOHOL AGE VERIFIED (ID CHECKED) **" : "",
       "----------------------------------------",
       `Client UUIDv7: ${saleId.slice(0, 18)}...`,
-    ].filter(Boolean);
+    ]
+      .filter(Boolean)
+      .join("\n");
+  };
 
-    setReceiptPreview(paperLines.join("\n"));
+  const completeSale = async (method: "cash" | "card" | "mobile_pay") => {
+    if (evaluated.lines.length === 0 || saleLockRef.current) return;
+    saleLockRef.current = true;
+    setSubmittingSale(true);
+    setSyncError(null);
 
-    if (simulatedOffline) {
-      setOfflineQueue((q) => [...q, payload]);
-      setSyncMessage(`Saved offline locally (${receiptNo}). Checkout uninterrupted!`);
-    } else {
-      try {
-        await apiPost("/api/pos/sales", payload);
-        setSyncMessage(`Completed & synced ${receiptNo} directly to PostgreSQL ledger.`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("(400)") || msg.includes("(403)")) {
-          setSyncError(msg);
-          return;
-        }
+    try {
+      const saleId = generateUuidV7();
+      const receiptNo = `REG-01-${saleId.slice(-8).toUpperCase()}`;
+      const nowIso = new Date().toISOString();
+
+      const payload: QueuedPosSale = {
+        id: saleId,
+        registerCode: "REG-01",
+        receiptNo,
+        kind: "sale",
+        soldAt: nowIso,
+        cashierName,
+        ageVerified: evaluated.requiresAgeCheck && ageVerified,
+        lines: evaluated.lines.map((l) => ({
+          id: generateUuidV7(),
+          productId: l.productId,
+          scannedBarcode: l.scannedBarcode,
+          packLabel: l.packLabel,
+          packQty: l.packQty,
+          qtyPacks: l.qtyPacks,
+          unitPriceCents: l.unitPriceCents,
+          unitCostCents: l.unitCostCents,
+          discountCents: l.discountCents,
+          taxRateBp: l.taxRateBp,
+          taxCents: l.taxCents,
+          lineTotalCents: l.lineTotalCents,
+        })),
+        payments: [
+          {
+            id: generateUuidV7(),
+            method,
+            amountCents: evaluated.grandTotalCents,
+            tenderedCents: evaluated.grandTotalCents,
+            changeCents: 0,
+          },
+        ],
+      };
+
+      if (simulatedOffline) {
         setOfflineQueue((q) => [...q, payload]);
-        setSyncMessage(`Network hiccup — queued ${receiptNo} locally for auto-retry.`);
+        setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[OFFLINE QUEUED]"));
+        setSyncMessage(`Saved offline locally (${receiptNo}). Checkout uninterrupted!`);
+      } else {
+        try {
+          await apiPost("/api/pos/sales", payload);
+          setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[SYNCED]"));
+          setSyncMessage(`Completed & synced ${receiptNo} directly to PostgreSQL ledger.`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const kind = classifySaleSyncError(err);
+          if (kind === "permanent") {
+            setSyncError(msg);
+            return;
+          }
+          setOfflineQueue((q) => [...q, payload]);
+          setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[OFFLINE QUEUED]"));
+          if (kind === "auth") {
+            setSyncError(`Session expired — ${receiptNo} queued safely offline until you sign back in.`);
+          } else {
+            setSyncMessage(`Network hiccup — queued ${receiptNo} locally for auto-retry.`);
+          }
+        }
       }
-    }
 
-    setCart([]);
-    setAgeVerified(false);
-    scanRef.current?.focus();
+      setCart([]);
+      setAgeVerified(false);
+      scanRef.current?.focus();
+    } finally {
+      saleLockRef.current = false;
+      setSubmittingSale(false);
+    }
   };
 
   const handleCloseShift = async () => {
+    if (closingShift) return;
     setShiftError(null);
     const parsedCash = Number(blindCashInput);
     if (!Number.isFinite(parsedCash) || parsedCash < 0) {
       setShiftError("Enter a valid non-negative cash count amount.");
       return;
     }
+    setClosingShift(true);
     try {
       const res = await apiPost<{
         zReportNo: string;
@@ -451,6 +525,8 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
       setZReportResult(res);
     } catch (err) {
       setShiftError(err instanceof Error ? err.message : "Failed closing shift");
+    } finally {
+      setClosingShift(false);
     }
   };
 
@@ -460,8 +536,15 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
         <div>
           <h1>Offline-First POS Checkout Terminal</h1>
           <p className="page-subtitle">
-            Local cache ({cacheSource === "indexeddb" ? "IndexedDB offline snapshot" : "live"}):{" "}
-            <strong className="mono">{productsMap.size.toLocaleString()}</strong> SKUs /{" "}
+            Local cache (
+            {cacheSource === "indexeddb"
+              ? "IndexedDB offline snapshot"
+              : cacheSource === "live"
+                ? "live"
+                : bootstrapLoading
+                  ? "syncing..."
+                  : "unavailable"}
+            ): <strong className="mono">{productsMap.size.toLocaleString()}</strong> SKUs /{" "}
             <strong className="mono">{barcodesMap.size.toLocaleString()}</strong> barcodes · Deterministic multi-UOM &amp; promo engine runs 100% locally.
           </p>
         </div>
@@ -495,9 +578,11 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
             <button
               id="flush-offline-queue-btn"
               className="btn btn-primary"
+              disabled={syncingQueue}
               onClick={() => void flushOfflineQueue()}
             >
-              <RefreshCw size={14} /> Sync {offlineQueue.length} Queued Sale(s)
+              <RefreshCw size={14} />{" "}
+              {syncingQueue ? "Syncing..." : `Sync ${offlineQueue.length} Queued Sale(s)`}
             </button>
           )}
           <button
@@ -514,9 +599,21 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
         </div>
       </header>
 
+      {bootstrapError && (
+        <div className="banner banner-red" style={{ marginBottom: 12 }}>
+          <span>{bootstrapError}</span>
+          <button className="btn btn-sm" onClick={() => void loadBootstrap()}>
+            <RefreshCw size={12} /> Retry Sync
+          </button>
+        </div>
+      )}
+
       {syncError && (
         <div className="banner banner-red" style={{ marginBottom: 12 }}>
           <span>{syncError}</span>
+          <button className="btn btn-sm" onClick={() => setSyncError(null)}>
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -557,13 +654,16 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
                 onChange={(e) => setScanInput(e.target.value)}
                 autoFocus
               />
-              <button type="submit" className="btn btn-primary">
+              <button type="submit" className="btn btn-primary" disabled={barcodesMap.size === 0}>
                 Scan Item
               </button>
             </form>
             {scanError && (
               <div className="banner banner-red" style={{ marginBottom: 12 }}>
-                {scanError}
+                <span>{scanError}</span>
+                <button className="btn btn-sm" onClick={() => setScanError(null)}>
+                  Dismiss
+                </button>
               </div>
             )}
 
@@ -576,24 +676,34 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
               </div>
             </div>
 
-            <div className="quick-scan-grid">
-              {quickItems.map((q) => (
-                <button
-                  key={q.barcode}
-                  className="quick-sku-btn"
-                  onClick={() => handleScanSubmit(q.barcode)}
-                >
-                  <span className="tag tag-blue" style={{ width: "fit-content", fontSize: 10.5 }}>
-                    {q.badge}
-                  </span>
-                  <div className="quick-sku-name">{q.name}</div>
-                  <div className="quick-sku-foot">
-                    <span style={{ color: "var(--ink-muted)" }}>{q.packLabel}</span>
-                    <strong>{formatMoney(q.priceCents)}</strong>
-                  </div>
-                </button>
-              ))}
-            </div>
+            {bootstrapLoading && quickItems.length === 0 ? (
+              <div style={{ color: "var(--ink-muted)", padding: "18px 0" }}>
+                Syncing offline-first barcode catalog...
+              </div>
+            ) : quickItems.length === 0 ? (
+              <div style={{ color: "var(--ink-muted)", padding: "18px 0" }}>
+                No quick-scan catalog items available. Use Retry Sync above once API connectivity is restored.
+              </div>
+            ) : (
+              <div className="quick-scan-grid">
+                {quickItems.map((q) => (
+                  <button
+                    key={q.barcode}
+                    className="quick-sku-btn"
+                    onClick={() => handleScanSubmit(q.barcode)}
+                  >
+                    <span className="tag tag-blue" style={{ width: "fit-content", fontSize: 10.5 }}>
+                      {q.badge}
+                    </span>
+                    <div className="quick-sku-name">{q.name}</div>
+                    <div className="quick-sku-foot">
+                      <span style={{ color: "var(--ink-muted)" }}>{q.packLabel}</span>
+                      <strong>{formatMoney(q.priceCents)}</strong>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
           </section>
 
           {receiptPreview && (
@@ -616,6 +726,7 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
             {cart.length > 0 && (
               <button
                 className="btn btn-sm"
+                disabled={submittingSale}
                 onClick={() => {
                   setCart([]);
                   setAgeVerified(false);
@@ -665,6 +776,8 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
                     <div className="qty-stepper" style={{ marginTop: 4 }}>
                       <button
                         className="qty-btn"
+                        aria-label={`Decrease quantity for ${line.name}`}
+                        disabled={submittingSale}
                         onClick={() =>
                           setCart((prev) =>
                             prev
@@ -684,6 +797,8 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
                       </span>
                       <button
                         className="qty-btn"
+                        aria-label={`Increase quantity for ${line.name}`}
+                        disabled={submittingSale}
                         onClick={() =>
                           setCart((prev) =>
                             prev.map((c) =>
@@ -721,6 +836,7 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
                   </div>
                   <button
                     className="btn btn-sm"
+                    disabled={submittingSale}
                     onClick={() => handleScanSubmit(u.barcode)}
                   >
                     + Add
@@ -740,7 +856,7 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
               <span className="mono">-{formatMoney(evaluated.totalDiscountCents)}</span>
             </div>
             <div className="total-row">
-              <span>Included VAT / Excise</span>
+              <span>VAT / Excise Tax</span>
               <span className="mono">{formatMoney(evaluated.totalTaxCents)}</span>
             </div>
             <div className="total-row" style={{ fontSize: 11.5 }}>
@@ -757,15 +873,15 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
             <button
               id="pos-pay-cash-btn"
               className="btn btn-primary"
-              disabled={evaluated.lines.length === 0}
+              disabled={evaluated.lines.length === 0 || submittingSale}
               onClick={() => void completeSale("cash")}
             >
-              <DollarSign size={14} /> Cash
+              <DollarSign size={14} /> {submittingSale ? "Saving..." : "Cash"}
             </button>
             <button
               id="pos-pay-card-btn"
               className="btn btn-primary"
-              disabled={evaluated.lines.length === 0}
+              disabled={evaluated.lines.length === 0 || submittingSale}
               onClick={() => void completeSale("card")}
             >
               <CreditCard size={14} /> Card
@@ -773,7 +889,7 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
             <button
               id="pos-pay-mobile-btn"
               className="btn"
-              disabled={evaluated.lines.length === 0}
+              disabled={evaluated.lines.length === 0 || submittingSale}
               onClick={() => void completeSale("mobile_pay")}
             >
               Mobile Pay
@@ -784,8 +900,8 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
 
       {/* Alcohol Age Verification Modal */}
       {pendingAgeItem && (
-        <div className="overlay centered">
-          <div className="modal" style={{ maxWidth: 440 }}>
+        <div className="overlay centered" onClick={() => setPendingAgeItem(null)}>
+          <div className="modal" style={{ maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", gap: 10, alignItems: "center", color: "var(--accent-amber)" }}>
               <AlertTriangle size={22} />
               <h2 style={{ margin: 0, fontSize: 18, color: "var(--ink-primary)" }}>
@@ -807,6 +923,7 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
                   setAgeVerified(true);
                   setPendingAgeItem(null);
                   addBarcodeToCart(item, true);
+                  scanRef.current?.focus();
                 }}
               >
                 <ShieldCheck size={14} /> ID Verified — Add to Basket
@@ -826,16 +943,22 @@ export function PosTerminalView({ cashierName = "Elena Morales" }: { cashierName
             </p>
             {shiftError && <div className="banner banner-red">{shiftError}</div>}
             <div className="field">
-              <label>Physical Cash Counted in Drawer ($ USD)</label>
+              <label htmlFor="blind-cash-input">Physical Cash Counted in Drawer ($ USD)</label>
               <input
+                id="blind-cash-input"
                 className="input mono"
                 value={blindCashInput}
                 onChange={(e) => setBlindCashInput(e.target.value)}
+                disabled={closingShift}
               />
             </div>
             <div style={{ display: "flex", gap: 10 }}>
-              <button className="btn btn-primary" onClick={() => void handleCloseShift()}>
-                Submit Blind Count &amp; Generate Z-Report
+              <button
+                className="btn btn-primary"
+                disabled={closingShift}
+                onClick={() => void handleCloseShift()}
+              >
+                {closingShift ? "Closing Shift..." : "Submit Blind Count & Generate Z-Report"}
               </button>
               <button className="btn" onClick={() => setShowShiftClose(false)}>
                 Close

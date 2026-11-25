@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Plus, Send, Sparkles, Terminal, X } from "lucide-react";
-import { apiGet, apiPost } from "../api";
+import { apiGet, apiPost, formatApiErrorPayload } from "../api";
 
 interface ToolTrace {
   tool: string;
@@ -33,6 +33,19 @@ interface ConversationSummary {
   updatedAt: string;
 }
 
+interface SseEventPayload {
+  type: string;
+  conversationId?: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  summary?: string;
+  text?: string;
+  model?: string;
+  message?: ChatMessage;
+  actions?: ProposedAction[];
+  error?: string;
+}
+
 const STARTER_PROMPTS = [
   "Give me today's Morning Risk Briefing",
   "Diagnose why morning shift sales are underperforming & propose a fix",
@@ -62,29 +75,60 @@ export function AiCopilotDrawer({
   const [actions, setActions] = useState<ProposedAction[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [busyActionId, setBusyActionId] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState("");
   const [liveTools, setLiveTools] = useState<ToolTrace[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  const loadStatusAndHistory = async () => {
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const abortActiveStream = () => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+  };
+
+  const loadStatusAndHistory = async (signal?: AbortSignal) => {
     try {
       const [status, convs] = await Promise.all([
-        apiGet<{ geminiConfigured: boolean; model: string }>("/api/ai/status"),
-        apiGet<{ conversations: ConversationSummary[] }>("/api/ai/conversations"),
+        apiGet<{ geminiConfigured: boolean; model: string }>("/api/ai/status", signal),
+        apiGet<{ conversations: ConversationSummary[] }>("/api/ai/conversations", signal),
       ]);
       setGeminiConfigured(status.geminiConfigured);
       setModelName(status.model);
       setConversations(convs.conversations);
-    } catch {
-      // ignore initial status fetch error
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setError(err instanceof Error ? err.message : "Failed loading AI Copilot status");
+      }
     }
   };
 
   useEffect(() => {
-    if (open) {
-      void loadStatusAndHistory();
+    if (!open) {
+      abortActiveStream();
+      return;
     }
-  }, [open]);
+    const controller = new AbortController();
+    void loadStatusAndHistory(controller.signal);
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      controller.abort();
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open, onClose]);
+
+  useEffect(() => {
+    return () => {
+      abortActiveStream();
+    };
+  }, []);
 
   useEffect(() => {
     if (open && initialPrompt && !sending) {
@@ -94,7 +138,15 @@ export function AiCopilotDrawer({
     }
   }, [open, initialPrompt]);
 
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages.length, streamingText, liveTools.length]);
+
   const loadConversation = async (id: string) => {
+    abortActiveStream();
+    setSending(false);
+    setStreamingText("");
+    setLiveTools([]);
     setError(null);
     try {
       const data = await apiGet<{
@@ -112,6 +164,10 @@ export function AiCopilotDrawer({
   const sendMessage = async (text = input) => {
     const clean = text.trim();
     if (!clean || sending) return;
+    abortActiveStream();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+
     setError(null);
     setSending(true);
     setStreamingText("");
@@ -126,6 +182,59 @@ export function AiCopilotDrawer({
     };
     setMessages((prev) => [...prev, optimisticUserMsg]);
 
+    let completedTurn = false;
+
+    const processRawEvent = (rawEvent: string) => {
+      const dataLines = rawEvent
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim());
+      if (dataLines.length === 0) return;
+      const jsonStr = dataLines.join("\n");
+      if (!jsonStr) return;
+
+      let ev: SseEventPayload;
+      try {
+        ev = JSON.parse(jsonStr) as SseEventPayload;
+      } catch {
+        return;
+      }
+
+      if (ev.type === "meta" && ev.conversationId) {
+        setConversationId(ev.conversationId);
+      } else if (ev.type === "tool_call" && ev.tool) {
+        setLiveTools((prev) => [
+          ...prev,
+          { tool: ev.tool!, args: ev.args ?? {}, summary: "running..." },
+        ]);
+      } else if (ev.type === "tool_result" && ev.tool) {
+        setLiveTools((prev) =>
+          prev.map((t, idx) =>
+            idx === prev.length - 1 && t.tool === ev.tool
+              ? { ...t, summary: ev.summary ?? "OK" }
+              : t
+          )
+        );
+      } else if (ev.type === "delta" && ev.text) {
+        setStreamingText((prev) => prev + ev.text);
+      } else if (ev.type === "done" && ev.message) {
+        completedTurn = true;
+        setConversationId(ev.conversationId ?? null);
+        if (ev.model) setModelName(ev.model);
+        setMessages((prev) => [
+          ...prev.filter((m) => m.id !== optimisticUserMsg.id),
+          optimisticUserMsg,
+          ev.message!,
+        ]);
+        setActions(ev.actions ?? []);
+        setStreamingText("");
+        setLiveTools([]);
+        void loadStatusAndHistory();
+      } else if (ev.type === "error") {
+        throw new Error(ev.error ?? "Streaming failed");
+      }
+    };
+
     try {
       const res = await fetch("/api/ai/chat/stream", {
         method: "POST",
@@ -135,9 +244,11 @@ export function AiCopilotDrawer({
           conversationId: conversationId ?? undefined,
           message: clean,
         }),
+        signal: controller.signal,
       });
       if (!res.ok || !res.body) {
-        throw new Error(`Stream request failed (${res.status})`);
+        const errBody = await res.text().catch(() => "");
+        throw new Error(formatApiErrorPayload(errBody, res.status, "POST", "/api/ai/chat/stream"));
       }
 
       const reader = res.body.getReader();
@@ -146,7 +257,10 @@ export function AiCopilotDrawer({
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
 
         let sepIdx = buffer.indexOf("\n\n");
@@ -154,69 +268,36 @@ export function AiCopilotDrawer({
           const rawEvent = buffer.slice(0, sepIdx).trim();
           buffer = buffer.slice(sepIdx + 2);
           sepIdx = buffer.indexOf("\n\n");
-
-          if (!rawEvent.startsWith("data:")) continue;
-          const jsonStr = rawEvent.slice(5).trim();
-          if (!jsonStr) continue;
-
-          const ev = JSON.parse(jsonStr) as {
-            type: string;
-            conversationId?: string;
-            tool?: string;
-            args?: Record<string, unknown>;
-            summary?: string;
-            text?: string;
-            model?: string;
-            message?: ChatMessage;
-            actions?: ProposedAction[];
-            error?: string;
-          };
-
-          if (ev.type === "meta" && ev.conversationId) {
-            setConversationId(ev.conversationId);
-          } else if (ev.type === "tool_call" && ev.tool) {
-            setLiveTools((prev) => [
-              ...prev,
-              { tool: ev.tool!, args: ev.args ?? {}, summary: "running..." },
-            ]);
-          } else if (ev.type === "tool_result" && ev.tool) {
-            setLiveTools((prev) =>
-              prev.map((t, idx) =>
-                idx === prev.length - 1 && t.tool === ev.tool
-                  ? { ...t, summary: ev.summary ?? "OK" }
-                  : t
-              )
-            );
-          } else if (ev.type === "delta" && ev.text) {
-            setStreamingText((prev) => prev + ev.text);
-          } else if (ev.type === "done" && ev.message) {
-            setConversationId(ev.conversationId ?? null);
-            if (ev.model) setModelName(ev.model);
-            setMessages((prev) => [
-              ...prev.filter((m) => m.id !== optimisticUserMsg.id),
-              optimisticUserMsg,
-              ev.message!,
-            ]);
-            setActions(ev.actions ?? []);
-            setStreamingText("");
-            setLiveTools([]);
-            void loadStatusAndHistory();
-          } else if (ev.type === "error") {
-            throw new Error(ev.error ?? "Streaming failed");
-          }
+          if (rawEvent) processRawEvent(rawEvent);
         }
       }
+
+      if (buffer.trim()) {
+        processRawEvent(buffer.trim());
+      }
+      if (!completedTurn && !controller.signal.aborted) {
+        throw new Error("Copilot stream ended unexpectedly before finishing.");
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed sending message");
+      if ((err as Error).name !== "AbortError") {
+        setError(err instanceof Error ? err.message : "Failed sending message");
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticUserMsg.id));
+        setInput((curr) => (curr ? curr : clean));
+      }
       setStreamingText("");
       setLiveTools([]);
     } finally {
+      if (streamAbortRef.current === controller) {
+        streamAbortRef.current = null;
+      }
       setSending(false);
     }
   };
 
   const handleActionDecision = async (actionId: string, decision: "execute" | "reject") => {
+    if (busyActionId) return;
     setError(null);
+    setBusyActionId(actionId);
     try {
       const res = await apiPost<{ action: ProposedAction }>(
         `/api/ai/actions/${actionId}/${decision}`,
@@ -228,6 +309,8 @@ export function AiCopilotDrawer({
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to ${decision} action`);
+    } finally {
+      setBusyActionId(null);
     }
   };
 
@@ -253,6 +336,8 @@ export function AiCopilotDrawer({
             <button
               className="btn btn-sm"
               onClick={() => {
+                abortActiveStream();
+                setSending(false);
                 setConversationId(null);
                 setMessages([]);
                 setActions([]);
@@ -263,7 +348,7 @@ export function AiCopilotDrawer({
             >
               <Plus size={13} /> New
             </button>
-            <button className="btn btn-sm" onClick={onClose}>
+            <button className="btn btn-sm" aria-label="Close AI Copilot" onClick={onClose}>
               <X size={15} />
             </button>
           </div>
@@ -286,7 +371,14 @@ export function AiCopilotDrawer({
           </select>
         )}
 
-        {error && <div className="banner banner-red">{error}</div>}
+        {error && (
+          <div className="banner banner-red">
+            <span>{error}</span>
+            <button className="btn btn-sm" onClick={() => setError(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
 
         <div className="ai-messages">
           {messages.length === 0 && !sending ? (
@@ -342,6 +434,7 @@ export function AiCopilotDrawer({
               </div>
             </div>
           )}
+          <div ref={messagesEndRef} />
         </div>
 
         {actions.length > 0 && (
@@ -371,12 +464,15 @@ export function AiCopilotDrawer({
                     <button
                       id={`approve-ai-action-${a.id}`}
                       className="btn btn-primary btn-sm"
+                      disabled={busyActionId !== null}
                       onClick={() => void handleActionDecision(a.id, "execute")}
                     >
-                      <Check size={13} /> Approve &amp; Execute
+                      <Check size={13} />{" "}
+                      {busyActionId === a.id ? "Applying..." : "Approve & Execute"}
                     </button>
                     <button
                       className="btn btn-sm"
+                      disabled={busyActionId !== null}
                       onClick={() => void handleActionDecision(a.id, "reject")}
                     >
                       Dismiss
