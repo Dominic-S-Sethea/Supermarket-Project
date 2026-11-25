@@ -24,6 +24,22 @@ export async function applyDatabaseConstraintsAndViews() {
       WHERE closed_at IS NULL;
   `);
 
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS idx_sales_kind_sold_at
+      ON sales (kind, sold_at);
+  `);
+
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS idx_sales_original_sale
+      ON sales (original_sale_id)
+      WHERE original_sale_id IS NOT NULL;
+  `);
+
+  await db.execute(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_targeted_coupons_upper_code
+      ON targeted_coupons (upper(code));
+  `);
+
   // Idempotent CHECK constraint helper statements
   await db.execute(sql`
     DO $$
