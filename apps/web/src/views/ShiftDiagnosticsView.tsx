@@ -11,6 +11,7 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { StaffingRosterTab } from "../components/StaffingRosterTab";
 
 interface ShiftRow {
   shiftKey: string;
@@ -194,7 +195,7 @@ export function ShiftDiagnosticsView({
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ kind: "green" | "amber" | "red"; text: string } | null>(null);
-  const [subTab, setSubTab] = useState<"oos" | "queue" | "missions" | "experiments">("oos");
+  const [subTab, setSubTab] = useState<"oos" | "queue" | "missions" | "experiments" | "roster">("oos");
   const [hoverHour, setHoverHour] = useState<number | null>(null);
 
   // Footfall log modal state
@@ -756,6 +757,13 @@ export function ShiftDiagnosticsView({
             >
               DiD Impact Trials ({data?.experiments.length ?? 0})
             </button>
+            <button
+              id="subtab-roster"
+              className={`subtab-btn ${subTab === "roster" ? "active" : ""}`}
+              onClick={() => setSubTab("roster")}
+            >
+              Hourly Lane Staffing Roster
+            </button>
           </div>
 
           {subTab === "oos" && (
@@ -1119,6 +1127,10 @@ export function ShiftDiagnosticsView({
                 </section>
               )}
             </div>
+          )}
+
+          {subTab === "roster" && (
+            <StaffingRosterTab canOperate={canOperate} onBanner={(b) => setBanner(b)} />
           )}
 
           <section className="panel">

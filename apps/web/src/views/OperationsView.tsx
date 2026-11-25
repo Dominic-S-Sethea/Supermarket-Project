@@ -5,8 +5,9 @@ import {
   formatMoney,
   type UserRole,
 } from "@supermarket/shared";
-import { AlertTriangle, Award, Check, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Award, Check, ClipboardList, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { FloorTasksTab } from "../components/FloorTasksTab";
 import { ShelfIntegrityTab } from "../components/ShelfIntegrityTab";
 import { SupplierMatchTab } from "../components/SupplierMatchTab";
 
@@ -84,7 +85,7 @@ interface ParsedInvoiceResponse {
   };
 }
 
-type OpsSubTab = "receiving" | "shelf" | "suppliers";
+type OpsSubTab = "receiving" | "shelf" | "tasks" | "suppliers";
 
 export function OperationsView({
   suppliers,
@@ -409,6 +410,15 @@ export function OperationsView({
           >
             <Ghost size={14} /> Shelf Integrity &amp; 07:30 Tags
           </button>
+          <button
+            id="ops-subtab-tasks"
+            role="tab"
+            aria-selected={subTab === "tasks"}
+            className={`subtab-btn ${subTab === "tasks" ? "active" : ""}`}
+            onClick={() => setSubTab("tasks")}
+          >
+            <ClipboardList size={14} /> Daily Floor Tasks
+          </button>
           {canManage && (
             <button
               id="ops-subtab-suppliers"
@@ -426,7 +436,7 @@ export function OperationsView({
       {!canManage && (
         <div className="banner banner-amber" style={{ marginBottom: 14 }}>
           <span>
-            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, phantom stock blind counts, and 07:30 shelf tag batch printing are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
+            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, phantom stock blind counts, 07:30 shelf tag batch printing, and daily floor checklist completion are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
           </span>
         </div>
       )}
@@ -465,6 +475,14 @@ export function OperationsView({
             setErrorMsg(null);
             setFeedback(msg);
             onCountsChanged?.();
+          }}
+          onError={(msg) => setErrorMsg(msg)}
+        />
+      ) : subTab === "tasks" ? (
+        <FloorTasksTab
+          onFeedback={(msg) => {
+            setErrorMsg(null);
+            setFeedback(msg);
           }}
           onError={(msg) => setErrorMsg(msg)}
         />

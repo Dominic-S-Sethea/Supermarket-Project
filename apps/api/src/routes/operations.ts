@@ -1,10 +1,13 @@
 import type { FastifyInstance } from "fastify";
 import {
   ApplyDynamicMarkdownSchema,
+  CompleteFloorTaskSchema,
   computeSuggestedSellPriceCents,
   formatMoney,
+  GenerateStaffingPlanSchema,
   generateUuidV7,
   PrintShelfTagBatchSchema,
+  UpdateStaffingPlanSchema,
 } from "@supermarket/shared";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -19,10 +22,15 @@ import {
   productBarcodes,
   products,
   promotions,
+  sales,
   shelfTagQueue,
+  shiftRosters,
   stockBaselines,
   stockMovements,
+  storeFootfall,
+  storeTasks,
   taxRates,
+  users,
 } from "../db/index.js";
 import { buildZplBarcodeCommand, sanitizeZpl } from "../lib/helpers.js";
 import { requireRole } from "../plugins/auth.js";
@@ -622,6 +630,378 @@ ${buildZplBarcodeCommand(r.barcode)}
         tagIds: foundIds,
         zpl: zplBlocks.join("\n"),
       };
+    }
+  );
+
+  // =========================================================================
+  // MILESTONE 3: HOURLY LANE STAFFING PLANNER
+  // =========================================================================
+  app.get(
+    "/api/operations/staffing-plan",
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    async (req, reply) => {
+      const q = req.query as { date?: string };
+      const planDate = q.date?.trim() || new Date().toISOString().slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(planDate)) {
+        return reply.status(400).send({ error: "Invalid date format (expected YYYY-MM-DD)." });
+      }
+
+      const [slots, staffOptions] = await Promise.all([
+        db
+          .select()
+          .from(shiftRosters)
+          .where(eq(shiftRosters.planDate, planDate))
+          .orderBy(asc(shiftRosters.hour)),
+        db
+          .select({
+            id: users.id,
+            fullName: users.fullName,
+            role: users.role,
+          })
+          .from(users)
+          .where(and(eq(users.active, true), inArray(users.role, ["cashier", "manager", "owner"])))
+          .orderBy(asc(users.role), asc(users.fullName)),
+      ]);
+
+      const peakLanes = slots.reduce((m, s) => Math.max(m, s.recommendedLanes), 0);
+      const totalPredictedEntries = Math.round(
+        slots.reduce((s, r) => s + r.predictedEntries, 0)
+      );
+      const assignedSlots = slots.filter((s) => Boolean(s.assignedStaffId || s.assignedCashierName)).length;
+      const confirmedSlots = slots.filter(
+        (s) => s.status === "confirmed" || s.status === "completed"
+      ).length;
+
+      return {
+        planDate,
+        summary: {
+          totalHours: slots.length,
+          peakLanes,
+          totalPredictedEntries,
+          assignedSlots,
+          confirmedSlots,
+        },
+        staffOptions,
+        slots,
+      };
+    }
+  );
+
+  app.post(
+    "/api/operations/staffing-plan/generate",
+    { preHandler: [requireRole(["owner", "manager"])] },
+    async (req, reply) => {
+      const parsed = GenerateStaffingPlanSchema.safeParse(req.body);
+      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+
+      const { planDate, shiftBucket } = parsed.data;
+      const cutoff = new Date(Date.now() - 28 * 86400_000);
+
+      // Compute trailing 28-day hourly averages for door entries and POS receipts
+      const [ffRows, txRows] = await Promise.all([
+        db.execute(sql`
+          SELECT
+            EXTRACT(HOUR FROM ${storeFootfall.bucketStart})::int AS hr,
+            coalesce(sum(${storeFootfall.entries})::double precision / NULLIF(count(DISTINCT date(${storeFootfall.bucketStart})), 0), 0) AS avg_entries
+          FROM ${storeFootfall}
+          WHERE ${storeFootfall.bucketStart} >= ${cutoff}
+          GROUP BY 1
+        `),
+        db.execute(sql`
+          SELECT
+            EXTRACT(HOUR FROM ${sales.soldAt})::int AS hr,
+            coalesce(count(*)::double precision / NULLIF(count(DISTINCT date(${sales.soldAt})), 0), 0) AS avg_txns
+          FROM ${sales}
+          WHERE ${sales.kind} = 'sale' AND ${sales.soldAt} >= ${cutoff}
+          GROUP BY 1
+        `),
+      ]);
+
+      const entriesByHour = new Map<number, number>();
+      for (const r of ffRows.rows as { hr: number; avg_entries: number }[]) {
+        entriesByHour.set(Number(r.hr), Number(r.avg_entries) || 0);
+      }
+      const txnsByHour = new Map<number, number>();
+      for (const r of txRows.rows as { hr: number; avg_txns: number }[]) {
+        txnsByHour.set(Number(r.hr), Number(r.avg_txns) || 0);
+      }
+
+      const hours = Array.from({ length: 14 }, (_, i) => i + 8).filter((h) => {
+        if (!shiftBucket) return true;
+        if (shiftBucket === "morning") return h >= 8 && h < 12;
+        if (shiftBucket === "afternoon") return h >= 12 && h < 17;
+        return h >= 17 && h <= 21;
+      });
+
+      const slots = await db.transaction(async (tx) => {
+        const upserted = [];
+        for (const hr of hours) {
+          const bucket = hr < 12 ? "morning" : hr < 17 ? "afternoon" : "evening";
+          const predEntries = Number((entriesByHour.get(hr) ?? (hr >= 17 ? 52 : hr < 12 ? 34 : 44)).toFixed(1));
+          const predTxns = Number((txnsByHour.get(hr) ?? Math.max(6, predEntries * 0.62)).toFixed(1));
+          const recLanes = Math.min(6, Math.max(1, Math.ceil(predEntries / 30)));
+
+          const [row] = await tx
+            .insert(shiftRosters)
+            .values({
+              planDate,
+              hour: hr,
+              shiftBucket: bucket,
+              predictedEntries: predEntries,
+              predictedTransactions: predTxns,
+              recommendedLanes: recLanes,
+              status: "planned",
+            })
+            .onConflictDoUpdate({
+              target: [shiftRosters.planDate, shiftRosters.hour],
+              set: {
+                shiftBucket: bucket,
+                predictedEntries: predEntries,
+                predictedTransactions: predTxns,
+                recommendedLanes: recLanes,
+              },
+            })
+            .returning();
+          upserted.push(row);
+        }
+
+        await tx.insert(auditLogs).values({
+          actor: req.authUser!.fullName,
+          action: "staffing_plan_generate",
+          entityType: "shift_roster",
+          entityId: upserted[0]?.id ?? null,
+          detailsJson: { planDate, shiftBucket: shiftBucket ?? "all", slots: upserted.length },
+        });
+        return upserted;
+      });
+
+      return reply.status(201).send({ planDate, generatedCount: slots.length, slots });
+    }
+  );
+
+  app.patch(
+    "/api/operations/staffing-plan/:id",
+    { preHandler: [requireRole(["owner", "manager"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid staffing slot ID format." });
+      }
+      const parsed = UpdateStaffingPlanSchema.safeParse(req.body);
+      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+
+      const data = parsed.data;
+      const patch: Partial<typeof shiftRosters.$inferInsert> = {};
+
+      if (data.assignedStaffId !== undefined) {
+        if (data.assignedStaffId === null) {
+          patch.assignedStaffId = null;
+          patch.assignedCashierName = data.assignedCashierName ?? null;
+        } else {
+          const [staff] = await db
+            .select({ id: users.id, fullName: users.fullName })
+            .from(users)
+            .where(eq(users.id, data.assignedStaffId))
+            .limit(1);
+          if (!staff) return reply.status(404).send({ error: "Assigned staff user not found." });
+          patch.assignedStaffId = staff.id;
+          patch.assignedCashierName = data.assignedCashierName ?? staff.fullName;
+        }
+      } else if (data.assignedCashierName !== undefined) {
+        patch.assignedCashierName = data.assignedCashierName;
+      }
+
+      if (data.status !== undefined) patch.status = data.status;
+      if (data.recommendedLanes !== undefined) patch.recommendedLanes = data.recommendedLanes;
+
+      if (Object.keys(patch).length === 0) {
+        return reply.status(400).send({ error: "Provide at least one field to update." });
+      }
+
+      const [updated] = await db
+        .update(shiftRosters)
+        .set(patch)
+        .where(eq(shiftRosters.id, id))
+        .returning();
+
+      if (!updated) return reply.status(404).send({ error: "Staffing slot not found." });
+
+      await db.insert(auditLogs).values({
+        actor: req.authUser!.fullName,
+        action: "staffing_slot_update",
+        entityType: "shift_roster",
+        entityId: updated.id,
+        detailsJson: patch,
+      });
+
+      return { slot: updated };
+    }
+  );
+
+  // =========================================================================
+  // MILESTONE 3: DAILY FLOOR TASK CHECKLIST (RESTOCK, COUNTS, TAGS, MARKDOWNS)
+  // =========================================================================
+  app.get(
+    "/api/operations/tasks",
+    { preHandler: [requireRole(["owner", "manager", "stock_clerk", "accountant"])] },
+    async (req, reply) => {
+      const q = req.query as { date?: string; status?: string; taskType?: string };
+      const rawDate = q.date?.trim();
+      const targetDate = rawDate && rawDate !== "all" ? rawDate : rawDate === "all" ? null : new Date().toISOString().slice(0, 10);
+      if (targetDate && !/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+        return reply.status(400).send({ error: "Invalid date format (expected YYYY-MM-DD or all)." });
+      }
+
+      const conditions = [];
+      if (targetDate) conditions.push(eq(storeTasks.taskDate, targetDate));
+      if (q.status && q.status !== "all") {
+        if (!["pending", "completed", "skipped"].includes(q.status)) {
+          return reply.status(400).send({ error: "Invalid task status filter." });
+        }
+        conditions.push(eq(storeTasks.status, q.status));
+      }
+      if (q.taskType && q.taskType !== "all") {
+        if (!["restock", "cycle_count", "shelf_tag", "expiry_markdown"].includes(q.taskType)) {
+          return reply.status(400).send({ error: "Invalid taskType filter." });
+        }
+        conditions.push(eq(storeTasks.taskType, q.taskType));
+      }
+
+      const tasks = await db
+        .select({
+          id: storeTasks.id,
+          taskDate: storeTasks.taskDate,
+          shiftBucket: storeTasks.shiftBucket,
+          taskType: storeTasks.taskType,
+          priority: storeTasks.priority,
+          title: storeTasks.title,
+          aisleLocation: storeTasks.aisleLocation,
+          productId: storeTasks.productId,
+          sku: products.sku,
+          productName: products.name,
+          targetQty: storeTasks.targetQty,
+          status: storeTasks.status,
+          completedBy: storeTasks.completedBy,
+          completedAt: storeTasks.completedAt,
+          completionNote: storeTasks.completionNote,
+          createdAt: storeTasks.createdAt,
+        })
+        .from(storeTasks)
+        .leftJoin(products, eq(storeTasks.productId, products.id))
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(asc(storeTasks.status), asc(storeTasks.priority), desc(storeTasks.createdAt))
+        .limit(120);
+
+      const summary = {
+        total: tasks.length,
+        pending: tasks.filter((t) => t.status === "pending").length,
+        completed: tasks.filter((t) => t.status === "completed").length,
+        urgentPending: tasks.filter((t) => t.status === "pending" && t.priority === 1).length,
+      };
+
+      return { date: targetDate ?? "all", summary, tasks };
+    }
+  );
+
+  app.post(
+    "/api/operations/tasks/:id/complete",
+    { preHandler: [requireRole(["owner", "manager", "stock_clerk"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid floor task ID format." });
+      }
+      const parsed = CompleteFloorTaskSchema.safeParse(req.body ?? {});
+      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+
+      const actorName = req.authUser!.fullName;
+      const result = await db.transaction(async (tx) => {
+        const [task] = await tx
+          .select()
+          .from(storeTasks)
+          .where(eq(storeTasks.id, id))
+          .for("update");
+        if (!task) return null;
+
+        let stockVarianceUnits: number | null = null;
+        if (
+          task.taskType === "cycle_count" &&
+          parsed.data.actualQty !== undefined &&
+          task.productId
+        ) {
+          const [lockedProd] = await tx
+            .select({ id: products.id, avgCostCents: products.avgCostCents })
+            .from(products)
+            .where(eq(products.id, task.productId))
+            .for("update");
+          if (lockedProd) {
+            const [baseline] = await tx
+              .select({ quantity: stockBaselines.quantity })
+              .from(stockBaselines)
+              .where(eq(stockBaselines.productId, lockedProd.id))
+              .limit(1);
+            const [unfolded] = await tx
+              .select({
+                delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
+              })
+              .from(stockMovements)
+              .where(
+                and(eq(stockMovements.productId, lockedProd.id), eq(stockMovements.folded, false))
+              );
+            const expected = Number(baseline?.quantity ?? 0) + Number(unfolded?.delta ?? 0);
+            const variance = parsed.data.actualQty - expected;
+            stockVarianceUnits = variance;
+            if (variance !== 0) {
+              await tx.insert(stockMovements).values({
+                id: generateUuidV7(),
+                productId: lockedProd.id,
+                qtyDelta: variance,
+                unitCostCents: lockedProd.avgCostCents,
+                reason: "count_adj",
+                folded: false,
+              });
+            }
+            await tx
+              .update(analyticsPhantomStock)
+              .set({
+                status: variance === 0 ? "verified_ok" : "recounted",
+                bookStockUnits: parsed.data.actualQty,
+                estimatedValueAtRiskCents: 0,
+              })
+              .where(eq(analyticsPhantomStock.productId, lockedProd.id));
+          }
+        }
+
+        const [updated] = await tx
+          .update(storeTasks)
+          .set({
+            status: "completed",
+            completedBy: actorName,
+            completedAt: new Date(),
+            completionNote: parsed.data.note ?? null,
+          })
+          .where(eq(storeTasks.id, id))
+          .returning();
+
+        await tx.insert(auditLogs).values({
+          actor: actorName,
+          action: "floor_task_complete",
+          entityType: "store_task",
+          entityId: updated.id,
+          detailsJson: {
+            taskType: updated.taskType,
+            title: updated.title,
+            actualQty: parsed.data.actualQty ?? null,
+            stockVarianceUnits,
+            note: parsed.data.note ?? null,
+          },
+        });
+
+        return { task: updated, stockVarianceUnits };
+      });
+
+      if (!result) return reply.status(404).send({ error: "Floor task not found." });
+      return result;
     }
   );
 }

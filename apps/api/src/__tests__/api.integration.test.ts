@@ -28,8 +28,10 @@ import {
   sales,
   shelfTagQueue,
   shiftExperiments,
+  shiftRosters,
   stockMovements,
   storeFootfall,
+  storeTasks,
   targetedCoupons,
   users,
 } from "../db/index.js";
@@ -1533,5 +1535,107 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       .where(inArray(stockMovements.refId, [winnerPayload.id, voidId]));
     await db.delete(sales).where(inArray(sales.id, [voidId, winnerPayload.id]));
     await db.delete(customers).where(eq(customers.id, customer.id));
+  });
+
+  it("Milestone 3: supports Hourly Lane Staffing Plan generation/assignment and Daily Floor Task Checklist completion with RBAC", async () => {
+    const clerkLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "clerk1", pin: "2222" },
+    });
+    expect(clerkLogin.statusCode).toBe(200);
+    const clerkToken = (clerkLogin.json() as { token: string }).token;
+
+    // 1. Cashier blocked from staffing plan & tasks
+    const cashierStaff = await app.inject({
+      method: "GET",
+      url: "/api/operations/staffing-plan",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierStaff.statusCode).toBe(403);
+
+    const cashierTasks = await app.inject({
+      method: "GET",
+      url: "/api/operations/tasks",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierTasks.statusCode).toBe(403);
+
+    // 2. Generate staffing plan for a dedicated test date, assign a cashier, and confirm
+    const testPlanDate = "2027-01-15";
+    const genRes = await app.inject({
+      method: "POST",
+      url: "/api/operations/staffing-plan/generate",
+      headers: authHeaders(),
+      payload: { planDate: testPlanDate },
+    });
+    expect(genRes.statusCode).toBe(201);
+    expect(genRes.json().generatedCount).toBe(14);
+
+    const listPlan = await app.inject({
+      method: "GET",
+      url: `/api/operations/staffing-plan?date=${testPlanDate}`,
+      headers: authHeaders(),
+    });
+    expect(listPlan.statusCode).toBe(200);
+    const planBody = listPlan.json() as {
+      staffOptions: { id: string; fullName: string }[];
+      slots: { id: string; hour: number }[];
+    };
+    expect(planBody.slots.length).toBe(14);
+    expect(planBody.staffOptions.length).toBeGreaterThan(0);
+
+    const patchSlot = await app.inject({
+      method: "PATCH",
+      url: `/api/operations/staffing-plan/${planBody.slots[0].id}`,
+      headers: authHeaders(),
+      payload: {
+        assignedStaffId: planBody.staffOptions[0].id,
+        status: "confirmed",
+        recommendedLanes: 2,
+      },
+    });
+    expect(patchSlot.statusCode).toBe(200);
+    expect(patchSlot.json().slot.status).toBe("confirmed");
+    expect(patchSlot.json().slot.assignedCashierName).toBe(planBody.staffOptions[0].fullName);
+
+    // 3. Daily Floor Tasks: clerk lists tasks & completes one, then restore original state
+    const tasksRes = await app.inject({
+      method: "GET",
+      url: "/api/operations/tasks?date=all",
+      headers: authHeaders(clerkToken),
+    });
+    expect(tasksRes.statusCode).toBe(200);
+    const taskList = tasksRes.json().tasks as {
+      id: string;
+      status: string;
+      completedBy: string | null;
+      completedAt: string | null;
+      completionNote: string | null;
+    }[];
+    expect(taskList.length).toBeGreaterThan(0);
+    const sampleTask = taskList[0];
+
+    const compRes = await app.inject({
+      method: "POST",
+      url: `/api/operations/tasks/${sampleTask.id}/complete`,
+      headers: authHeaders(clerkToken),
+      payload: { note: "Restocked top shelf before 08:00" },
+    });
+    expect(compRes.statusCode).toBe(200);
+    expect(compRes.json().task.status).toBe("completed");
+    expect(compRes.json().task.completedBy).toContain("Marcus");
+
+    // Cleanup test staffing plan & restore task state
+    await db.delete(shiftRosters).where(eq(shiftRosters.planDate, testPlanDate));
+    await db
+      .update(storeTasks)
+      .set({
+        status: sampleTask.status,
+        completedBy: sampleTask.completedBy,
+        completedAt: sampleTask.completedAt ? new Date(sampleTask.completedAt) : null,
+        completionNote: sampleTask.completionNote,
+      })
+      .where(eq(storeTasks.id, sampleTask.id));
   });
 });
