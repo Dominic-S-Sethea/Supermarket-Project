@@ -17,19 +17,35 @@ const DEMO_PERSONAS: { label: string; role: string; username: string; pin: strin
   { label: "Stock Clerk", role: "FEFO & Counts", username: "clerk1", pin: "2222" },
 ];
 
-export function LoginScreen({ onLoggedIn }: { onLoggedIn: (user: SessionUser) => void }) {
+export function LoginScreen({
+  onLoggedIn,
+  sessionNotice,
+}: {
+  onLoggedIn: (user: SessionUser) => void;
+  sessionNotice?: string | null;
+}) {
   const [username, setUsername] = useState("owner");
   const [pin, setPin] = useState("1111");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const submitLogin = async (u = username, p = pin) => {
+    const cleanUser = u.trim();
+    const cleanPin = p.trim();
+    if (!cleanUser) {
+      setError("Enter your staff username.");
+      return;
+    }
+    if (cleanPin.length < 4 || cleanPin.length > 12) {
+      setError("Staff PIN must be 4 to 12 characters.");
+      return;
+    }
     setError(null);
     setSubmitting(true);
     try {
       const res = await apiPost<{ user: SessionUser }>("/api/auth/login", {
-        username: u,
-        pin: p,
+        username: cleanUser,
+        pin: cleanPin,
       });
       onLoggedIn(res.user);
     } catch (err) {
@@ -59,6 +75,12 @@ export function LoginScreen({ onLoggedIn }: { onLoggedIn: (user: SessionUser) =>
           Enter your staff username and PIN, or pick a demo role below.
         </p>
 
+        {sessionNotice && !error && (
+          <div className="banner banner-amber" style={{ marginBottom: 14 }}>
+            {sessionNotice}
+          </div>
+        )}
+
         {error && (
           <div className="banner banner-red" style={{ marginBottom: 14 }}>
             {error}
@@ -81,6 +103,8 @@ export function LoginScreen({ onLoggedIn }: { onLoggedIn: (user: SessionUser) =>
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               autoComplete="username"
+              disabled={submitting}
+              required
             />
           </div>
           <div className="field">
@@ -92,6 +116,10 @@ export function LoginScreen({ onLoggedIn }: { onLoggedIn: (user: SessionUser) =>
               value={pin}
               onChange={(e) => setPin(e.target.value)}
               autoComplete="current-password"
+              disabled={submitting}
+              minLength={4}
+              maxLength={12}
+              required
             />
           </div>
           <button
@@ -115,6 +143,7 @@ export function LoginScreen({ onLoggedIn }: { onLoggedIn: (user: SessionUser) =>
                 key={p.username}
                 type="button"
                 className="quick-sku-btn"
+                disabled={submitting}
                 onClick={() => {
                   setUsername(p.username);
                   setPin(p.pin);

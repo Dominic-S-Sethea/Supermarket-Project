@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import Fastify from "fastify";
 import { db } from "./db/index.js";
 import { registerAuthHook } from "./plugins/auth.js";
+import { registerCsrfOriginCheck, registerSecurityHeaders } from "./plugins/security.js";
 import { aiRoutes } from "./routes/ai.js";
 import { analyticsRoutes } from "./routes/analytics.js";
 import { authRoutes } from "./routes/auth.js";
@@ -10,7 +11,21 @@ import { catalogRoutes } from "./routes/catalog.js";
 import { inventoryRoutes } from "./routes/inventory.js";
 import { posRoutes } from "./routes/pos.js";
 
+declare module "fastify" {
+  interface FastifyInstance {
+    allowedOrigins: Set<string>;
+  }
+}
+
 const DEFAULT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
+
+export function getPgErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const e = err as { code?: unknown; cause?: { code?: unknown } };
+  if (typeof e.code === "string") return e.code;
+  if (e.cause && typeof e.cause.code === "string") return e.cause.code;
+  return undefined;
+}
 
 export async function buildApp(logger = true) {
   const app = Fastify({
@@ -24,6 +39,7 @@ export async function buildApp(logger = true) {
       .map((s) => s.trim())
       .filter(Boolean)
   );
+  app.decorate("allowedOrigins", allowedOrigins);
 
   await app.register(cors, {
     credentials: true,
@@ -32,12 +48,45 @@ export async function buildApp(logger = true) {
       if (!origin || allowedOrigins.has(origin)) {
         cb(null, true);
       } else {
-        cb(new Error(`Origin ${origin} not allowed by CORS`), false);
+        const corsErr = new Error("Origin not allowed by CORS") as Error & { statusCode?: number };
+        corsErr.statusCode = 403;
+        cb(corsErr, false);
       }
     },
   });
 
+  registerSecurityHeaders(app);
+  registerCsrfOriginCheck(app, allowedOrigins);
   registerAuthHook(app);
+
+  app.setErrorHandler((err, req, reply) => {
+    const pgCode = getPgErrorCode(err);
+    if (pgCode === "22P02") {
+      return reply.status(400).send({ error: "Invalid identifier or parameter format." });
+    }
+    if (pgCode === "23505") {
+      return reply.status(409).send({ error: "A record with this unique value already exists." });
+    }
+    if (pgCode === "23503") {
+      return reply.status(400).send({ error: "Referenced resource does not exist." });
+    }
+    if (pgCode === "23514") {
+      return reply.status(400).send({ error: "Value violates data integrity constraints." });
+    }
+
+    const status =
+      typeof (err as { statusCode?: unknown }).statusCode === "number"
+        ? (err as { statusCode: number }).statusCode
+        : 500;
+    if (status >= 400 && status < 500) {
+      return reply.status(status).send({
+        error: err instanceof Error ? err.message : "Request rejected.",
+      });
+    }
+
+    req.log.error({ err }, "Unhandled server error");
+    return reply.status(500).send({ error: "Internal server error." });
+  });
 
   app.get("/api/health", async () => ({
     status: "ok",

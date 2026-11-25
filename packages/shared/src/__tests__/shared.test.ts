@@ -7,6 +7,8 @@ import {
   computeNetMarginBp,
   computeSuggestedSellPriceCents,
   computeTaxCents,
+  CreateGrnSchema,
+  CreatePromotionSchema,
   evaluateCart,
   formatMoney,
   generateUuidV7,
@@ -428,4 +430,207 @@ describe("deterministic promotion and multi-UOM pricing engine", () => {
     expect(resWithin.totalDiscountCents).toBe(400);
     expect(resWithin.couponDiscountCents).toBe(0);
   });
+
+  it("handles zero/negative quantities cleanly without triggering promos or age checks", () => {
+    const zeroBeer: CartInputLine = {
+      ...beer6Pack,
+      lineKey: "zero-beer",
+      qtyPacks: 0,
+    };
+    const negNoodle: CartInputLine = {
+      ...noodleA,
+      lineKey: "neg-noodle",
+      qtyPacks: -3,
+    };
+    const res = evaluateCart([zeroBeer, negNoodle], [
+      {
+        id: "p-clear",
+        name: "Clearance",
+        promoType: "clearance",
+        priority: 1,
+        combinable: true,
+        minMarginGuardBp: null,
+        productIds: ["p-beer-1", "p-noodle-a"],
+        discountBp: 2000,
+      },
+    ]);
+    expect(res.subtotalBeforeDiscountCents).toBe(0);
+    expect(res.totalDiscountCents).toBe(0);
+    expect(res.grandTotalCents).toBe(0);
+    expect(res.requiresAgeCheck).toBe(false);
+    expect(res.appliedPromos).toHaveLength(0);
+  });
+
+  it("allocates basket_threshold and coupon discounts with Hamilton Largest Remainder without over-allocating", () => {
+    // 5 identical lines of 1000c each with flatDiscountCents = 3c (previously naive rounding allocated 1c*4 = 4c > 3c)
+    const lines: CartInputLine[] = Array.from({ length: 5 }, (_, idx) => ({
+      ...noodleA,
+      lineKey: `eq-${idx}`,
+      productId: `p-eq-${idx}`,
+      qtyPacks: 1,
+      unitPriceCents: 1000,
+      unitCostCents: 400,
+    }));
+    const basketPromo: PromotionRule = {
+      id: "tiny-basket",
+      name: "$0.03 Off Over $20",
+      promoType: "basket_threshold",
+      priority: 10,
+      combinable: true,
+      minMarginGuardBp: null,
+      minBasketCents: 2000,
+      flatDiscountCents: 3,
+    };
+    const res = evaluateCart(lines, [basketPromo], { couponDiscountCents: 7 });
+    const lineDiscountSum = res.lines.reduce((acc, l) => acc + l.discountCents, 0);
+    expect(res.appliedPromos[0]?.discountCents).toBe(3);
+    expect(res.couponDiscountCents).toBe(7);
+    expect(res.totalDiscountCents).toBe(10);
+    expect(lineDiscountSum).toBe(10);
+    expect(res.grandTotalCents).toBe(4990);
+  });
+
+  it("prevents double-discounting when combinable clearance stacks with mix_and_match", () => {
+    // Two single packs at 100c each -> combinable 20% clearance makes them 80c each (160c total).
+    // Then mix_and_match "2 for 150c" should only discount the remaining 10c (NOT 50c down to 110c!).
+    const twoNoodles: CartInputLine = {
+      ...noodleA,
+      lineKey: "stack-1",
+      qtyPacks: 2,
+      unitPriceCents: 100,
+      unitCostCents: 30,
+    };
+    const promos: PromotionRule[] = [
+      {
+        id: "comb-clear",
+        name: "20% Combinable Clearance",
+        promoType: "clearance",
+        priority: 1,
+        combinable: true,
+        minMarginGuardBp: null,
+        productIds: ["p-noodle-a"],
+        discountBp: 2000,
+      },
+      {
+        id: "comb-bundle",
+        name: "2 for $1.50",
+        promoType: "mix_and_match",
+        priority: 2,
+        combinable: false,
+        minMarginGuardBp: null,
+        categoryIds: ["cat-noodles"],
+        requiredQty: 2,
+        bundlePriceCents: 150,
+      },
+    ];
+    const res = evaluateCart([twoNoodles], promos);
+    expect(res.totalDiscountCents).toBe(50);
+    expect(res.grandTotalCents).toBe(150);
+  });
+
+  it("safely ignores malformed/negative promotion parameters and non-finite coupons", () => {
+    const malformedPromos: PromotionRule[] = [
+      {
+        id: "bad-bogo",
+        name: "Bad BOGO",
+        promoType: "bogo",
+        priority: 1,
+        combinable: true,
+        minMarginGuardBp: null,
+        categoryIds: ["cat-noodles"],
+        buyQty: -1,
+        getQty: 1,
+        discountBp: 10000,
+      },
+      {
+        id: "bad-bundle",
+        name: "Negative Bundle",
+        promoType: "mix_and_match",
+        priority: 2,
+        combinable: true,
+        minMarginGuardBp: null,
+        categoryIds: ["cat-noodles"],
+        requiredQty: 2,
+        bundlePriceCents: -100,
+      },
+      {
+        id: "over-discount",
+        name: "150% Off Clamped",
+        promoType: "clearance",
+        priority: 3,
+        combinable: true,
+        minMarginGuardBp: null,
+        productIds: ["p-noodle-a"],
+        discountBp: 15000,
+      },
+    ];
+
+    const res = evaluateCart([noodleA], malformedPromos, {
+      couponDiscountCents: Number.POSITIVE_INFINITY,
+    });
+    expect(res.totalDiscountCents).toBe(300); // clamped to 100% of 300c, never negative grandTotal
+    expect(res.grandTotalCents).toBe(0);
+    expect(res.couponDiscountCents).toBe(0);
+    expect(Number.isFinite(res.estimatedMarginBp)).toBe(true);
+  });
 });
+
+describe("money and Zod schema edge cases", () => {
+  it("guards money utilities against -0, NaN, non-positive roundStep, and negative units", () => {
+    expect(formatMoney(-0.1)).toBe("$0.00");
+    expect(formatMoney(Number.NaN)).toBe("$0.00");
+    expect(computeSuggestedSellPriceCents(100, 2000, 1000, true, 0)).toBeGreaterThan(100);
+    expect(computeEffectiveUnitCostCents(1000, -10, 0)).toBe(0);
+    expect(computeMovingWeightedAvgCostCents(10, 100, 0, 500)).toBe(100);
+    expect(computeMovingWeightedAvgCostCents(10, 100, -5, 500)).toBe(100);
+    expect(computeTaxCents(Number.NaN, 1000, true)).toEqual({
+      netCents: 0,
+      taxCents: 0,
+      grossCents: 0,
+    });
+  });
+
+  it("rejects zero-case GRN lines and invalid promotion daypart/date windows", () => {
+    const emptyGrn = CreateGrnSchema.safeParse({
+      supplierId: "01950000-0000-7000-8000-000000000001",
+      invoiceNumber: "INV-001",
+      lines: [
+        {
+          productId: "01950000-0000-7000-8000-000000000002",
+          paidCases: 0,
+          freeBonusCases: 0,
+          caseQty: 12,
+          invoiceLineTotalCents: 0,
+        },
+      ],
+    });
+    expect(emptyGrn.success).toBe(false);
+    if (!emptyGrn.success) {
+      expect(emptyGrn.error.issues.some((i) => i.message.includes("at least 1 paid or bonus case"))).toBe(true);
+    }
+
+    const partialDaypart = CreatePromotionSchema.safeParse({
+      name: "Broken Daypart",
+      promoType: "clearance",
+      daypartStartHour: 8,
+      rulesJson: {},
+    });
+    expect(partialDaypart.success).toBe(false);
+    if (!partialDaypart.success) {
+      expect(partialDaypart.error.issues.some((i) => i.message.includes("provided together"))).toBe(true);
+    }
+
+    const reversedDates = CreatePromotionSchema.safeParse({
+      name: "Reversed Dates",
+      promoType: "clearance",
+      startsAt: "2026-12-31T00:00:00Z",
+      endsAt: "2026-01-01T00:00:00Z",
+      rulesJson: {},
+    });
+    expect(reversedDates.success).toBe(false);
+    if (!reversedDates.success) {
+      expect(reversedDates.error.issues.some((i) => i.message.includes("earlier than or equal to endsAt"))).toBe(true);
+    }
+  });
+});
+

@@ -218,28 +218,47 @@ export function ShiftDiagnosticsView({
   const [postStart, setPostStart] = useState(offsetIso(14));
   const [postEnd, setPostEnd] = useState(todayIso);
 
-  const load = async () => {
+  const load = async (signal?: AbortSignal) => {
     setLoading(true);
     try {
-      const res = await apiGet<DiagnosticsPayload>("/api/analytics/shift-diagnostics");
-      setData(res);
+      const res = await apiGet<DiagnosticsPayload>("/api/analytics/shift-diagnostics", signal);
+      if (!signal?.aborted) {
+        setData(res);
+      }
     } catch (err) {
-      setBanner({
-        kind: "red",
-        text: err instanceof Error ? err.message : "Failed loading shift diagnostics",
-      });
+      if ((err as Error).name !== "AbortError") {
+        setBanner({
+          kind: "red",
+          text: err instanceof Error ? err.message : "Failed loading shift diagnostics",
+        });
+      }
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    if (!showFootfallModal) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowFootfallModal(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showFootfallModal]);
+
   const canManage = userRole === "owner" || userRole === "manager";
+  const canOperate = canManage || userRole === "stock_clerk";
 
   const handleCaptureSnapshot = async () => {
+    if (!canOperate || busyAction) return;
     setBusyAction("snapshot");
     setBanner(null);
     try {
@@ -263,6 +282,7 @@ export function ShiftDiagnosticsView({
   };
 
   const handleRecompute = async () => {
+    if (!canManage || busyAction) return;
     setBusyAction("recompute");
     setBanner(null);
     try {
@@ -281,6 +301,7 @@ export function ShiftDiagnosticsView({
 
   const handleLogFootfall = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canOperate || busyAction) return;
     setBusyAction("footfall");
     try {
       const d = new Date();
@@ -289,10 +310,10 @@ export function ShiftDiagnosticsView({
         buckets: [
           {
             bucketStart: d.toISOString(),
-            entries: Math.max(0, Number(ffEntries) || 0),
-            exits: Math.max(0, Number(ffEntries) || 0),
-            avgDwellSec: Math.max(30, Number(ffDwell) || 240),
-            openLanes: Math.max(1, Number(ffLanes) || 1),
+            entries: Math.max(0, Math.trunc(Number(ffEntries) || 0)),
+            exits: Math.max(0, Math.trunc(Number(ffEntries) || 0)),
+            avgDwellSec: Math.max(30, Math.trunc(Number(ffDwell) || 240)),
+            openLanes: Math.min(32, Math.max(1, Math.trunc(Number(ffLanes) || 1))),
             weatherRain: ffRain,
             source: "manual_counter",
           },
@@ -312,11 +333,20 @@ export function ShiftDiagnosticsView({
 
   const handleCreateExperiment = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canManage || busyAction) return;
+    if (preStart > preEnd || postStart > postEnd) {
+      setBanner({
+        kind: "red",
+        text: "Experiment Pre and Post windows must each have start date <= end date.",
+      });
+      return;
+    }
     setBusyAction("experiment");
+    setBanner(null);
     try {
       await apiPost("/api/analytics/shift-experiments", {
-        name: expName,
-        hypothesis: expHyp,
+        name: expName.trim(),
+        hypothesis: expHyp.trim(),
         interventionType: expType,
         targetShift: "morning",
         controlShift: "afternoon",
@@ -341,16 +371,16 @@ export function ShiftDiagnosticsView({
     return <div className="panel">Loading Morning Shift Diagnostics &amp; ML Analytics...</div>;
   }
 
-  const diag = data?.diagnostics;
-  const shifts = diag?.shiftComparison.shifts ?? [];
+  const diag = data?.diagnostics ?? null;
+  const shifts = diag?.shiftComparison?.shifts ?? [];
   const morning = shifts.find((s) => s.shiftKey === "morning");
   const afternoon = shifts.find((s) => s.shiftKey === "afternoon");
   const evening = shifts.find((s) => s.shiftKey === "evening");
   const hourly = diag?.hourlyProfile ?? [];
   const oosList = diag?.oosRootCauses ?? [];
-  const queueBins = diag?.queueSaturation.bins ?? [];
-  const drivers = diag?.driverAttribution.drivers ?? [];
-  const missions = diag?.shopperMissions.clusters ?? [];
+  const queueBins = diag?.queueSaturation?.bins ?? [];
+  const drivers = diag?.driverAttribution?.drivers ?? [];
+  const missions = diag?.shopperMissions?.clusters ?? [];
 
   // Hourly SVG dimensions
   const chartW = 720;
@@ -369,7 +399,7 @@ export function ShiftDiagnosticsView({
     .map((h, i) => {
       if (h.walkIns === 0) return null;
       const cx = padL + i * stepW + stepW / 2;
-      const cy = padT + plotH - (Math.min(100, h.conversionPct) / 100) * plotH;
+      const cy = padT + plotH - (Math.min(100, Math.max(0, h.conversionPct)) / 100) * plotH;
       return `${cx.toFixed(1)},${cy.toFixed(1)}`;
     })
     .filter(Boolean)
@@ -392,22 +422,26 @@ export function ShiftDiagnosticsView({
           </p>
         </div>
         <div className="header-actions">
-          <button
-            id="capture-snapshot-btn"
-            className="btn"
-            disabled={busyAction !== null}
-            onClick={() => void handleCaptureSnapshot()}
-          >
-            <Camera size={14} /> Capture Shelf Snapshot
-          </button>
-          <button
-            id="log-footfall-btn"
-            className="btn"
-            disabled={busyAction !== null}
-            onClick={() => setShowFootfallModal(true)}
-          >
-            <Users size={14} /> Log Footfall
-          </button>
+          {canOperate && (
+            <>
+              <button
+                id="capture-snapshot-btn"
+                className="btn"
+                disabled={busyAction !== null}
+                onClick={() => void handleCaptureSnapshot()}
+              >
+                <Camera size={14} /> Capture Shelf Snapshot
+              </button>
+              <button
+                id="log-footfall-btn"
+                className="btn"
+                disabled={busyAction !== null}
+                onClick={() => setShowFootfallModal(true)}
+              >
+                <Users size={14} /> Log Footfall
+              </button>
+            </>
+          )}
           {canManage && (
             <>
               <button
@@ -450,34 +484,57 @@ export function ShiftDiagnosticsView({
         </div>
       )}
 
-      {diag && (
+      {!diag ? (
+        <section className="panel stack-md" style={{ gap: 12 }}>
+          <p style={{ margin: 0, color: "var(--ink-secondary)" }}>
+            Shift diagnostics have not been materialized yet.{" "}
+            {canManage
+              ? "Run Recompute ML to generate the hourly funnel, OOS losses, K-Means shopper missions, and causal Ridge drivers."
+              : "Ask a Store Manager or Owner to run the analytics worker."}
+          </p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn" disabled={loading} onClick={() => void load()}>
+              <RefreshCw size={14} /> Retry
+            </button>
+            {canManage && (
+              <button
+                className="btn btn-primary"
+                disabled={busyAction !== null}
+                onClick={() => void handleRecompute()}
+              >
+                <RefreshCw size={14} /> {busyAction === "recompute" ? "Running ML..." : "Run ML Pipeline Now"}
+              </button>
+            )}
+          </div>
+        </section>
+      ) : (
         <>
           <section className="kpi-strip" aria-label="4-Lever Morning Decomposition KPIs">
             <div className="kpi-tile">
               <div className="kpi-label">1. Morning Revenue / Open Hr</div>
               <div className="kpi-value">
-                ${morning?.revenuePerOpenHourUsd.toFixed(0) ?? "0"}
+                ${(morning?.revenuePerOpenHourUsd ?? 0).toFixed(0)}
                 <span style={{ fontSize: 13, fontWeight: 500, color: "var(--ink-muted)" }}>/hr</span>
               </div>
               <div className="kpi-meta">
-                Afternoon: <span className="mono">${afternoon?.revenuePerOpenHourUsd.toFixed(0) ?? 0}/hr</span>{" "}
+                Afternoon: <span className="mono">${(afternoon?.revenuePerOpenHourUsd ?? 0).toFixed(0)}/hr</span>{" "}
                 · Share <strong className="mono">{diag.morningSharePct}%</strong> (p=
-                {diag.shiftComparison.morningVsAfternoonRevPerHrPValue})
+                {diag.shiftComparison?.morningVsAfternoonRevPerHrPValue ?? 1})
               </div>
             </div>
 
             <div className="kpi-tile">
               <div className="kpi-label">2. Morning Walk-In Conversion</div>
               <div className="kpi-value" style={{ color: "var(--accent-crimson)" }}>
-                {diag.morningConversionPct.toFixed(1)}%
+                {(diag.morningConversionPct ?? 0).toFixed(1)}%
               </div>
               <div className="kpi-meta">
                 95% CI{" "}
                 <span className="mono">
                   [{morning?.conversionCiLow ?? 0}–{morning?.conversionCiHigh ?? 0}%]
                 </span>{" "}
-                vs Aft <strong className="mono">{diag.afternoonConversionPct.toFixed(1)}%</strong> (p=
-                {diag.shiftComparison.morningVsAfternoonConversionPValue})
+                vs Aft <strong className="mono">{(diag.afternoonConversionPct ?? 0).toFixed(1)}%</strong> (p=
+                {diag.shiftComparison?.morningVsAfternoonConversionPValue ?? 1})
               </div>
             </div>
 
@@ -524,101 +581,107 @@ export function ShiftDiagnosticsView({
                 )}
               </div>
 
-              <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="img">
-                {morningCols > 0 && (
-                  <rect
-                    x={padL}
-                    y={padT}
-                    width={morningCols * stepW}
-                    height={plotH}
-                    fill="hsla(38, 92%, 50%, 0.08)"
-                  />
-                )}
-                {[0, 0.5, 1].map((t) => {
-                  const y = padT + plotH - t * plotH;
-                  return (
-                    <g key={t}>
-                      <line
-                        x1={padL}
-                        y1={y}
-                        x2={chartW - padR}
-                        y2={y}
-                        stroke="hsl(36, 14%, 89%)"
-                        strokeDasharray={t === 0 ? undefined : "3 3"}
-                      />
-                      <text
-                        x={padL - 6}
-                        y={y + 4}
-                        textAnchor="end"
-                        fontSize="10"
-                        fill="hsl(215, 10%, 52%)"
-                        fontFamily="JetBrains Mono, monospace"
+              {hourly.length === 0 ? (
+                <div style={{ color: "var(--ink-muted)", padding: "24px 0", textAlign: "center" }}>
+                  No hourly footfall telemetry recorded yet.
+                </div>
+              ) : (
+                <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="img" aria-label="Hourly footfall funnel">
+                  {morningCols > 0 && (
+                    <rect
+                      x={padL}
+                      y={padT}
+                      width={morningCols * stepW}
+                      height={plotH}
+                      fill="hsla(38, 92%, 50%, 0.08)"
+                    />
+                  )}
+                  {[0, 0.5, 1].map((t) => {
+                    const y = padT + plotH - t * plotH;
+                    return (
+                      <g key={t}>
+                        <line
+                          x1={padL}
+                          y1={y}
+                          x2={chartW - padR}
+                          y2={y}
+                          stroke="hsl(36, 14%, 89%)"
+                          strokeDasharray={t === 0 ? undefined : "3 3"}
+                        />
+                        <text
+                          x={padL - 6}
+                          y={y + 4}
+                          textAnchor="end"
+                          fontSize="10"
+                          fill="hsl(215, 10%, 52%)"
+                          fontFamily="JetBrains Mono, monospace"
+                        >
+                          {Math.round(maxTraffic * t)}
+                        </text>
+                        <text
+                          x={chartW - padR + 6}
+                          y={y + 4}
+                          textAnchor="start"
+                          fontSize="10"
+                          fill="hsl(158, 62%, 27%)"
+                          fontFamily="JetBrains Mono, monospace"
+                        >
+                          {Math.round(t * 100)}%
+                        </text>
+                      </g>
+                    );
+                  })}
+                  {hourly.map((h, i) => {
+                    const baseX = padL + i * stepW + stepW / 2;
+                    const hWalk = (h.walkIns / maxTraffic) * plotH;
+                    const hRcpt = (h.receipts / maxTraffic) * plotH;
+                    return (
+                      <g
+                        key={h.hour}
+                        onMouseEnter={() => setHoverHour(h.hour)}
+                        onMouseLeave={() => setHoverHour(null)}
+                        style={{ cursor: "pointer" }}
                       >
-                        {Math.round(maxTraffic * t)}
-                      </text>
-                      <text
-                        x={chartW - padR + 6}
-                        y={y + 4}
-                        textAnchor="start"
-                        fontSize="10"
-                        fill="hsl(158, 62%, 27%)"
-                        fontFamily="JetBrains Mono, monospace"
-                      >
-                        {Math.round(t * 100)}%
-                      </text>
-                    </g>
-                  );
-                })}
-                {hourly.map((h, i) => {
-                  const baseX = padL + i * stepW + stepW / 2;
-                  const hWalk = (h.walkIns / maxTraffic) * plotH;
-                  const hRcpt = (h.receipts / maxTraffic) * plotH;
-                  return (
-                    <g
-                      key={h.hour}
-                      onMouseEnter={() => setHoverHour(h.hour)}
-                      onMouseLeave={() => setHoverHour(null)}
-                      style={{ cursor: "pointer" }}
-                    >
-                      <rect
-                        x={baseX - barW - 1}
-                        y={padT + plotH - hWalk}
-                        width={barW}
-                        height={Math.max(1, hWalk)}
-                        rx={2}
-                        fill="hsl(215, 22%, 72%)"
-                      />
-                      <rect
-                        x={baseX + 1}
-                        y={padT + plotH - hRcpt}
-                        width={barW}
-                        height={Math.max(1, hRcpt)}
-                        rx={2}
-                        fill="hsl(158, 52%, 34%)"
-                      />
-                      <text
-                        x={baseX}
-                        y={chartH - 8}
-                        textAnchor="middle"
-                        fontSize="10"
-                        fill={h.hour < 12 ? "hsl(28, 84%, 32%)" : "hsl(215, 10%, 50%)"}
-                        fontWeight={h.hour < 12 ? "700" : "400"}
-                        fontFamily="JetBrains Mono, monospace"
-                      >
-                        {String(h.hour).padStart(2, "0")}
-                      </text>
-                    </g>
-                  );
-                })}
-                {convPolyline && (
-                  <polyline
-                    fill="none"
-                    stroke="hsl(28, 88%, 48%)"
-                    strokeWidth="2.4"
-                    points={convPolyline}
-                  />
-                )}
-              </svg>
+                        <rect
+                          x={baseX - barW - 1}
+                          y={padT + plotH - hWalk}
+                          width={barW}
+                          height={Math.max(1, hWalk)}
+                          rx={2}
+                          fill="hsl(215, 22%, 72%)"
+                        />
+                        <rect
+                          x={baseX + 1}
+                          y={padT + plotH - hRcpt}
+                          width={barW}
+                          height={Math.max(1, hRcpt)}
+                          rx={2}
+                          fill="hsl(158, 52%, 34%)"
+                        />
+                        <text
+                          x={baseX}
+                          y={chartH - 8}
+                          textAnchor="middle"
+                          fontSize="10"
+                          fill={h.hour < 12 ? "hsl(28, 84%, 32%)" : "hsl(215, 10%, 50%)"}
+                          fontWeight={h.hour < 12 ? "700" : "400"}
+                          fontFamily="JetBrains Mono, monospace"
+                        >
+                          {String(h.hour).padStart(2, "0")}
+                        </text>
+                      </g>
+                    );
+                  })}
+                  {convPolyline && (
+                    <polyline
+                      fill="none"
+                      stroke="hsl(28, 88%, 48%)"
+                      strokeWidth="2.4"
+                      points={convPolyline}
+                    />
+                  )}
+                </svg>
+              )}
             </section>
 
             <section className="panel">
@@ -627,33 +690,39 @@ export function ShiftDiagnosticsView({
                   <h2 className="panel-title">Chronological Ridge Causal Attribution</h2>
                   <p className="panel-desc">
                     Out-of-sample 14d Holdout WMAPE{" "}
-                    <strong className="mono">{diag.driverAttribution.holdoutWmapePct}%</strong> vs Seasonal
-                    Baseline <span className="mono">{diag.driverAttribution.baselineWmapePct}%</span>
+                    <strong className="mono">{diag.driverAttribution?.holdoutWmapePct ?? 0}%</strong> vs Seasonal
+                    Baseline <span className="mono">{diag.driverAttribution?.baselineWmapePct ?? 0}%</span>
                   </p>
                 </div>
               </div>
               <div className="stack-md" style={{ gap: 11 }}>
-                {drivers.map((d) => (
-                  <div key={d.feature} className="driver-row">
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
-                      <span style={{ fontWeight: 600 }}>{d.label}</span>
-                      <span className="mono">
-                        {d.importancePct}% ({d.coefUsdPerSd >= 0 ? "+" : ""}
-                        ${d.coefUsdPerSd}/SD)
-                      </span>
-                    </div>
-                    <div className="driver-bar-track">
-                      <div
-                        style={{
-                          width: `${Math.min(100, d.importancePct * 1.4)}%`,
-                          height: "100%",
-                          background:
-                            d.direction === "positive" ? "var(--accent-primary)" : "var(--accent-amber)",
-                        }}
-                      />
-                    </div>
+                {drivers.length === 0 ? (
+                  <div style={{ color: "var(--ink-muted)" }}>
+                    Insufficient historical buckets for causal Ridge driver attribution.
                   </div>
-                ))}
+                ) : (
+                  drivers.map((d) => (
+                    <div key={d.feature} className="driver-row">
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                        <span style={{ fontWeight: 600 }}>{d.label}</span>
+                        <span className="mono">
+                          {d.importancePct}% ({d.coefUsdPerSd >= 0 ? "+" : ""}
+                          ${d.coefUsdPerSd}/SD)
+                        </span>
+                      </div>
+                      <div className="driver-bar-track">
+                        <div
+                          style={{
+                            width: `${Math.min(100, d.importancePct * 1.4)}%`,
+                            height: "100%",
+                            background:
+                              d.direction === "positive" ? "var(--accent-primary)" : "var(--accent-amber)",
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             </section>
           </div>
@@ -713,33 +782,41 @@ export function ShiftDiagnosticsView({
                     </tr>
                   </thead>
                   <tbody>
-                    {oosList.slice(0, 15).map((item) => (
-                      <tr key={item.productId}>
-                        <td>
-                          <div style={{ fontWeight: 600 }}>{item.name}</div>
-                          <div className="mono" style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                            {item.sku} · {item.supplierName}
-                          </div>
-                        </td>
-                        <td>
-                          <span className="tag tag-neutral mono">{item.abcSegment}</span>{" "}
-                          <span style={{ fontSize: 12 }}>{item.departmentName}</span>
-                        </td>
-                        <td className="text-right mono">
-                          <span className="tag tag-red">
-                            {item.oosDays} / {item.snapshotDays}d
-                          </span>
-                        </td>
-                        <td className="text-right mono">{item.avgRestockHour}:00</td>
-                        <td className="text-right mono">{item.expectedMorningUnitsPerDay} u/morn</td>
-                        <td className="text-right mono">
-                          <strong>{item.suggestedPreOpenPickUnits} units</strong>
-                        </td>
-                        <td className="text-right mono" style={{ color: "var(--accent-crimson)", fontWeight: 700 }}>
-                          {formatMoney(item.estLostRevenueCents)}
+                    {oosList.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
+                          No recurring 08:00 AM shelf stockouts detected.
                         </td>
                       </tr>
-                    ))}
+                    ) : (
+                      oosList.slice(0, 15).map((item) => (
+                        <tr key={item.productId}>
+                          <td>
+                            <div style={{ fontWeight: 600 }}>{item.name}</div>
+                            <div className="mono" style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                              {item.sku} · {item.supplierName}
+                            </div>
+                          </td>
+                          <td>
+                            <span className="tag tag-neutral mono">{item.abcSegment}</span>{" "}
+                            <span style={{ fontSize: 12 }}>{item.departmentName}</span>
+                          </td>
+                          <td className="text-right mono">
+                            <span className="tag tag-red">
+                              {item.oosDays} / {item.snapshotDays}d
+                            </span>
+                          </td>
+                          <td className="text-right mono">{item.avgRestockHour}:00</td>
+                          <td className="text-right mono">{item.expectedMorningUnitsPerDay} u/morn</td>
+                          <td className="text-right mono">
+                            <strong>{item.suggestedPreOpenPickUnits} units</strong>
+                          </td>
+                          <td className="text-right mono" style={{ color: "var(--accent-crimson)", fontWeight: 700 }}>
+                            {formatMoney(item.estLostRevenueCents)}
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -753,7 +830,7 @@ export function ShiftDiagnosticsView({
                   <h2 className="panel-title">Morning 15-Min Queue Saturation &amp; Walk-Out Knee</h2>
                   <p className="panel-desc">
                     Detected walk-out saturation threshold:{" "}
-                    <span className="tag tag-amber mono">{diag.queueSaturation.thresholdBin}</span>. Opening
+                    <span className="tag tag-amber mono">{diag.queueSaturation?.thresholdBin ?? "N/A"}</span>. Opening
                     Lane 02 keeps load under 6 entries/lane.
                   </p>
                 </div>
@@ -770,28 +847,36 @@ export function ShiftDiagnosticsView({
                     </tr>
                   </thead>
                   <tbody>
-                    {queueBins.map((b) => (
-                      <tr key={b.loadBin}>
-                        <td>
-                          <strong>{b.loadBin}</strong>{" "}
-                          {b.loadBin === diag.queueSaturation.thresholdBin && (
-                            <span className="tag tag-red">Saturation Knee</span>
-                          )}
-                        </td>
-                        <td className="text-right mono">{b.buckets}</td>
-                        <td className="text-right mono">{b.avgEntries}</td>
-                        <td className="text-right mono">{b.avgDwellSec}s</td>
-                        <td className="text-right mono">
-                          <span
-                            className={`tag ${
-                              b.conversionPct < 62 ? "tag-red" : b.conversionPct < 70 ? "tag-amber" : "tag-green"
-                            }`}
-                          >
-                            {b.conversionPct}%
-                          </span>
+                    {queueBins.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
+                          No 15-minute queue saturation buckets available yet.
                         </td>
                       </tr>
-                    ))}
+                    ) : (
+                      queueBins.map((b) => (
+                        <tr key={b.loadBin}>
+                          <td>
+                            <strong>{b.loadBin}</strong>{" "}
+                            {b.loadBin === diag.queueSaturation?.thresholdBin && (
+                              <span className="tag tag-red">Saturation Knee</span>
+                            )}
+                          </td>
+                          <td className="text-right mono">{b.buckets}</td>
+                          <td className="text-right mono">{b.avgEntries}</td>
+                          <td className="text-right mono">{b.avgDwellSec}s</td>
+                          <td className="text-right mono">
+                            <span
+                              className={`tag ${
+                                b.conversionPct < 62 ? "tag-red" : b.conversionPct < 70 ? "tag-amber" : "tag-green"
+                              }`}
+                            >
+                              {b.conversionPct}%
+                            </span>
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -804,31 +889,35 @@ export function ShiftDiagnosticsView({
                 <div className="panel-header">
                   <div>
                     <h2 className="panel-title">
-                      K-Means Shopper Mission Clusters (Silhouette {diag.shopperMissions.silhouetteScore})
+                      K-Means Shopper Mission Clusters (Silhouette {diag.shopperMissions?.silhouetteScore ?? 0})
                     </h2>
                     <p className="panel-desc">
                       Receipts clustered on time-of-day, SKU depth, multipack share, ATV, and category mix.
                     </p>
                   </div>
                 </div>
-                <div className="mission-grid">
-                  {missions.map((m) => (
-                    <div key={m.clusterId} className="did-card">
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <strong style={{ fontSize: 14 }}>{m.name}</strong>
-                        <span className="tag tag-blue mono">{m.sharePct}% tx</span>
+                {missions.length === 0 ? (
+                  <div style={{ color: "var(--ink-muted)" }}>No shopper mission clusters available.</div>
+                ) : (
+                  <div className="mission-grid">
+                    {missions.map((m) => (
+                      <div key={m.clusterId} className="did-card">
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <strong style={{ fontSize: 14 }}>{m.name}</strong>
+                          <span className="tag tag-blue mono">{m.sharePct}% tx</span>
+                        </div>
+                        <div className="mono" style={{ fontSize: 12, color: "var(--ink-secondary)" }}>
+                          Avg Hour {m.avgHour}:00 · ATV ${(m.avgAtvUsd ?? 0).toFixed(2)} · {m.avgSkus} SKUs ·{" "}
+                          {m.multipackPct}% multipack
+                        </div>
+                        <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                          Morning {m.morningSharePct}% / Afternoon {m.afternoonSharePct}% / Evening{" "}
+                          {m.eveningSharePct}%
+                        </div>
                       </div>
-                      <div className="mono" style={{ fontSize: 12, color: "var(--ink-secondary)" }}>
-                        Avg Hour {m.avgHour}:00 · ATV ${m.avgAtvUsd.toFixed(2)} · {m.avgSkus} SKUs ·{" "}
-                        {m.multipackPct}% multipack
-                      </div>
-                      <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                        Morning {m.morningSharePct}% / Afternoon {m.afternoonSharePct}% / Evening{" "}
-                        {m.eveningSharePct}%
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                    ))}
+                  </div>
+                )}
               </section>
 
               <section className="panel">
@@ -852,20 +941,28 @@ export function ShiftDiagnosticsView({
                       </tr>
                     </thead>
                     <tbody>
-                      {(data?.morningBasketRules ?? []).slice(0, 10).map((r) => (
-                        <tr key={r.id}>
-                          <td>{r.antecedentName}</td>
-                          <td>
-                            <ShoppingBag size={12} style={{ marginRight: 5 }} />
-                            <strong>{r.consequentName}</strong>
-                          </td>
-                          <td className="text-right mono">{r.coOccurrences}</td>
-                          <td className="text-right mono">{(r.confidence * 100).toFixed(1)}%</td>
-                          <td className="text-right mono">
-                            <span className="tag tag-green">{r.lift}×</span>
+                      {(data?.morningBasketRules ?? []).length === 0 ? (
+                        <tr>
+                          <td colSpan={5} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
+                            No morning-only market basket pairs discovered yet.
                           </td>
                         </tr>
-                      ))}
+                      ) : (
+                        (data?.morningBasketRules ?? []).slice(0, 10).map((r) => (
+                          <tr key={r.id}>
+                            <td>{r.antecedentName}</td>
+                            <td>
+                              <ShoppingBag size={12} style={{ marginRight: 5 }} />
+                              <strong>{r.consequentName}</strong>
+                            </td>
+                            <td className="text-right mono">{r.coOccurrences}</td>
+                            <td className="text-right mono">{(r.confidence * 100).toFixed(1)}%</td>
+                            <td className="text-right mono">
+                              <span className="tag tag-green">{r.lift}×</span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -885,47 +982,51 @@ export function ShiftDiagnosticsView({
                   </div>
                 </div>
                 <div className="stack-md">
-                  {(data?.experiments ?? []).map((exp) => {
-                    const r = exp.resultsJson;
-                    return (
-                      <div key={exp.id} className="did-card">
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                          <strong>{exp.name}</strong>
-                          {r && (
-                            <span
-                              className={`tag ${
-                                r.verdict === "significant_positive"
-                                  ? "tag-green"
-                                  : r.verdict === "negative_or_cannibalized"
-                                    ? "tag-red"
-                                    : "tag-amber"
-                              }`}
-                            >
-                              {r.verdict.replace(/_/g, " ").toUpperCase()}
-                            </span>
-                          )}
-                        </div>
-                        <div style={{ fontSize: 12.5, color: "var(--ink-secondary)" }}>{exp.hypothesis}</div>
-                        <div className="mono" style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                          Pre {exp.preStartDate}..{exp.preEndDate} vs Post {exp.postStartDate}..{exp.postEndDate}
-                        </div>
-                        {r && (
-                          <div className="mono" style={{ fontSize: 12 }}>
-                            DiD Lift:{" "}
-                            <strong>
-                              {r.didLiftUsdPerDay >= 0 ? "+" : ""}${r.didLiftUsdPerDay}/day ({r.didLiftPct}%)
-                            </strong>{" "}
-                            · 95% CI [${r.ciLowUsd}, ${r.ciHighUsd}] · p={r.pValue} · Control{" "}
-                            {r.controlChangePct >= 0 ? "+" : ""}
-                            {r.controlChangePct}%{" "}
-                            {r.cannibalizationFlag && (
-                              <span className="tag tag-red">Cannibalization Risk</span>
+                  {(data?.experiments ?? []).length === 0 ? (
+                    <div style={{ color: "var(--ink-muted)" }}>No shift experiments logged yet.</div>
+                  ) : (
+                    (data?.experiments ?? []).map((exp) => {
+                      const r = exp.resultsJson;
+                      return (
+                        <div key={exp.id} className="did-card">
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                            <strong>{exp.name}</strong>
+                            {r && (
+                              <span
+                                className={`tag ${
+                                  r.verdict === "significant_positive"
+                                    ? "tag-green"
+                                    : r.verdict === "negative_or_cannibalized"
+                                      ? "tag-red"
+                                      : "tag-amber"
+                                }`}
+                              >
+                                {r.verdict.replace(/_/g, " ").toUpperCase()}
+                              </span>
                             )}
                           </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                          <div style={{ fontSize: 12.5, color: "var(--ink-secondary)" }}>{exp.hypothesis}</div>
+                          <div className="mono" style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                            Pre {exp.preStartDate}..{exp.preEndDate} vs Post {exp.postStartDate}..{exp.postEndDate}
+                          </div>
+                          {r && (
+                            <div className="mono" style={{ fontSize: 12 }}>
+                              DiD Lift:{" "}
+                              <strong>
+                                {r.didLiftUsdPerDay >= 0 ? "+" : ""}${r.didLiftUsdPerDay}/day ({r.didLiftPct}%)
+                              </strong>{" "}
+                              · 95% CI [${r.ciLowUsd}, ${r.ciHighUsd}] · p={r.pValue} · Control{" "}
+                              {r.controlChangePct >= 0 ? "+" : ""}
+                              {r.controlChangePct}%{" "}
+                              {r.cannibalizationFlag && (
+                                <span className="tag tag-red">Cannibalization Risk</span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
               </section>
 
@@ -972,7 +1073,7 @@ export function ShiftDiagnosticsView({
                       </div>
                       <div className="field">
                         <label>Pre Window</label>
-                        <div style={{ display: "flex", gap: 4 }}>
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                           <input
                             type="date"
                             className="input"
@@ -989,7 +1090,7 @@ export function ShiftDiagnosticsView({
                       </div>
                       <div className="field">
                         <label>Post Window</label>
-                        <div style={{ display: "flex", gap: 4 }}>
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                           <input
                             type="date"
                             className="input"
@@ -1011,7 +1112,8 @@ export function ShiftDiagnosticsView({
                       className="btn btn-primary"
                       disabled={busyAction !== null}
                     >
-                      <FlaskConical size={14} /> Run DiD Evaluation
+                      <FlaskConical size={14} />{" "}
+                      {busyAction === "experiment" ? "Evaluating..." : "Run DiD Evaluation"}
                     </button>
                   </form>
                 </section>
@@ -1049,7 +1151,7 @@ export function ShiftDiagnosticsView({
         </>
       )}
 
-      {showFootfallModal && (
+      {showFootfallModal && canOperate && (
         <div className="overlay centered" onClick={() => setShowFootfallModal(false)}>
           <div className="modal" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
             <h2 style={{ margin: 0, fontSize: 18 }}>Log 15-Minute Door Footfall Counter</h2>

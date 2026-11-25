@@ -227,7 +227,34 @@ export const COPILOT_TOOLS: CopilotToolDefinition[] = [
   },
 ];
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const VALID_URGENCIES = new Set(["critical", "reorder_now", "watch", "healthy"]);
+const VALID_PROMO_TYPES = new Set<PromotionRule["promoType"]>([
+  "clearance",
+  "tier_price",
+  "mix_and_match",
+  "bogo",
+  "basket_threshold",
+]);
+
+function finiteIntInRange(value: unknown, min: number, max: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
 export async function executeCopilotTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: CopilotToolContext
+): Promise<Record<string, unknown>> {
+  try {
+    return await executeCopilotToolInner(name, args ?? {}, ctx);
+  } catch {
+    return { error: `Tool "${name}" could not complete with the supplied parameters.` };
+  }
+}
+
+async function executeCopilotToolInner(
   name: string,
   args: Record<string, unknown>,
   ctx: CopilotToolContext
@@ -345,7 +372,10 @@ export async function executeCopilotTool(
     }
 
     case "search_catalog": {
-      const q = String(args.query ?? "").trim();
+      const q = String(args.query ?? "").trim().slice(0, 120);
+      if (!q) {
+        return { error: "Search query must be a non-empty string." };
+      }
       const limit = Math.min(25, Math.max(1, Number(args.limit ?? 10) || 10));
       const unfoldedSq = db
         .select({
@@ -428,7 +458,11 @@ export async function executeCopilotTool(
     }
 
     case "get_reorder_alerts": {
-      const urgency = typeof args.urgency === "string" && args.urgency ? args.urgency : null;
+      const rawUrgency = typeof args.urgency === "string" ? args.urgency.trim().toLowerCase() : "";
+      if (rawUrgency && !VALID_URGENCIES.has(rawUrgency)) {
+        return { error: `Invalid urgency filter "${rawUrgency}".` };
+      }
+      const urgency = rawUrgency || null;
       const limit = Math.min(30, Math.max(1, Number(args.limit ?? 15) || 15));
       const rows = await db
         .select({
@@ -686,8 +720,15 @@ export async function executeCopilotTool(
     }
 
     case "propose_purchase_order": {
-      const supQuery = String(args.supplierName ?? "").trim();
-      const urgencyFilter = typeof args.urgency === "string" && args.urgency ? args.urgency : null;
+      const supQuery = String(args.supplierName ?? "").trim().slice(0, 120);
+      if (!supQuery) {
+        return { error: "supplierName is required to propose a purchase order." };
+      }
+      const rawUrgency = typeof args.urgency === "string" ? args.urgency.trim().toLowerCase() : "";
+      if (rawUrgency && !VALID_URGENCIES.has(rawUrgency)) {
+        return { error: `Invalid urgency filter "${rawUrgency}".` };
+      }
+      const urgencyFilter = rawUrgency || null;
       const [sup] = await db
         .select()
         .from(suppliers)
@@ -737,8 +778,8 @@ export async function executeCopilotTool(
         supplierId: sup.id,
         supplierName: sup.name,
         notes:
-          typeof args.notes === "string" && args.notes
-            ? args.notes
+          typeof args.notes === "string" && args.notes.trim()
+            ? args.notes.trim().slice(0, 500)
             : `AI-drafted replenishment PO for ${sup.name}`,
         lines: forecastRows.map((r) => ({
           productId: r.productId,
@@ -780,8 +821,11 @@ export async function executeCopilotTool(
     }
 
     case "propose_price_update": {
-      const key = String(args.skuOrProductId ?? "").trim();
-      const isUuid = /^[0-9a-f-]{36}$/i.test(key);
+      const key = String(args.skuOrProductId ?? "").trim().slice(0, 80);
+      if (!key) {
+        return { error: "skuOrProductId is required." };
+      }
+      const isUuid = UUID_RE.test(key);
       const [prod] = await db
         .select({
           id: products.id,
@@ -825,10 +869,8 @@ export async function executeCopilotTool(
         prod.taxInclusive,
         5
       );
-      const targetPrice =
-        typeof args.newSellPriceCents === "number" && args.newSellPriceCents > 0
-          ? Math.round(args.newSellPriceCents)
-          : openAlert?.suggestedSellPriceCents ?? suggested;
+      const requestedPrice = finiteIntInRange(args.newSellPriceCents, 1, 10_000_000);
+      const targetPrice = requestedPrice ?? openAlert?.suggestedSellPriceCents ?? suggested;
 
       const currentMarginBp = computeNetMarginBp(
         primaryBc.sellPriceCents,
@@ -848,8 +890,8 @@ export async function executeCopilotTool(
         alertId: openAlert?.id ?? null,
         newSellPriceCents: targetPrice,
         reason:
-          typeof args.reason === "string" && args.reason
-            ? args.reason
+          typeof args.reason === "string" && args.reason.trim()
+            ? args.reason.trim().slice(0, 300)
             : "Restore net margin floor across primary & multi-pack tiers",
       };
 
@@ -884,26 +926,54 @@ export async function executeCopilotTool(
     }
 
     case "propose_promotion": {
-      const promoType = String(args.promoType ?? "clearance") as PromotionRule["promoType"];
-      const promoName = String(args.name ?? "AI Suggested Promotion");
-      const minMarginGuardBp =
-        typeof args.minMarginGuardBp === "number" ? Math.round(args.minMarginGuardBp) : 1000;
-      const daypartStartHour =
-        typeof args.daypartStartHour === "number" ? Math.round(args.daypartStartHour) : null;
-      const daypartEndHour =
-        typeof args.daypartEndHour === "number" ? Math.round(args.daypartEndHour) : null;
-      const productIds = Array.isArray(args.productIds)
-        ? args.productIds.map(String)
-        : undefined;
+      const rawPromoType = String(args.promoType ?? "clearance").trim() as PromotionRule["promoType"];
+      if (!VALID_PROMO_TYPES.has(rawPromoType)) {
+        return { error: `Unsupported promoType "${rawPromoType}".` };
+      }
+      const promoType = rawPromoType;
+      const promoName = String(args.name ?? "AI Suggested Promotion").trim().slice(0, 160);
+      if (promoName.length < 2) {
+        return { error: "Promotion name must be at least 2 characters." };
+      }
+      const minMarginGuardBp = finiteIntInRange(args.minMarginGuardBp, 0, 9500) ?? 1000;
+      const rawDaypartStart = finiteIntInRange(args.daypartStartHour, 0, 23);
+      const rawDaypartEnd = finiteIntInRange(args.daypartEndHour, 1, 24);
+      const hasCompleteDaypart = rawDaypartStart !== null && rawDaypartEnd !== null;
+      const daypartStartHour = hasCompleteDaypart ? rawDaypartStart : null;
+      const daypartEndHour = hasCompleteDaypart ? rawDaypartEnd : null;
+
+      // Filter productIds safely to valid UUIDs (prevent Postgres 22P02 if LLM passes SKUs or garbage)
+      let productIds: string[] | undefined;
+      if (Array.isArray(args.productIds) && args.productIds.length > 0) {
+        const rawIds = args.productIds.map((x) => String(x).trim()).filter(Boolean).slice(0, 50);
+        const uuids = rawIds.filter((x) => UUID_RE.test(x));
+        const nonUuids = rawIds.filter((x) => !UUID_RE.test(x));
+        if (nonUuids.length > 0) {
+          const resolvedBySku = await db
+            .select({ id: products.id })
+            .from(products)
+            .where(inArray(products.sku, nonUuids));
+          uuids.push(...resolvedBySku.map((r) => r.id));
+        }
+        const deduped = Array.from(new Set(uuids));
+        if (deduped.length === 0) {
+          return { error: "No valid product UUIDs or SKUs found in productIds." };
+        }
+        productIds = deduped;
+      }
 
       const rulesJson: Record<string, unknown> = {};
       if (productIds && productIds.length > 0) rulesJson.productIds = productIds;
-      if (typeof args.discountBp === "number") rulesJson.discountBp = Math.round(args.discountBp);
-      if (typeof args.requiredQty === "number") rulesJson.requiredQty = Math.round(args.requiredQty);
-      if (typeof args.bundlePriceCents === "number")
-        rulesJson.bundlePriceCents = Math.round(args.bundlePriceCents);
-      if (typeof args.buyQty === "number") rulesJson.buyQty = Math.round(args.buyQty);
-      if (typeof args.getQty === "number") rulesJson.getQty = Math.round(args.getQty);
+      const discountBp = finiteIntInRange(args.discountBp, 1, 9500);
+      if (discountBp !== null) rulesJson.discountBp = discountBp;
+      const requiredQty = finiteIntInRange(args.requiredQty, 1, 100);
+      if (requiredQty !== null) rulesJson.requiredQty = requiredQty;
+      const bundlePriceCents = finiteIntInRange(args.bundlePriceCents, 1, 10_000_000);
+      if (bundlePriceCents !== null) rulesJson.bundlePriceCents = bundlePriceCents;
+      const buyQty = finiteIntInRange(args.buyQty, 1, 50);
+      if (buyQty !== null) rulesJson.buyQty = buyQty;
+      const getQty = finiteIntInRange(args.getQty, 1, 50);
+      if (getQty !== null) rulesJson.getQty = getQty;
 
       // Dry-run simulate through @supermarket/shared evaluateCart()
       const sampleProds = await db
@@ -932,9 +1002,9 @@ export async function executeCopilotTool(
 
       const qtyPerLine =
         promoType === "bogo"
-          ? (Number(args.buyQty ?? 2) + Number(args.getQty ?? 1))
+          ? (buyQty ?? 2) + (getQty ?? 1)
           : promoType === "tier_price" || promoType === "mix_and_match"
-            ? Math.max(1, Number(args.requiredQty ?? 2))
+            ? Math.max(1, requiredQty ?? 2)
             : 1;
 
       const sampleCart: CartInputLine[] = sampleProds.map((p, idx) => ({

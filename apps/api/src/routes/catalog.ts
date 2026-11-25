@@ -29,9 +29,11 @@ import {
 import { buildZplBarcodeCommand, parseCsvRows, sanitizeZpl } from "../lib/helpers.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
 
+const UuidSchema = z.string().uuid();
+
 export async function catalogRoutes(app: FastifyInstance) {
   // Metadata bootstrap for dropdowns, promos, and filters
-  app.get("/api/meta", { preHandler: [requireAuth] }, async () => {
+  app.get("/api/meta", { preHandler: [requireAuth] }, async (req) => {
     const [depts, cats, taxes, sups, promos, staff] = await Promise.all([
       db.select().from(departments).orderBy(asc(departments.name)),
       db.select().from(categories).orderBy(asc(categories.name)),
@@ -113,12 +115,18 @@ export async function catalogRoutes(app: FastifyInstance) {
   );
 
   // High-speed paginated & searchable 3,000+ SKU catalog query (consistent live stock + net margin)
-  app.get("/api/products", { preHandler: [requireAuth] }, async (req) => {
+  app.get("/api/products", { preHandler: [requireAuth] }, async (req, reply) => {
     const q = req.query as Record<string, string | undefined>;
     const search = (q.search ?? "").trim();
-    const departmentId = q.departmentId;
-    const categoryId = q.categoryId;
-    const segment = q.segment;
+    const departmentId = q.departmentId?.trim() || undefined;
+    const categoryId = q.categoryId?.trim() || undefined;
+    const segment = q.segment?.trim() || undefined;
+    if (departmentId && !UuidSchema.safeParse(departmentId).success) {
+      return reply.status(400).send({ error: "Invalid departmentId UUID format." });
+    }
+    if (categoryId && !UuidSchema.safeParse(categoryId).success) {
+      return reply.status(400).send({ error: "Invalid categoryId UUID format." });
+    }
     const rawPage = Number(q.page);
     const rawPageSize = Number(q.pageSize);
     const page = Number.isFinite(rawPage) ? Math.max(1, Math.trunc(rawPage)) : 1;
@@ -349,14 +357,28 @@ export async function catalogRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: parsed.error.flatten() });
       }
       const data = parsed.data;
+      const seenBarcodes = new Set<string>();
+      const normalizedBarcodes: typeof data.barcodes = [];
+      for (const b of data.barcodes) {
+        const validation = validateBarcode(b.barcode);
+        if (!validation.valid) {
+          return reply.status(400).send({ error: validation.error ?? `Invalid barcode: ${b.barcode}` });
+        }
+        if (seenBarcodes.has(validation.normalized)) {
+          return reply.status(400).send({ error: `Duplicate barcode in request: ${validation.normalized}` });
+        }
+        seenBarcodes.add(validation.normalized);
+        normalizedBarcodes.push({ ...b, barcode: validation.normalized });
+      }
+      const primaryIdx = Math.max(0, normalizedBarcodes.findIndex((b) => b.isPrimary));
       const productId = generateUuidV7();
 
       await db.transaction(async (tx) => {
         await tx.insert(products).values({
           id: productId,
-          sku: data.sku,
-          name: data.name,
-          brand: data.brand,
+          sku: data.sku.trim(),
+          name: data.name.trim(),
+          brand: data.brand.trim(),
           categoryId: data.categoryId,
           taxRateId: data.taxRateId,
           baseUnitLabel: data.baseUnitLabel,
@@ -368,13 +390,13 @@ export async function catalogRoutes(app: FastifyInstance) {
         });
 
         await tx.insert(productBarcodes).values(
-          data.barcodes.map((b, idx) => ({
+          normalizedBarcodes.map((b, idx) => ({
             productId,
-            barcode: b.barcode.trim(),
+            barcode: b.barcode,
             packQty: b.packQty,
             packLabel: b.packLabel,
             sellPriceCents: b.sellPriceCents,
-            isPrimary: idx === 0 ? true : b.isPrimary,
+            isPrimary: idx === primaryIdx,
             isOrderableCase: b.isOrderableCase,
           }))
         );
@@ -392,6 +414,9 @@ export async function catalogRoutes(app: FastifyInstance) {
     { preHandler: [requireRole(["owner", "manager"])] },
     async (req, reply) => {
       const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid product ID format." });
+      }
       const schema = z.object({
         barcode: z.string().min(4).max(32),
         packQty: z.number().int().min(1),
@@ -408,18 +433,36 @@ export async function catalogRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: validation.error });
       }
 
-      const [created] = await db
-        .insert(productBarcodes)
-        .values({
-          productId: id,
-          barcode: validation.normalized,
-          packQty: parsed.data.packQty,
-          packLabel: parsed.data.packLabel,
-          sellPriceCents: parsed.data.sellPriceCents,
-          isPrimary: parsed.data.isPrimary,
-          isOrderableCase: parsed.data.isOrderableCase,
-        })
-        .returning();
+      const [existingProd] = await db
+        .select({ id: products.id })
+        .from(products)
+        .where(eq(products.id, id))
+        .limit(1);
+      if (!existingProd) {
+        return reply.status(404).send({ error: "Product not found" });
+      }
+
+      const created = await db.transaction(async (tx) => {
+        if (parsed.data.isPrimary) {
+          await tx
+            .update(productBarcodes)
+            .set({ isPrimary: false })
+            .where(and(eq(productBarcodes.productId, id), eq(productBarcodes.isPrimary, true)));
+        }
+        const [inserted] = await tx
+          .insert(productBarcodes)
+          .values({
+            productId: id,
+            barcode: validation.normalized,
+            packQty: parsed.data.packQty,
+            packLabel: parsed.data.packLabel,
+            sellPriceCents: parsed.data.sellPriceCents,
+            isPrimary: parsed.data.isPrimary,
+            isOrderableCase: parsed.data.isOrderableCase,
+          })
+          .returning();
+        return inserted;
+      });
 
       return reply.status(201).send(created);
     }
@@ -430,41 +473,54 @@ export async function catalogRoutes(app: FastifyInstance) {
     { preHandler: [requireRole(["owner", "manager"])] },
     async (req, reply) => {
       const { id, barcodeId } = req.params as { id: string; barcodeId: string };
-      const schema = z.object({
-        packLabel: z.string().min(1).max(64).optional(),
-        packQty: z.number().int().min(1).optional(),
-        sellPriceCents: z.number().int().min(1).optional(),
-      });
+      if (!UuidSchema.safeParse(id).success || !UuidSchema.safeParse(barcodeId).success) {
+        return reply.status(400).send({ error: "Invalid product or barcode ID format." });
+      }
+      const schema = z
+        .object({
+          packLabel: z.string().min(1).max(64).optional(),
+          packQty: z.number().int().min(1).optional(),
+          sellPriceCents: z.number().int().min(1).optional(),
+        })
+        .refine(
+          (d) =>
+            d.packLabel !== undefined || d.packQty !== undefined || d.sellPriceCents !== undefined,
+          { message: "At least one updatable field is required." }
+        );
       const parsed = schema.safeParse(req.body);
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
 
-      const [existing] = await db
-        .select()
-        .from(productBarcodes)
-        .where(and(eq(productBarcodes.id, barcodeId), eq(productBarcodes.productId, id)))
-        .limit(1);
-      if (!existing) return reply.status(404).send({ error: "Barcode not found" });
+      const updated = await db.transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(productBarcodes)
+          .where(and(eq(productBarcodes.id, barcodeId), eq(productBarcodes.productId, id)))
+          .for("update");
+        if (!existing) return null;
 
-      const [updated] = await db
-        .update(productBarcodes)
-        .set(parsed.data)
-        .where(and(eq(productBarcodes.id, barcodeId), eq(productBarcodes.productId, id)))
-        .returning();
+        const [row] = await tx
+          .update(productBarcodes)
+          .set(parsed.data)
+          .where(and(eq(productBarcodes.id, barcodeId), eq(productBarcodes.productId, id)))
+          .returning();
 
-      if (
-        parsed.data.sellPriceCents !== undefined &&
-        parsed.data.sellPriceCents !== existing.sellPriceCents
-      ) {
-        await db.insert(shelfTagQueue).values({
-          productId: id,
-          barcode: updated.barcode,
-          oldPriceCents: existing.sellPriceCents,
-          newPriceCents: updated.sellPriceCents,
-          reason: "manual",
-          status: "pending",
-        });
-      }
+        if (
+          parsed.data.sellPriceCents !== undefined &&
+          parsed.data.sellPriceCents !== existing.sellPriceCents
+        ) {
+          await tx.insert(shelfTagQueue).values({
+            productId: id,
+            barcode: row.barcode,
+            oldPriceCents: existing.sellPriceCents,
+            newPriceCents: row.sellPriceCents,
+            reason: "manual",
+            status: "pending",
+          });
+        }
+        return row;
+      });
 
+      if (!updated) return reply.status(404).send({ error: "Barcode not found" });
       return updated;
     }
   );
@@ -474,6 +530,9 @@ export async function catalogRoutes(app: FastifyInstance) {
     { preHandler: [requireRole(["owner", "manager"])] },
     async (req, reply) => {
       const { id, barcodeId } = req.params as { id: string; barcodeId: string };
+      if (!UuidSchema.safeParse(id).success || !UuidSchema.safeParse(barcodeId).success) {
+        return reply.status(400).send({ error: "Invalid product or barcode ID format." });
+      }
       const allForProduct = await db
         .select()
         .from(productBarcodes)
@@ -506,10 +565,13 @@ export async function catalogRoutes(app: FastifyInstance) {
     "/api/import/preview",
     { preHandler: [requireRole(["owner", "manager"])] },
     async (req, reply) => {
-      const body = req.body as { csvText?: string };
-      if (!body?.csvText) return reply.status(400).send({ error: "csvText required" });
+      const schema = z.object({
+        csvText: z.string().min(1).max(5_000_000),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) return reply.status(400).send({ error: "csvText required" });
 
-      const parsedRows = parseCsvRows(body.csvText);
+      const parsedRows = parseCsvRows(parsed.data.csvText);
       if (parsedRows.length < 2) {
         return reply
           .status(400)

@@ -11,7 +11,7 @@ import {
   Sun,
   TrendingUp,
 } from "lucide-react";
-import { apiGet, apiPost } from "./api";
+import { apiGet, apiPost, setUnauthorizedHandler } from "./api";
 import { AiCopilotDrawer } from "./components/AiCopilotDrawer";
 import { LoginScreen, type SessionUser } from "./components/LoginScreen";
 import { AbcLossView } from "./views/AbcLossView";
@@ -47,6 +47,7 @@ const ROLE_TABS: Record<UserRole, TabId[]> = {
 export function App() {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [meta, setMeta] = useState<MetaPayload>({ departments: [], suppliers: [] });
   const [alertCounts, setAlertCounts] = useState({ margin: 0, expiry: 0 });
@@ -77,12 +78,23 @@ export function App() {
   };
 
   useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setUser(null);
+      setCopilotOpen(false);
+      setSessionNotice(
+        "Your session expired or was revoked. Please sign in again (any queued offline POS receipts remain saved locally)."
+      );
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
+
+  useEffect(() => {
     void (async () => {
       try {
         const res = await apiGet<{ user: SessionUser | null }>("/api/auth/me");
         setUser(res.user);
         if (res.user) {
-          const allowed = ROLE_TABS[res.user.role];
+          const allowed = ROLE_TABS[res.user.role] ?? ["catalog"];
           setActiveTab(allowed[0]);
           void loadMetaAndAlerts(res.user);
         }
@@ -95,8 +107,9 @@ export function App() {
   }, []);
 
   const handleLoggedIn = (loggedUser: SessionUser) => {
+    setSessionNotice(null);
     setUser(loggedUser);
-    const allowed = ROLE_TABS[loggedUser.role];
+    const allowed = ROLE_TABS[loggedUser.role] ?? ["catalog"];
     setActiveTab(allowed[0]);
     void loadMetaAndAlerts(loggedUser);
   };
@@ -107,6 +120,7 @@ export function App() {
     } catch {
       // ignore logout error
     }
+    setSessionNotice(null);
     setUser(null);
     setCopilotOpen(false);
   };
@@ -120,10 +134,10 @@ export function App() {
   }
 
   if (!user) {
-    return <LoginScreen onLoggedIn={handleLoggedIn} />;
+    return <LoginScreen onLoggedIn={handleLoggedIn} sessionNotice={sessionNotice} />;
   }
 
-  const allowedTabs = ROLE_TABS[user.role];
+  const allowedTabs = ROLE_TABS[user.role] ?? ["catalog"];
   const canUseAi = user.role === "owner" || user.role === "manager";
   const totalOpsAlerts = alertCounts.margin + alertCounts.expiry;
 
@@ -252,6 +266,7 @@ export function App() {
               className="btn btn-sm"
               style={{ padding: "4px 8px" }}
               title="Sign Out"
+              aria-label="Sign Out"
               onClick={() => void handleLogout()}
             >
               <LogOut size={13} />
@@ -270,27 +285,39 @@ export function App() {
           <OverviewView
             key={`ov-${refreshTick}`}
             userRole={user.role}
-            onNavigate={(tab) => setActiveTab(tab)}
+            allowedTabs={allowedTabs}
+            onNavigate={(tab) => {
+              if (allowedTabs.includes(tab)) setActiveTab(tab);
+            }}
           />
         )}
         {activeTab === "catalog" && (
-          <CatalogView key={`cat-${refreshTick}`} departments={meta.departments} />
+          <CatalogView
+            key={`cat-${refreshTick}`}
+            departments={meta.departments}
+            userRole={user.role}
+          />
         )}
         {/* Keep PosTerminalView mounted across tab switches so active basket & offline state persist */}
         {allowedTabs.includes("pos") && (
           <div style={{ display: activeTab === "pos" ? "block" : "none" }}>
-            <PosTerminalView cashierName={user.fullName} />
+            <PosTerminalView cashierName={user.fullName} isActive={activeTab === "pos"} />
           </div>
         )}
         {activeTab === "operations" && (
           <OperationsView
             key={`ops-${refreshTick}`}
             suppliers={meta.suppliers}
+            userRole={user.role}
             onCountsChanged={() => void loadMetaAndAlerts(user)}
           />
         )}
-        {activeTab === "abc-lp" && <AbcLossView key={`abc-${refreshTick}`} />}
-        {activeTab === "forecasting" && <ForecastingBasketView key={`fc-${refreshTick}`} />}
+        {activeTab === "abc-lp" && (
+          <AbcLossView key={`abc-${refreshTick}`} userRole={user.role} />
+        )}
+        {activeTab === "forecasting" && (
+          <ForecastingBasketView key={`fc-${refreshTick}`} userRole={user.role} />
+        )}
         {activeTab === "shift-diagnostics" && (
           <ShiftDiagnosticsView
             key={`sd-${refreshTick}`}

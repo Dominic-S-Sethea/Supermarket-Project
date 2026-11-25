@@ -4,9 +4,12 @@ import type { UserRole } from "@supermarket/shared";
 import { and, eq, gt, isNull } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { env } from "../config/env.js";
-import { db, userSessions } from "../db/index.js";
+import { db, userSessions, users } from "../db/index.js";
+import { parseCookies } from "./security.js";
 
 const scryptAsync = promisify(crypto.scrypt);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DUMMY_SALT = "00000000000000000000000000000000";
 
 export interface AuthUser {
   id: string;
@@ -34,11 +37,18 @@ export async function verifyPin(pin: string, stored: string): Promise<boolean> {
   const parts = stored.split(":");
   if (parts.length !== 2) return false;
   const [salt, hashHex] = parts;
-  if (!salt || !hashHex) return false;
+  if (!salt || !hashHex || !/^[0-9a-f]+$/i.test(hashHex)) return false;
   const expected = Buffer.from(hashHex, "hex");
   const actual = (await scryptAsync(pin, salt, 64)) as Buffer;
   if (expected.length !== actual.length) return false;
   return crypto.timingSafeEqual(expected, actual);
+}
+
+/**
+ * Perform dummy scrypt work when a login username is unknown to reduce timing-based user enumeration.
+ */
+export async function runDummyPinWork(pin: string): Promise<void> {
+  await scryptAsync(pin, DUMMY_SALT, 64);
 }
 
 interface SessionPayload {
@@ -95,6 +105,7 @@ export function verifySessionToken(
   try {
     const parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as SessionPayload;
     if (!parsed.jti || !parsed.sub || !parsed.username || !parsed.role) return null;
+    if (!UUID_RE.test(parsed.jti) || !UUID_RE.test(parsed.sub)) return null;
     if (typeof parsed.exp !== "number" || parsed.exp < Math.floor(Date.now() / 1000)) return null;
     return {
       jti: parsed.jti,
@@ -108,19 +119,6 @@ export function verifySessionToken(
   } catch {
     return null;
   }
-}
-
-function parseCookies(header: string | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!header) return out;
-  for (const part of header.split(";")) {
-    const idx = part.indexOf("=");
-    if (idx <= 0) continue;
-    const key = part.slice(0, idx).trim();
-    const val = part.slice(idx + 1).trim();
-    if (key) out[key] = decodeURIComponent(val);
-  }
-  return out;
 }
 
 export async function extractSession(
@@ -140,11 +138,20 @@ export async function extractSession(
   if (!verified) return null;
 
   const [session] = await db
-    .select({ jti: userSessions.jti })
+    .select({
+      jti: userSessions.jti,
+      userId: users.id,
+      username: users.username,
+      fullName: users.fullName,
+      role: users.role,
+    })
     .from(userSessions)
+    .innerJoin(users, eq(userSessions.userId, users.id))
     .where(
       and(
         eq(userSessions.jti, verified.jti),
+        eq(userSessions.userId, verified.user.id),
+        eq(users.active, true),
         isNull(userSessions.revokedAt),
         gt(userSessions.expiresAt, new Date())
       )
@@ -152,7 +159,15 @@ export async function extractSession(
     .limit(1);
 
   if (!session) return null;
-  return verified;
+  return {
+    jti: session.jti,
+    user: {
+      id: session.userId,
+      username: session.username,
+      fullName: session.fullName,
+      role: session.role as UserRole,
+    },
+  };
 }
 
 export function registerAuthHook(app: FastifyInstance) {

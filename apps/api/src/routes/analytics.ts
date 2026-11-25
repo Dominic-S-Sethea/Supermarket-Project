@@ -31,10 +31,15 @@ import { requireAuth, requireRole } from "../plugins/auth.js";
 const execFileAsync = promisify(execFile);
 
 export async function analyticsRoutes(app: FastifyInstance) {
+  const analyticsReadOnly = [requireRole(["owner", "manager", "accountant"])];
+
   // Executive Overview KPIs, Daily Trend & Hourly Traffic Heatmap
-  app.get("/api/analytics/overview", { preHandler: [requireAuth] }, async (req) => {
+  app.get("/api/analytics/overview", { preHandler: analyticsReadOnly }, async (req) => {
     const q = req.query as { days?: string };
-    const days = Math.min(90, Math.max(7, Number(q.days ?? 30)));
+    const rawDays = Number(q.days);
+    const days = Number.isFinite(rawDays)
+      ? Math.min(90, Math.max(7, Math.trunc(rawDays)))
+      : 30;
 
     const [kpiRes, dailyRes, hourlyRes, payRes, shrinkRes, skuCountRes] =
       await Promise.all([
@@ -156,7 +161,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // Department Profitability, GMROII & Stock Value (uses live unfolded stock)
-  app.get("/api/analytics/departments", { preHandler: [requireAuth] }, async () => {
+  app.get("/api/analytics/departments", { preHandler: analyticsReadOnly }, async () => {
     const res = await db.execute(sql`
       WITH unfolded AS (
         SELECT product_id, COALESCE(SUM(qty_delta), 0)::int AS delta
@@ -232,7 +237,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // ABC-XYZ 3x3 Matrix + SKU Detail
-  app.get("/api/analytics/abc-xyz", { preHandler: [requireAuth] }, async (req) => {
+  app.get("/api/analytics/abc-xyz", { preHandler: analyticsReadOnly }, async (req) => {
     const q = req.query as { segment?: string };
     const matrixRes = await db.execute(sql`
       SELECT
@@ -287,7 +292,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // Demand Forecasting & Auto-Replenishment Draft PO Suggestions
-  app.get("/api/analytics/forecasts", { preHandler: [requireAuth] }, async (req) => {
+  app.get("/api/analytics/forecasts", { preHandler: analyticsReadOnly }, async (req) => {
     const q = req.query as { urgency?: string };
     const rows = await db
       .select({
@@ -365,7 +370,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // Shift Diagnostics, Footfall Funnel, Morning OOS, Shopper Missions & DiD Experiments
-  app.get("/api/analytics/shift-diagnostics", { preHandler: [requireAuth] }, async () => {
+  app.get("/api/analytics/shift-diagnostics", { preHandler: analyticsReadOnly }, async () => {
     const [diagRows, morningRules, daypartPromos, experiments] = await Promise.all([
       db
         .select()
@@ -543,7 +548,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   );
 
   // Difference-in-Differences Shift Intervention Experiments
-  app.get("/api/analytics/shift-experiments", { preHandler: [requireAuth] }, async () => {
+  app.get("/api/analytics/shift-experiments", { preHandler: analyticsReadOnly }, async () => {
     const experiments = await db
       .select()
       .from(shiftExperiments)
@@ -590,7 +595,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   app.post(
     "/api/analytics/shift-diagnostics/recompute",
     { preHandler: [requireRole(["owner", "manager"])] },
-    async (_req, reply) => {
+    async (req, reply) => {
       const repoRoot = path.resolve(process.cwd(), "../..");
       const scriptPath = path.join(repoRoot, "services", "analytics", "run_all.py");
       const winPy = path.join(repoRoot, "services", "analytics", ".venv", "Scripts", "python.exe");
@@ -599,7 +604,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
         ? winPy
         : fs.existsSync(posixPy)
           ? posixPy
-          : "python";
+          : "python3";
 
       try {
         const { stdout } = await execFileAsync(pyBin, [scriptPath], {
@@ -613,8 +618,9 @@ export async function analyticsRoutes(app: FastifyInstance) {
           .limit(1);
         return { ok: true, log: stdout.trim(), computedAt: diag?.computedAt ?? null };
       } catch (err) {
+        req.log.error({ err }, "Python analytics recompute failed");
         return reply.status(500).send({
-          error: `Python worker failed: ${err instanceof Error ? err.message : String(err)}`,
+          error: "Analytics worker recompute failed. Check server logs for details.",
         });
       }
     }
@@ -623,7 +629,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   // Loss Prevention (Cashier Anomalies + Live-Stock Dead-Stock Cash Traps + Negative Stock)
   app.get(
     "/api/analytics/loss-prevention",
-    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    { preHandler: analyticsReadOnly },
     async () => {
       const [cashiers, deadStock, negativeStock] = await Promise.all([
         db.select().from(analyticsLpAnomalies).orderBy(desc(analyticsLpAnomalies.zScore)),
@@ -705,10 +711,14 @@ export async function analyticsRoutes(app: FastifyInstance) {
   // Accounting Journal Export (supports ?days=7|30|60|all)
   app.get(
     "/api/exports/accounting.csv",
-    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    { preHandler: analyticsReadOnly },
     async (req, reply) => {
       const q = req.query as { days?: string };
-      const parsedDays = q.days && q.days !== "all" ? Math.min(365, Math.max(1, Number(q.days))) : null;
+      let parsedDays: number | null = null;
+      if (q.days && q.days !== "all") {
+        const raw = Number(q.days);
+        parsedDays = Number.isFinite(raw) ? Math.min(365, Math.max(1, Math.trunc(raw))) : 30;
+      }
 
       const res = parsedDays
         ? await db.execute(sql`

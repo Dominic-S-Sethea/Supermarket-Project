@@ -4,7 +4,7 @@ import {
   computeSuggestedSellPriceCents,
   generateUuidV7,
 } from "@supermarket/shared";
-import { isNotNull, sql } from "drizzle-orm";
+import { eq, isNotNull, sql } from "drizzle-orm";
 import { hashPin } from "../plugins/auth.js";
 import { applyDatabaseConstraintsAndViews } from "./applyConstraints.js";
 import {
@@ -382,6 +382,20 @@ async function seed() {
 
   if (count >= 3000) {
     console.log(`Database already seeded with ${count} products. Ensuring shift telemetry, constraints & M1-M3 data...`);
+    // Self-heal any users seeded before await hashPin() fix (corrupted "{}" pin_hash)
+    const repairPins: Record<string, string> = {
+      cashier4: "4567",
+      cashier5: "5678",
+    };
+    const existingUsers = await db.select().from(users);
+    for (const u of existingUsers) {
+      if (repairPins[u.username] && !u.pinHash.includes(":")) {
+        await db
+          .update(users)
+          .set({ pinHash: await hashPin(repairPins[u.username]) })
+          .where(eq(users.id, u.id));
+      }
+    }
     const rng = createRng(20261126);
     await seedShiftTelemetryAndDaypart(rng);
     await seedRetailExpansionData(rng);
@@ -464,8 +478,8 @@ async function seed() {
     { username: "cashier1", fullName: "Elena Morales", role: "cashier", pinHash: await hashPin("1234") },
     { username: "cashier2", fullName: "Liam O'Connor", role: "cashier", pinHash: await hashPin("2345") },
     { username: "cashier3", fullName: "Mei Lin", role: "cashier", pinHash: await hashPin("3456") },
-    { username: "cashier4", fullName: "Jordan Brooks", role: "cashier", pinHash: hashPin("4567") },
-    { username: "cashier5", fullName: "Samira Haddad", role: "cashier", pinHash: hashPin("5678") },
+    { username: "cashier4", fullName: "Jordan Brooks", role: "cashier", pinHash: await hashPin("4567") },
+    { username: "cashier5", fullName: "Samira Haddad", role: "cashier", pinHash: await hashPin("5678") },
   ]);
 
   // 3. Suppliers
@@ -1392,7 +1406,7 @@ async function seedRetailExpansionData(rng: () => number) {
       "Garcia", "Cho", "Turner", "Bennett", "Hayes", "Singh", "Reed", "Foster",
     ];
 
-    const customerRows: (typeof customers.$inferInsert)[] = [];
+    const customerRows: (typeof customers.$inferInsert & { id: string })[] = [];
     for (let i = 0; i < 24; i++) {
       const id = generateUuidV7();
       customerRows.push({

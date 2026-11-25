@@ -1,6 +1,9 @@
+import json
+import math
 import numpy as np
 
 from run_all import (
+    _mine_basket_subset,
     bootstrap_ci,
     chronological_ridge_attribution,
     compute_did_evaluation,
@@ -11,6 +14,8 @@ from run_all import (
     kmeans_missions,
     recommend_abc_xyz_action,
     recommend_hourly_lanes,
+    safe_float,
+    safe_json_dumps,
     score_cashiers_robust,
     score_rfm_segment,
     solve_optimal_markdown,
@@ -180,3 +185,128 @@ def test_score_rfm_segment_and_recommend_hourly_lanes():
     assert recommend_hourly_lanes(12.0) == 1
     assert recommend_hourly_lanes(90.0) >= 3
     assert recommend_hourly_lanes(999.0, max_lanes=8) == 8
+
+
+# ============================================================================
+# PHASE 3 HARDENING REGRESSION TESTS: SPARSE DATA, NaN/Inf & DEGENERATE INPUTS
+# ============================================================================
+
+
+def test_forecasting_handles_empty_sparse_negative_and_non_finite_series():
+    for bad in [
+        np.array([], dtype=float),
+        np.zeros(60, dtype=float),
+        np.array([5.0], dtype=float),
+        np.array([np.nan, np.inf, -np.inf, -3.0, 2.0] * 12, dtype=float),
+    ]:
+        c_fc = croston_sba_forecast(bad, alpha=np.nan)
+        c_wmape = croston_holdout_wmape(bad)
+        ets_fc, ets_wmape = weekend_ets_forecast(bad, alpha=0.0)
+        for v in (c_fc, c_wmape, ets_fc, ets_wmape):
+            assert math.isfinite(v)
+            assert v >= 0.0
+        assert c_wmape <= 200.0
+        assert ets_wmape <= 200.0
+
+    # Zero-holdout after positive training must stay finite and bounded
+    tail_zero = np.array([4.0] * 46 + [0.0] * 14, dtype=float)
+    ets_fc, ets_wmape = weekend_ets_forecast(tail_zero)
+    assert math.isfinite(ets_fc) and ets_fc >= 0.0
+    assert math.isfinite(ets_wmape) and 0.0 <= ets_wmape <= 200.0
+
+
+def test_kmeans_missions_handles_identical_points_empty_and_nan_without_crashing():
+    # Previously raised ValueError: probabilities do not sum to 1 when all rows were identical
+    identical = np.ones((40, 6), dtype=float) * 7.5
+    labels, centroids, sil, best_k = kmeans_missions(identical, k_candidates=(3, 4))
+    assert len(labels) == 40
+    assert best_k == 1
+    assert sil == 0.0
+    assert np.all(np.isfinite(centroids))
+
+    # Empty & NaN/Inf inputs
+    empty_l, empty_c, empty_s, empty_k = kmeans_missions(np.zeros((0, 6), dtype=float))
+    assert len(empty_l) == 0 and empty_k == 1 and empty_s == 0.0 and empty_c.shape == (1, 6)
+
+    noisy = np.array([[np.nan, np.inf, -np.inf, 1.0, 2.0, 3.0]] * 15 + [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]] * 15)
+    l2, c2, s2, _ = kmeans_missions(noisy, k_candidates=(2, 3))
+    assert len(l2) == 30
+    assert math.isfinite(s2)
+    assert np.all(np.isfinite(c2))
+
+
+def test_chronological_ridge_handles_empty_constant_zero_holdout_and_nan():
+    res_empty = chronological_ridge_attribution(np.zeros((0, 3)), np.zeros(0), ["a", "b", "c"])
+    assert res_empty["drivers"] == []
+
+    # Constant target + NaN/Inf features + zero lam + zero holdout
+    X_bad = np.ones((50, 3), dtype=float)
+    X_bad[0, 0] = np.nan
+    X_bad[1, 1] = np.inf
+    y_zero_holdout = np.array([100.0] * 36 + [0.0] * 14, dtype=float)
+    res = chronological_ridge_attribution(X_bad, y_zero_holdout, ["f1", "f2", "f3"], holdout_days=14, lam=0.0)
+    assert math.isfinite(res["holdoutWmapePct"])
+    assert math.isfinite(res["baselineWmapePct"])
+    assert math.isfinite(res["r2Train"])
+    for drv in res["drivers"]:
+        assert math.isfinite(drv["coefUsdPerSd"])
+        assert math.isfinite(drv["importancePct"])
+    # Ensure strict JSONB compatibility (allow_nan=False)
+    assert json.loads(safe_json_dumps(res))["holdoutWmapePct"] == res["holdoutWmapePct"]
+
+
+def test_did_bootstrap_welch_and_cashier_edge_cases():
+    # Non-finite values in DiD arrays must be filtered cleanly
+    did_nan = compute_did_evaluation(
+        np.array([np.nan, 500.0, 510.0, np.inf]),
+        np.array([620.0, 630.0, -np.inf]),
+        np.array([1000.0, np.nan, 1020.0]),
+        np.array([1010.0, 1030.0]),
+    )
+    serialized = safe_json_dumps(did_nan)
+    assert "NaN" not in serialized and "Infinity" not in serialized
+
+    # Empty arrays
+    did_empty = compute_did_evaluation(np.array([]), np.array([]), np.array([]), np.array([]))
+    assert did_empty["didLiftUsdPerDay"] == 0.0
+    assert did_empty["pValue"] == 1.0
+
+    assert bootstrap_ci(np.array([np.nan, np.inf])) == (0.0, 0.0, 0.0)
+    assert welch_ttest_pvalue(np.array([10.0]), np.array([20.0])) == 1.0
+
+    # Zero-tx and identical cashiers (MAD == 0) must not divide by zero
+    assert score_cashiers_robust([]) == []
+    identical_cashiers = [("C1", 0, 0, 0, 0), ("C2", 0, 0, 0, 0)]
+    scored = score_cashiers_robust(identical_cashiers)
+    assert len(scored) == 2
+    assert all(math.isfinite(r[5]) and math.isfinite(r[6]) for r in scored)
+
+
+def test_otif_phantom_markdown_rfm_lanes_and_json_sanitizer_edge_cases():
+    otif_empty = compute_supplier_otif_metrics([], expected_lead_days=0)
+    assert otif_empty["avg_lead_time_days"] == 1.0
+    assert otif_empty["lead_time_std_days"] >= 0.4
+
+    otif_nan = compute_supplier_otif_metrics(
+        [{"lead_days": float("nan"), "ordered_units": -5, "received_units": 0, "po_cost_cents": -10, "invoice_cost_cents": 0}],
+        expected_lead_days=3,
+    )
+    assert math.isfinite(otif_nan["avg_lead_time_days"])
+
+    assert compute_phantom_prob(10, float("nan"), float("inf"), float("nan")) == 0.0
+    assert 0.0 <= compute_phantom_prob(10, 5.0, 9999.0, 0.5) <= 0.99
+
+    md_zero = solve_optimal_markdown(0, 0, float("nan"), 0, -50, elasticity=float("inf"))
+    assert md_zero["predicted_clearance_units"] == 0
+    assert md_zero["expected_recovery_cents"] == 0
+
+    assert score_rfm_segment(float("nan"), 0, 0) == "Hibernating"
+    assert recommend_hourly_lanes(float("nan"), conversion_rate=float("inf"), min_lanes=4, max_lanes=2) == 4
+    assert _mine_basket_subset([], "all", min_co=2, min_lift=1.2, top_n=10) == []
+
+    # JSONB sanitizer strips NaN/Inf & converts NumPy scalars cleanly
+    raw = {"a": float("nan"), "b": float("inf"), "c": np.float64(-np.inf), "d": np.int64(42), "e": [np.bool_(True)]}
+    parsed = json.loads(safe_json_dumps(raw))
+    assert parsed == {"a": 0.0, "b": 0.0, "c": 0.0, "d": 42, "e": [True]}
+    assert safe_float(float("nan"), default=1.5) == 1.5
+

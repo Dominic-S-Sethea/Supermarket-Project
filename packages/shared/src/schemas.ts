@@ -101,15 +101,19 @@ export const CreateGrnSchema = z.object({
   notes: z.string().max(500).optional(),
   lines: z
     .array(
-      z.object({
-        productId: z.string().uuid(),
-        caseQty: z.number().int().min(1),
-        paidCases: z.number().int().min(0),
-        freeBonusCases: z.number().int().min(0).default(0),
-        invoiceLineTotalCents: z.number().int().min(0),
-        lotCode: z.string().max(64).optional(),
-        bestBeforeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-      })
+      z
+        .object({
+          productId: z.string().uuid(),
+          caseQty: z.number().int().min(1),
+          paidCases: z.number().int().min(0),
+          freeBonusCases: z.number().int().min(0).default(0),
+          invoiceLineTotalCents: z.number().int().min(0),
+          lotCode: z.string().max(64).optional(),
+          bestBeforeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        })
+        .refine((l) => l.paidCases + l.freeBonusCases >= 1, {
+          message: "Each GRN line must receive at least 1 paid or bonus case",
+        })
     )
     .min(1),
 });
@@ -139,18 +143,33 @@ export const UpdatePoStatusSchema = z.object({
   status: z.enum(["draft", "approved", "sent", "partially_received", "received", "cancelled"]),
 });
 
-export const CreatePromotionSchema = z.object({
-  name: z.string().min(2).max(160),
-  promoType: z.enum(["mix_and_match", "bogo", "tier_price", "clearance", "basket_threshold"]),
-  priority: z.number().int().min(1).max(1000).default(15),
-  combinable: z.boolean().default(false),
-  minMarginGuardBp: z.number().int().min(0).max(9500).nullable().default(800),
-  startsAt: z.string().datetime().optional(),
-  endsAt: z.string().datetime().optional(),
-  daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
-  daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
-  rulesJson: z.record(z.unknown()),
-});
+export const CreatePromotionSchema = z
+  .object({
+    name: z.string().min(2).max(160),
+    promoType: z.enum(["mix_and_match", "bogo", "tier_price", "clearance", "basket_threshold"]),
+    priority: z.number().int().min(1).max(1000).default(15),
+    combinable: z.boolean().default(false),
+    minMarginGuardBp: z.number().int().min(0).max(9500).nullable().default(800),
+    startsAt: z.string().datetime().optional(),
+    endsAt: z.string().datetime().optional(),
+    daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
+    daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
+    rulesJson: z.record(z.unknown()),
+  })
+  .refine(
+    (d) =>
+      (d.daypartStartHour == null && d.daypartEndHour == null) ||
+      (d.daypartStartHour != null && d.daypartEndHour != null),
+    {
+      message: "Both daypartStartHour and daypartEndHour must be provided together or both omitted",
+    }
+  )
+  .refine(
+    (d) => !d.startsAt || !d.endsAt || Date.parse(d.startsAt) <= Date.parse(d.endsAt),
+    {
+      message: "Promotion startsAt must be earlier than or equal to endsAt",
+    }
+  );
 
 export const IngestFootfallSchema = z.object({
   buckets: z
