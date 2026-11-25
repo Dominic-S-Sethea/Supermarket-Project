@@ -50,7 +50,7 @@ test.describe("SupermarketOS Full-Stack E2E Smoke Suite", () => {
   }) => {
     const guard = attachErrorGuards(page);
 
-    // Owner: sees all 8 tabs + AI Copilot
+    // Owner: sees all 9 tabs + AI Copilot
     await loginAs(page, "owner", "1111");
     await expect(page.locator("#open-ai-copilot-btn")).toBeVisible();
     for (const id of [
@@ -62,39 +62,59 @@ test.describe("SupermarketOS Full-Stack E2E Smoke Suite", () => {
       "#nav-shift-diagnostics",
       "#nav-abc-lp",
       "#nav-forecasting",
+      "#nav-admin",
     ]) {
       await expect(page.locator(id)).toBeVisible();
     }
     await logout(page);
 
-    // Manager: sees all 8 tabs + AI Copilot
+    // Manager: sees all 9 tabs + AI Copilot
     await loginAs(page, "manager", "9999");
     await expect(page.locator("#open-ai-copilot-btn")).toBeVisible();
     await expect(page.locator("#nav-operations")).toBeVisible();
     await expect(page.locator("#nav-loyalty")).toBeVisible();
+    await expect(page.locator("#nav-admin")).toBeVisible();
     await logout(page);
 
-    // Cashier: strictly POS + Catalog, NO Operations / Overview / Loyalty / AI Copilot
+    // Accountant: sees Overview, Loyalty, Shift Diagnostics, ABC-LP, Forecasting & Governance (NO POS/Catalog/Ops/AI/Staff Users)
+    await loginAs(page, "accountant", "4444");
+    await expect(page.locator("#nav-overview")).toBeVisible();
+    await expect(page.locator("#nav-admin")).toBeVisible();
+    await expect(page.locator("#nav-pos")).toHaveCount(0);
+    await expect(page.locator("#nav-catalog")).toHaveCount(0);
+    await expect(page.locator("#nav-operations")).toHaveCount(0);
+    await expect(page.locator("#open-ai-copilot-btn")).toHaveCount(0);
+    await page.click("#nav-admin");
+    await expect(page.locator("#admin-subtab-audit")).toBeVisible();
+    await expect(page.locator("#admin-subtab-reconciliation")).toBeVisible();
+    await expect(page.locator("#admin-subtab-pipeline")).toBeVisible();
+    await expect(page.locator("#admin-subtab-users")).toHaveCount(0);
+    await logout(page);
+
+    // Cashier: strictly POS + Catalog, NO Operations / Overview / Loyalty / Admin / AI Copilot
     await loginAs(page, "cashier1", "1234");
     await expect(page.locator("#nav-pos")).toBeVisible();
     await expect(page.locator("#nav-catalog")).toBeVisible();
     await expect(page.locator("#nav-overview")).toHaveCount(0);
     await expect(page.locator("#nav-operations")).toHaveCount(0);
     await expect(page.locator("#nav-loyalty")).toHaveCount(0);
+    await expect(page.locator("#nav-admin")).toHaveCount(0);
     await expect(page.locator("#open-ai-copilot-btn")).toHaveCount(0);
     await logout(page);
 
-    // Stock Clerk: strictly Catalog + Operations (incl. Shelf Integrity & Floor Tasks), NO POS / Overview / AI Copilot
+    // Stock Clerk: strictly Catalog + Operations (incl. Shelf Integrity & Floor Tasks), NO POS / Overview / Admin / AI Copilot
     await loginAs(page, "clerk1", "2222");
     await expect(page.locator("#nav-catalog")).toBeVisible();
     await expect(page.locator("#nav-operations")).toBeVisible();
     await expect(page.locator("#nav-pos")).toHaveCount(0);
     await expect(page.locator("#nav-overview")).toHaveCount(0);
+    await expect(page.locator("#nav-admin")).toHaveCount(0);
     await expect(page.locator("#open-ai-copilot-btn")).toHaveCount(0);
     await page.click("#nav-operations");
     await expect(page.locator("#ops-subtab-shelf")).toBeVisible();
     await expect(page.locator("#ops-subtab-tasks")).toBeVisible();
     await expect(page.locator("#ops-subtab-suppliers")).toHaveCount(0);
+    await expect(page.locator("#ops-subtab-orders")).toHaveCount(0);
     await logout(page);
 
     guard.assertClean();
@@ -259,6 +279,66 @@ test.describe("SupermarketOS Full-Stack E2E Smoke Suite", () => {
     await expect(page.locator(".ai-action-card").first()).toContainText("PENDING");
 
     await page.keyboard.press("Escape");
+    await logout(page);
+    guard.assertClean();
+  });
+
+  test("6. Wave 2 Governance & Audit Explorer: Staff Users, Audit Log, Z-Reports/Exports & 12-Check ML Pipeline Health", async ({
+    page,
+  }) => {
+    const guard = attachErrorGuards(page);
+    await loginAs(page, "owner", "1111");
+
+    await page.click("#nav-admin");
+    await expect(page.locator("#admin-subtab-users")).toBeVisible();
+    await expect(page.locator("text=Staff Accounts & Active Sessions")).toBeVisible();
+    await expect(page.locator("tbody")).toContainText("@accountant");
+    await expect(page.locator("tbody")).toContainText("@owner");
+
+    // Immutable Audit Log tab
+    await page.click("#admin-subtab-audit");
+    await expect(page.locator("text=Immutable Compliance Audit Trail")).toBeVisible();
+    await expect(page.locator("#audit-search-input")).toBeVisible();
+
+    // Z-Report Reconciliation & 5 Formula-Safe Exports + OpenAPI 3.1 link
+    await page.click("#admin-subtab-reconciliation");
+    await expect(page.locator("text=Formula-Safe ERP CSV Exports")).toBeVisible();
+    await expect(page.locator("#export-valuation-csv")).toBeVisible();
+    await expect(page.locator("#openapi-spec-link")).toBeVisible();
+
+    // ML Pipeline Health & 12-Check Data-Quality Contract Matrix
+    await page.click("#admin-subtab-pipeline");
+    await expect(page.locator("text=12-Check Data-Quality Contract Matrix")).toBeVisible();
+    await expect(page.locator("text=12 / 12")).toBeVisible();
+    await expect(page.locator("text=abc_xyz_non_empty")).toBeVisible();
+
+    // My PIN Security tab
+    await page.click("#admin-subtab-security");
+    await expect(page.locator("#rotate-pin-btn")).toBeVisible();
+
+    await logout(page);
+    guard.assertClean();
+  });
+
+  test("7. Wave 2 Purchase Orders Workbench & 60-Day Promotion ROI Attribution", async ({
+    page,
+  }) => {
+    const guard = attachErrorGuards(page);
+    await loginAs(page, "owner", "1111");
+
+    // Operations -> Purchase Orders Workbench
+    await page.click("#nav-operations");
+    await expect(page.locator("#ops-subtab-orders")).toBeVisible();
+    await page.click("#ops-subtab-orders");
+    await expect(page.locator("text=Purchase Order Register")).toBeVisible();
+    await expect(page.locator("#po-status-filter")).toBeVisible();
+
+    // Loyalty & Promos -> Promotions -> 60-Day Promo ROI Attribution table
+    await page.click("#nav-loyalty");
+    await page.click("#loyalty-subtab-promotions");
+    await expect(page.locator("#promo-roi-panel")).toBeVisible();
+    await expect(page.locator("#promo-roi-panel tbody tr").first()).toBeVisible();
+
     await logout(page);
     guard.assertClean();
   });

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import type { UserRole } from "@supermarket/shared";
 import {
   BarChart3,
@@ -14,17 +14,38 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { apiGet, apiPost, setUnauthorizedHandler } from "./api";
-import { AiCopilotDrawer } from "./components/AiCopilotDrawer";
 import { LoginScreen, type SessionUser } from "./components/LoginScreen";
-import { AbcLossView } from "./views/AbcLossView";
-import { AdminAuditView } from "./views/AdminAuditView";
-import { CatalogView } from "./views/CatalogView";
-import { ForecastingBasketView } from "./views/ForecastingBasketView";
-import { LoyaltyPromosView } from "./views/LoyaltyPromosView";
-import { OperationsView } from "./views/OperationsView";
-import { OverviewView } from "./views/OverviewView";
-import { PosTerminalView } from "./views/PosTerminalView";
-import { ShiftDiagnosticsView } from "./views/ShiftDiagnosticsView";
+
+const AiCopilotDrawer = lazy(() =>
+  import("./components/AiCopilotDrawer").then((m) => ({ default: m.AiCopilotDrawer }))
+);
+const AbcLossView = lazy(() =>
+  import("./views/AbcLossView").then((m) => ({ default: m.AbcLossView }))
+);
+const AdminAuditView = lazy(() =>
+  import("./views/AdminAuditView").then((m) => ({ default: m.AdminAuditView }))
+);
+const CatalogView = lazy(() =>
+  import("./views/CatalogView").then((m) => ({ default: m.CatalogView }))
+);
+const ForecastingBasketView = lazy(() =>
+  import("./views/ForecastingBasketView").then((m) => ({ default: m.ForecastingBasketView }))
+);
+const LoyaltyPromosView = lazy(() =>
+  import("./views/LoyaltyPromosView").then((m) => ({ default: m.LoyaltyPromosView }))
+);
+const OperationsView = lazy(() =>
+  import("./views/OperationsView").then((m) => ({ default: m.OperationsView }))
+);
+const OverviewView = lazy(() =>
+  import("./views/OverviewView").then((m) => ({ default: m.OverviewView }))
+);
+const PosTerminalView = lazy(() =>
+  import("./views/PosTerminalView").then((m) => ({ default: m.PosTerminalView }))
+);
+const ShiftDiagnosticsView = lazy(() =>
+  import("./views/ShiftDiagnosticsView").then((m) => ({ default: m.ShiftDiagnosticsView }))
+);
 
 type TabId =
   | "overview"
@@ -307,80 +328,84 @@ export function App() {
       </aside>
 
       <main className="main-content">
-        {activeTab === "overview" && (
-          <OverviewView
-            key={`ov-${refreshTick}`}
-            userRole={user.role}
-            allowedTabs={allowedTabs}
-            onNavigate={(tab) => {
-              if (allowedTabs.includes(tab)) setActiveTab(tab);
-            }}
-          />
-        )}
-        {activeTab === "catalog" && (
-          <CatalogView
-            key={`cat-${refreshTick}`}
-            departments={meta.departments}
-            userRole={user.role}
-          />
-        )}
-        {/* Keep PosTerminalView mounted across tab switches so active basket & offline state persist */}
-        {allowedTabs.includes("pos") && (
-          <div style={{ display: activeTab === "pos" ? "block" : "none" }}>
-            <PosTerminalView
-              cashierName={user.fullName}
+        <Suspense fallback={<div className="panel">Loading SupermarketOS module...</div>}>
+          {activeTab === "overview" && (
+            <OverviewView
+              key={`ov-${refreshTick}`}
               userRole={user.role}
-              isActive={activeTab === "pos"}
+              allowedTabs={allowedTabs}
+              onNavigate={(tab) => {
+                if (allowedTabs.includes(tab)) setActiveTab(tab);
+              }}
             />
-          </div>
-        )}
-        {activeTab === "operations" && (
-          <OperationsView
-            key={`ops-${refreshTick}`}
-            suppliers={meta.suppliers}
-            userRole={user.role}
-            onCountsChanged={() => void loadMetaAndAlerts(user)}
-          />
-        )}
-        {activeTab === "loyalty" && (
-          <LoyaltyPromosView key={`loy-${refreshTick}`} userRole={user.role} />
-        )}
-        {activeTab === "abc-lp" && (
-          <AbcLossView key={`abc-${refreshTick}`} userRole={user.role} />
-        )}
-        {activeTab === "forecasting" && (
-          <ForecastingBasketView key={`fc-${refreshTick}`} userRole={user.role} />
-        )}
-        {activeTab === "shift-diagnostics" && (
-          <ShiftDiagnosticsView
-            key={`sd-${refreshTick}`}
-            userRole={user.role}
-            onAskCopilot={(prompt) => {
-              setCopilotInitialPrompt(prompt);
-              setCopilotOpen(true);
-            }}
-          />
-        )}
-        {activeTab === "admin" && (
-          <AdminAuditView
-            key={`adm-${refreshTick}`}
-            userRole={user.role}
-            currentUsername={user.username}
-          />
-        )}
+          )}
+          {activeTab === "catalog" && (
+            <CatalogView
+              key={`cat-${refreshTick}`}
+              departments={meta.departments}
+              userRole={user.role}
+            />
+          )}
+          {/* Keep PosTerminalView mounted across tab switches so active basket & offline state persist */}
+          {allowedTabs.includes("pos") && (
+            <div style={{ display: activeTab === "pos" ? "block" : "none" }}>
+              <PosTerminalView
+                cashierName={user.fullName}
+                userRole={user.role}
+                isActive={activeTab === "pos"}
+              />
+            </div>
+          )}
+          {activeTab === "operations" && (
+            <OperationsView
+              key={`ops-${refreshTick}`}
+              suppliers={meta.suppliers}
+              userRole={user.role}
+              onCountsChanged={() => void loadMetaAndAlerts(user)}
+            />
+          )}
+          {activeTab === "loyalty" && (
+            <LoyaltyPromosView key={`loy-${refreshTick}`} userRole={user.role} />
+          )}
+          {activeTab === "abc-lp" && (
+            <AbcLossView key={`abc-${refreshTick}`} userRole={user.role} />
+          )}
+          {activeTab === "forecasting" && (
+            <ForecastingBasketView key={`fc-${refreshTick}`} userRole={user.role} />
+          )}
+          {activeTab === "shift-diagnostics" && (
+            <ShiftDiagnosticsView
+              key={`sd-${refreshTick}`}
+              userRole={user.role}
+              onAskCopilot={(prompt) => {
+                setCopilotInitialPrompt(prompt);
+                setCopilotOpen(true);
+              }}
+            />
+          )}
+          {activeTab === "admin" && (
+            <AdminAuditView
+              key={`adm-${refreshTick}`}
+              userRole={user.role}
+              currentUsername={user.username}
+            />
+          )}
+        </Suspense>
       </main>
 
       {canUseAi && (
-        <AiCopilotDrawer
-          open={copilotOpen}
-          initialPrompt={copilotInitialPrompt}
-          onConsumeInitialPrompt={() => setCopilotInitialPrompt(null)}
-          onClose={() => setCopilotOpen(false)}
-          onActionExecuted={() => {
-            setRefreshTick((t) => t + 1);
-            void loadMetaAndAlerts(user);
-          }}
-        />
+        <Suspense fallback={null}>
+          <AiCopilotDrawer
+            open={copilotOpen}
+            initialPrompt={copilotInitialPrompt}
+            onConsumeInitialPrompt={() => setCopilotInitialPrompt(null)}
+            onClose={() => setCopilotOpen(false)}
+            onActionExecuted={() => {
+              setRefreshTick((t) => t + 1);
+              void loadMetaAndAlerts(user);
+            }}
+          />
+        </Suspense>
       )}
     </div>
   );
