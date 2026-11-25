@@ -1,9 +1,11 @@
-import { LoginSchema, type UserRole } from "@supermarket/shared";
-import { and, eq } from "drizzle-orm";
+import { ChangePinSchema, LoginSchema, type UserRole } from "@supermarket/shared";
+import { and, eq, isNull, ne } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { env } from "../config/env.js";
-import { db, userSessions, users } from "../db/index.js";
+import { auditLogs, db, userSessions, users } from "../db/index.js";
 import {
+  hashPin,
+  requireAuth,
   runDummyPinWork,
   SESSION_COOKIE_NAME,
   signSessionToken,
@@ -80,4 +82,50 @@ export async function authRoutes(app: FastifyInstance) {
   app.get("/api/auth/me", async (req) => {
     return { user: req.authUser };
   });
+
+  app.post(
+    "/api/auth/change-pin",
+    { preHandler: [requireAuth] },
+    async (req, reply) => {
+      const parsed = ChangePinSchema.safeParse(req.body);
+      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+      if (parsed.data.currentPin === parsed.data.newPin) {
+        return reply.status(400).send({ error: "New PIN must be different from current PIN." });
+      }
+
+      const actor = req.authUser!;
+      const [dbUser] = await db.select().from(users).where(eq(users.id, actor.id)).limit(1);
+      if (!dbUser || !(await verifyPin(parsed.data.currentPin, dbUser.pinHash))) {
+        return reply.status(401).send({ error: "Current PIN is incorrect." });
+      }
+
+      const nextHash = await hashPin(parsed.data.newPin);
+      const revokedCount = await db.transaction(async (tx) => {
+        await tx.update(users).set({ pinHash: nextHash }).where(eq(users.id, actor.id));
+        const otherCond = req.sessionJti
+          ? and(
+              eq(userSessions.userId, actor.id),
+              isNull(userSessions.revokedAt),
+              ne(userSessions.jti, req.sessionJti)
+            )
+          : and(eq(userSessions.userId, actor.id), isNull(userSessions.revokedAt));
+        const revoked = await tx
+          .update(userSessions)
+          .set({ revokedAt: new Date() })
+          .where(otherCond)
+          .returning({ jti: userSessions.jti });
+
+        await tx.insert(auditLogs).values({
+          actor: actor.fullName,
+          action: "pin_change",
+          entityType: "user",
+          entityId: actor.id,
+          detailsJson: { username: actor.username, otherSessionsRevoked: revoked.length },
+        });
+        return revoked.length;
+      });
+
+      return { ok: true, otherSessionsRevoked: revokedCount };
+    }
+  );
 }

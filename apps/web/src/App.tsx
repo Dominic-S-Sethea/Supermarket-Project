@@ -8,6 +8,7 @@ import {
   LogOut,
   PackageCheck,
   ScanBarcode,
+  ShieldCheck,
   Sparkles,
   Sun,
   TrendingUp,
@@ -16,6 +17,7 @@ import { apiGet, apiPost, setUnauthorizedHandler } from "./api";
 import { AiCopilotDrawer } from "./components/AiCopilotDrawer";
 import { LoginScreen, type SessionUser } from "./components/LoginScreen";
 import { AbcLossView } from "./views/AbcLossView";
+import { AdminAuditView } from "./views/AdminAuditView";
 import { CatalogView } from "./views/CatalogView";
 import { ForecastingBasketView } from "./views/ForecastingBasketView";
 import { LoyaltyPromosView } from "./views/LoyaltyPromosView";
@@ -32,7 +34,8 @@ type TabId =
   | "loyalty"
   | "abc-lp"
   | "forecasting"
-  | "shift-diagnostics";
+  | "shift-diagnostics"
+  | "admin";
 
 interface MetaPayload {
   departments: { id: string; code: string; name: string }[];
@@ -40,11 +43,11 @@ interface MetaPayload {
 }
 
 const ROLE_TABS: Record<UserRole, TabId[]> = {
-  owner: ["overview", "pos", "catalog", "operations", "loyalty", "abc-lp", "forecasting", "shift-diagnostics"],
-  manager: ["overview", "pos", "catalog", "operations", "loyalty", "abc-lp", "forecasting", "shift-diagnostics"],
+  owner: ["overview", "pos", "catalog", "operations", "loyalty", "abc-lp", "forecasting", "shift-diagnostics", "admin"],
+  manager: ["overview", "pos", "catalog", "operations", "loyalty", "abc-lp", "forecasting", "shift-diagnostics", "admin"],
   cashier: ["pos", "catalog"],
   stock_clerk: ["catalog", "operations"],
-  accountant: ["overview", "loyalty", "abc-lp", "forecasting", "shift-diagnostics"],
+  accountant: ["overview", "loyalty", "abc-lp", "forecasting", "shift-diagnostics", "admin"],
 };
 
 export function App() {
@@ -262,6 +265,16 @@ export function App() {
                   <span>Forecasts &amp; Basket AI</span>
                 </button>
               )}
+              {allowedTabs.includes("admin") && (
+                <button
+                  id="nav-admin"
+                  className={`nav-btn ${activeTab === "admin" ? "active" : ""}`}
+                  onClick={() => setActiveTab("admin")}
+                >
+                  <ShieldCheck size={16} />
+                  <span>Governance &amp; Audit</span>
+                </button>
+              )}
             </nav>
           </>
         )}
@@ -346,6 +359,13 @@ export function App() {
               setCopilotInitialPrompt(prompt);
               setCopilotOpen(true);
             }}
+          />
+        )}
+        {activeTab === "admin" && (
+          <AdminAuditView
+            key={`adm-${refreshTick}`}
+            userRole={user.role}
+            currentUsername={user.username}
           />
         )}
       </main>

@@ -474,6 +474,7 @@ async function seed() {
   await db.insert(users).values([
     { username: "owner", fullName: "Alex Rivera (Owner)", role: "owner", pinHash: await hashPin("1111") },
     { username: "manager", fullName: "Priya Patel (Manager)", role: "manager", pinHash: await hashPin("9999") },
+    { username: "accountant", fullName: "David Okafor (Accountant)", role: "accountant", pinHash: await hashPin("4444") },
     { username: "clerk1", fullName: "Marcus Chen (Stock Clerk)", role: "stock_clerk", pinHash: await hashPin("2222") },
     { username: "cashier1", fullName: "Elena Morales", role: "cashier", pinHash: await hashPin("1234") },
     { username: "cashier2", fullName: "Liam O'Connor", role: "cashier", pinHash: await hashPin("2345") },

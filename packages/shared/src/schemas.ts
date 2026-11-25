@@ -288,3 +288,27 @@ export const CompleteFloorTaskSchema = z.object({
   note: z.string().max(300).optional(),
   actualQty: z.number().int().min(0).max(100_000).optional(),
 });
+
+export const CreateUserSchema = z.object({
+  username: z
+    .string()
+    .trim()
+    .min(3)
+    .max(40)
+    .regex(/^[a-z0-9._-]+$/i, "Username may only contain letters, digits, dots, underscores, and hyphens"),
+  fullName: z.string().trim().min(2).max(120),
+  role: UserRoleSchema,
+  pin: z.string().trim().min(4).max(12),
+});
+
+export const UpdateUserSchema = z.object({
+  fullName: z.string().trim().min(2).max(120).optional(),
+  role: UserRoleSchema.optional(),
+  active: z.boolean().optional(),
+  pin: z.string().trim().min(4).max(12).optional(),
+});
+
+export const ChangePinSchema = z.object({
+  currentPin: z.string().trim().min(4).max(12),
+  newPin: z.string().trim().min(4).max(12),
+});

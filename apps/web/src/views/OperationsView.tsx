@@ -5,9 +5,10 @@ import {
   formatMoney,
   type UserRole,
 } from "@supermarket/shared";
-import { AlertTriangle, Award, Check, ClipboardList, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Award, Check, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import { FloorTasksTab } from "../components/FloorTasksTab";
+import { PurchaseOrdersTab, type ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
 import { ShelfIntegrityTab } from "../components/ShelfIntegrityTab";
 import { SupplierMatchTab } from "../components/SupplierMatchTab";
 
@@ -85,7 +86,7 @@ interface ParsedInvoiceResponse {
   };
 }
 
-type OpsSubTab = "receiving" | "shelf" | "tasks" | "suppliers";
+type OpsSubTab = "receiving" | "orders" | "shelf" | "tasks" | "suppliers";
 
 export function OperationsView({
   suppliers,
@@ -111,6 +112,7 @@ export function OperationsView({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // GRN Bonus-Case Receiving Form
+  const [linkedPo, setLinkedPo] = useState<{ id: string; poNumber: string } | null>(null);
   const [supplierId, setSupplierId] = useState(suppliers[0]?.id ?? "");
   const [invoiceNo, setInvoiceNo] = useState(
     `INV-${new Date().getFullYear()}-${String(Math.floor(10000 + Math.random() * 89999))}`
@@ -271,7 +273,9 @@ export function OperationsView({
       const res = await apiPost<{
         grnId: string;
         marginAlertsTriggered: number;
+        variancesDetected?: number;
       }>("/api/purchasing/grn", {
+        poId: linkedPo?.id,
         supplierId,
         invoiceNumber: invoiceNo.trim(),
         lines: [
@@ -285,11 +289,13 @@ export function OperationsView({
           },
         ],
       });
+      const linkedLabel = linkedPo ? ` against ${linkedPo.poNumber}` : "";
+      setLinkedPo(null);
       setInvoiceNo(
         `INV-${new Date().getFullYear()}-${String(Math.floor(10000 + Math.random() * 89999))}`
       );
       setFeedback(
-        `Posted GRN (+${paidUnits + freeUnits} base units added to ledger, effective cost ${formatMoney(effectiveUnitCost)}/unit). Margin alerts triggered: ${res.marginAlertsTriggered}.`
+        `Posted GRN${linkedLabel} (+${paidUnits + freeUnits} base units added to ledger, effective cost ${formatMoney(effectiveUnitCost)}/unit). Margin alerts: ${res.marginAlertsTriggered}${res.variancesDetected ? `, 3-way variances detected: ${res.variancesDetected}` : ""}.`
       );
       await loadAll();
     } catch (err) {
@@ -297,6 +303,22 @@ export function OperationsView({
     } finally {
       setBusyAction(null);
     }
+  };
+
+  const handleReceiveAgainstPo = (draft: ReceiveAgainstPoDraft) => {
+    setLinkedPo({ id: draft.poId, poNumber: draft.poNumber });
+    setSupplierId(draft.supplierId);
+    setSelectedProdId(draft.productId);
+    setSkuSearch(draft.sku);
+    setCaseQty(draft.caseQty);
+    setPaidCases(draft.paidCases);
+    setFreeBonusCases(0);
+    setInvoiceTotalUsd((draft.invoiceLineTotalCents / 100).toFixed(2));
+    setErrorMsg(null);
+    setFeedback(
+      `Loaded ${draft.poNumber} (${draft.sku} — ${draft.productName}, ${draft.paidCases} cs) into the GRN Receiving form for 3-way PO matching.`
+    );
+    setSubTab("receiving");
   };
 
   const handleInvoiceFileUpload = async (file: File) => {
@@ -387,7 +409,7 @@ export function OperationsView({
           <h1>Receiving (GRN), FEFO Expiry &amp; Operations</h1>
           <p className="page-subtitle">
             {canManage
-              ? "Protect your 1–3% supermarket net profit across receiving, vendor OTIF scorecards, 3-way dock variance matching, and FEFO expiry control."
+              ? "Protect your 1–3% supermarket net profit across receiving, purchase orders, vendor OTIF scorecards, 3-way dock variance matching, and FEFO expiry control."
               : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."}
           </p>
         </div>
@@ -401,6 +423,17 @@ export function OperationsView({
           >
             <PackageCheck size={14} /> Receiving &amp; FEFO
           </button>
+          {canManage && (
+            <button
+              id="ops-subtab-orders"
+              role="tab"
+              aria-selected={subTab === "orders"}
+              className={`subtab-btn ${subTab === "orders" ? "active" : ""}`}
+              onClick={() => setSubTab("orders")}
+            >
+              <FileText size={14} /> Purchase Orders
+            </button>
+          )}
           <button
             id="ops-subtab-shelf"
             role="tab"
@@ -459,7 +492,16 @@ export function OperationsView({
         </div>
       )}
 
-      {subTab === "suppliers" && canManage ? (
+      {subTab === "orders" && canManage ? (
+        <PurchaseOrdersTab
+          onReceiveAgainstPo={handleReceiveAgainstPo}
+          onFeedback={(msg) => {
+            setErrorMsg(null);
+            setFeedback(msg);
+          }}
+          onError={(msg) => setErrorMsg(msg)}
+        />
+      ) : subTab === "suppliers" && canManage ? (
         <SupplierMatchTab
           canManage={canManage}
           onFeedback={(msg) => {
@@ -695,6 +737,20 @@ export function OperationsView({
               </div>
 
               <div className="stack-md" style={{ gap: 11 }}>
+                {linkedPo && (
+                  <div className="banner banner-amber" style={{ padding: "8px 12px" }}>
+                    <span>
+                      Linked to Purchase Order <strong className="mono">{linkedPo.poNumber}</strong> (3-way match active)
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => setLinkedPo(null)}
+                    >
+                      Unlink PO
+                    </button>
+                  </div>
+                )}
                 <div className="field">
                   <label>Supplier &amp; Invoice #</label>
                   <div className="form-grid">

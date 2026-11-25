@@ -418,7 +418,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
   // Persistent Purchase Orders
   app.get(
     "/api/purchasing/orders",
-    { preHandler: [requireRole(["owner", "manager"])] },
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
     async () => {
       const rows = await db
         .select({
@@ -441,6 +441,88 @@ export async function inventoryRoutes(app: FastifyInstance) {
         .limit(30);
 
       return { orders: rows };
+    }
+  );
+
+  // Purchase Order Detail (lines with remaining cases + linked GRNs & variances)
+  app.get(
+    "/api/purchasing/orders/:id",
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid purchase order ID format." });
+      }
+      const [po] = await db
+        .select({
+          id: purchaseOrders.id,
+          poNumber: purchaseOrders.poNumber,
+          supplierId: purchaseOrders.supplierId,
+          supplierName: suppliers.name,
+          status: purchaseOrders.status,
+          totalCases: purchaseOrders.totalCases,
+          estimatedCostCents: purchaseOrders.estimatedCostCents,
+          createdBy: purchaseOrders.createdBy,
+          approvedBy: purchaseOrders.approvedBy,
+          notes: purchaseOrders.notes,
+          createdAt: purchaseOrders.createdAt,
+          approvedAt: purchaseOrders.approvedAt,
+        })
+        .from(purchaseOrders)
+        .innerJoin(suppliers, eq(purchaseOrders.supplierId, suppliers.id))
+        .where(eq(purchaseOrders.id, id))
+        .limit(1);
+
+      if (!po) return reply.status(404).send({ error: "Purchase order not found." });
+
+      const [lines, grns, variances] = await Promise.all([
+        db
+          .select({
+            id: purchaseOrderLines.id,
+            productId: purchaseOrderLines.productId,
+            sku: products.sku,
+            productName: products.name,
+            caseQty: purchaseOrderLines.caseQty,
+            orderedCases: purchaseOrderLines.orderedCases,
+            receivedCases: purchaseOrderLines.receivedCases,
+            unitCostCents: purchaseOrderLines.unitCostCents,
+            lineTotalCents: purchaseOrderLines.lineTotalCents,
+          })
+          .from(purchaseOrderLines)
+          .innerJoin(products, eq(purchaseOrderLines.productId, products.id))
+          .where(eq(purchaseOrderLines.poId, id))
+          .orderBy(asc(products.sku)),
+        db
+          .select({
+            id: goodsReceipts.id,
+            invoiceNumber: goodsReceipts.invoiceNumber,
+            receivedBy: goodsReceipts.receivedBy,
+            totalInvoiceCents: goodsReceipts.totalInvoiceCents,
+            receivedAt: goodsReceipts.receivedAt,
+          })
+          .from(goodsReceipts)
+          .where(eq(goodsReceipts.poId, id))
+          .orderBy(desc(goodsReceipts.receivedAt)),
+        db
+          .select({
+            id: grnVariances.id,
+            varianceType: grnVariances.varianceType,
+            financialImpactCents: grnVariances.financialImpactCents,
+            status: grnVariances.status,
+          })
+          .from(grnVariances)
+          .where(eq(grnVariances.poId, id)),
+      ]);
+
+      return {
+        order: po,
+        lines: lines.map((l) => ({
+          ...l,
+          remainingCases: Math.max(0, l.orderedCases - l.receivedCases),
+        })),
+        grns,
+        variances,
+      };
     }
   );
 
