@@ -34,6 +34,16 @@ export function isGeminiConfigured(): boolean {
   return Boolean(process.env.GEMINI_API_KEY?.trim());
 }
 
+function sanitizeGeminiError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const redacted = raw
+    .replace(/AIza[0-9A-Za-z_-]{10,}/g, "[REDACTED_KEY]")
+    .replace(/(api[_-]?key|token|key)=[^\s&"']+/gi, "$1=[REDACTED]")
+    .replace(/\s+/g, " ")
+    .trim();
+  return redacted.length > 140 ? `${redacted.slice(0, 137)}...` : redacted || "upstream error";
+}
+
 export async function runCopilotTurn(
   userMessage: string,
   previousInteractionId: string | null,
@@ -44,7 +54,7 @@ export async function runCopilotTurn(
       return await runGeminiInteractionsTurn(userMessage, previousInteractionId, ctx);
     } catch (err) {
       const fallback = await runLocalFallbackTurn(userMessage, ctx);
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = sanitizeGeminiError(err);
       return {
         ...fallback,
         replyText: `> Gemini API unavailable (${errMsg}). Switched to Local Tool Mode.\n\n${fallback.replyText}`,
@@ -64,7 +74,7 @@ export async function runCopilotTurnStream(
     try {
       return await runGeminiInteractionsTurnStream(userMessage, previousInteractionId, ctx, emit);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = sanitizeGeminiError(err);
       emit({ type: "delta", text: `> Gemini API unavailable (${errMsg}). Switched to Local Tool Mode.\n\n` });
       const fallback = await runLocalFallbackTurn(userMessage, ctx, emit);
       await streamTextChunks(fallback.replyText, emit);

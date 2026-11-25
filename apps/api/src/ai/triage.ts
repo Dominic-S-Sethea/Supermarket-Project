@@ -20,8 +20,14 @@ export interface CalibratedTriageResult {
   summary: string;
 }
 
+function safeNum(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function logistic(x: number, midpoint: number, steepness: number): number {
-  const p = 1 / (1 + Math.exp(-steepness * (x - midpoint)));
+  const safeX = Number.isFinite(x) ? x : midpoint;
+  const p = 1 / (1 + Math.exp(-steepness * (safeX - midpoint)));
   return Math.min(0.99, Math.max(0.01, Number(p.toFixed(3))));
 }
 
@@ -30,11 +36,11 @@ function runLocalCalibratedTriage(
   metrics: Record<string, unknown>
 ): CalibratedTriageResult {
   if (targetType === "cashier_anomaly") {
-    const voidRate = Number(metrics.voidRatePct ?? 0);
-    const zScore = Number(metrics.zScore ?? 0);
-    const noSales = Number(metrics.noSaleDrawerCount ?? 0);
-    const refunds = Number(metrics.refundCount ?? 0);
-    const totalTx = Math.max(1, Number(metrics.totalSalesCount ?? 100));
+    const voidRate = Math.max(0, safeNum(metrics.voidRatePct, 0));
+    const zScore = safeNum(metrics.zScore, 0);
+    const noSales = Math.max(0, safeNum(metrics.noSaleDrawerCount, 0));
+    const refunds = Math.max(0, safeNum(metrics.refundCount, 0));
+    const totalTx = Math.max(1, safeNum(metrics.totalSalesCount, 100));
     const cashier = String(metrics.cashierName ?? "Cashier");
 
     const compositeSignal = zScore * 0.8 + voidRate * 0.45 + (noSales / totalTx) * 40;
@@ -84,10 +90,10 @@ function runLocalCalibratedTriage(
   }
 
   if (targetType === "invoice_discrepancy") {
-    const maxCostDelta = Number(metrics.maxCostDeltaPct ?? 0);
-    const unmatchedCount = Number(metrics.unmatchedLines ?? 0);
-    const lineCount = Math.max(1, Number(metrics.lineCount ?? 1));
-    const bonusCases = Number(metrics.totalBonusCases ?? 0);
+    const maxCostDelta = safeNum(metrics.maxCostDeltaPct, 0);
+    const unmatchedCount = Math.max(0, safeNum(metrics.unmatchedLines, 0));
+    const lineCount = Math.max(1, safeNum(metrics.lineCount, 1));
+    const bonusCases = Math.max(0, safeNum(metrics.totalBonusCases, 0));
 
     const pMarginRisk = logistic(maxCostDelta, 8.0, 0.35);
     const pVerify = logistic(unmatchedCount * 3 + Math.max(0, maxCostDelta - 5) * 0.4, 3.0, 0.65);
@@ -127,8 +133,8 @@ function runLocalCalibratedTriage(
   }
 
   // expiry_batch
-  const daysLeft = Number(metrics.daysLeft ?? 30);
-  const atRiskUsd = Number(metrics.atRiskCostCents ?? 0) / 100;
+  const daysLeft = safeNum(metrics.daysLeft, 30);
+  const atRiskUsd = Math.max(0, safeNum(metrics.atRiskCostCents, 0)) / 100;
   const pMarkdown = logistic(30 - daysLeft + atRiskUsd * 0.04, 15, 0.25);
   const pSpoilage = logistic(14 - daysLeft, 4, 0.4);
 

@@ -3,7 +3,12 @@ import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { env } from "../config/env.js";
 import { db, userSessions, users } from "../db/index.js";
-import { SESSION_COOKIE_NAME, signSessionToken, verifyPin } from "../plugins/auth.js";
+import {
+  runDummyPinWork,
+  SESSION_COOKIE_NAME,
+  signSessionToken,
+  verifyPin,
+} from "../plugins/auth.js";
 import { createRateLimiter } from "../plugins/security.js";
 
 export async function authRoutes(app: FastifyInstance) {
@@ -26,7 +31,11 @@ export async function authRoutes(app: FastifyInstance) {
       .where(and(eq(users.username, username), eq(users.active, true)))
       .limit(1);
 
-    if (!found || !(await verifyPin(parsed.data.pin, found.pinHash))) {
+    if (!found) {
+      await runDummyPinWork(parsed.data.pin);
+      return reply.status(401).send({ error: "Invalid username or PIN." });
+    }
+    if (!(await verifyPin(parsed.data.pin, found.pinHash))) {
       return reply.status(401).send({ error: "Invalid username or PIN." });
     }
 

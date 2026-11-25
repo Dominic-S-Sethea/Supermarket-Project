@@ -124,12 +124,41 @@ function clampDiscountByMarginGuard(
 }
 
 /**
+ * Distribute an integer cent amount proportionally across positive weights using
+ * the Largest Remainder (Hamilton) method so shares are always >= 0 and sum to
+ * exactly `totalCents` (never over-allocating due to rounding up).
+ */
+function allocateProportionalCents(totalCents: number, weights: number[]): number[] {
+  const n = weights.length;
+  if (n === 0 || totalCents <= 0) return new Array<number>(n).fill(0);
+  const safeWeights = weights.map((w) => (Number.isFinite(w) && w > 0 ? w : 0));
+  const weightSum = safeWeights.reduce((s, w) => s + w, 0);
+  if (weightSum <= 0) return new Array<number>(n).fill(0);
+
+  const exact = safeWeights.map((w) => (totalCents * w) / weightSum);
+  const shares = exact.map((e) => Math.floor(e));
+  let remainder = totalCents - shares.reduce((s, v) => s + v, 0);
+
+  if (remainder > 0) {
+    const order = exact
+      .map((e, idx) => ({ idx, frac: e - shares[idx], weight: safeWeights[idx] }))
+      .filter((item) => item.weight > 0)
+      .sort((a, b) => b.frac - a.frac || a.idx - b.idx);
+    for (let i = 0; i < remainder && i < order.length; i++) {
+      shares[order[i].idx] += 1;
+    }
+  }
+  return shares;
+}
+
+/**
  * Returns true if a promotion is active at the supplied local hour (0..23).
  * When evalHour or daypart window bounds are omitted, treats the promotion as always active.
  */
 export function isPromoActiveAtHour(promo: PromotionRule, evalHour?: number): boolean {
   if (
     evalHour === undefined ||
+    !Number.isFinite(evalHour) ||
     promo.daypartStartHour === undefined ||
     promo.daypartStartHour === null ||
     promo.daypartEndHour === undefined ||
@@ -182,11 +211,27 @@ export function evaluateCart(
   options?: { evalHour?: number; evalNow?: Date; couponDiscountCents?: number }
 ): EvaluatedCart {
   const working = inputLines.map((line) => {
-    const baseUnitsSold = line.packQty * line.qtyPacks;
-    const grossBeforeDiscountCents = line.unitPriceCents * line.qtyPacks;
-    const lineCostCents = line.unitCostCents * baseUnitsSold;
+    const packQty = Number.isFinite(line.packQty) ? Math.max(1, Math.trunc(line.packQty)) : 1;
+    const qtyPacks = Number.isFinite(line.qtyPacks) ? Math.max(0, Math.trunc(line.qtyPacks)) : 0;
+    const unitPriceCents = Number.isFinite(line.unitPriceCents)
+      ? Math.max(0, Math.round(line.unitPriceCents))
+      : 0;
+    const unitCostCents = Number.isFinite(line.unitCostCents)
+      ? Math.max(0, Math.round(line.unitCostCents))
+      : 0;
+    const taxRateBp = Number.isFinite(line.taxRateBp)
+      ? Math.max(0, Math.round(line.taxRateBp))
+      : 0;
+    const baseUnitsSold = packQty * qtyPacks;
+    const grossBeforeDiscountCents = unitPriceCents * qtyPacks;
+    const lineCostCents = unitCostCents * baseUnitsSold;
     return {
       ...line,
+      packQty,
+      qtyPacks,
+      unitPriceCents,
+      unitCostCents,
+      taxRateBp,
       baseUnitsSold,
       grossBeforeDiscountCents,
       lineCostCents,
@@ -219,15 +264,23 @@ export function evaluateCart(
   for (const promo of sortedPromos) {
     const eligible = working.filter(
       (line) =>
+        line.qtyPacks > 0 &&
+        line.grossBeforeDiscountCents > line.discountCents &&
         lineMatchesPromo(line, promo) &&
         (!line.lockedNonCombinable || (promo.combinable && promo.promoType === "basket_threshold"))
     );
     if (eligible.length === 0) continue;
 
-    if (promo.promoType === "clearance" && promo.discountBp && promo.discountBp > 0) {
+    if (
+      promo.promoType === "clearance" &&
+      typeof promo.discountBp === "number" &&
+      Number.isFinite(promo.discountBp) &&
+      promo.discountBp > 0
+    ) {
+      const effectiveBp = Math.min(10000, Math.round(promo.discountBp));
       for (const line of eligible) {
         const remaining = line.grossBeforeDiscountCents - line.discountCents;
-        const proposed = Math.round((remaining * promo.discountBp) / 10000);
+        const proposed = Math.round((remaining * effectiveBp) / 10000);
         const applied = clampDiscountByMarginGuard(
           line.grossBeforeDiscountCents,
           line.discountCents,
@@ -246,14 +299,18 @@ export function evaluateCart(
       }
     } else if (
       promo.promoType === "tier_price" &&
-      promo.requiredQty &&
-      promo.discountBp &&
+      typeof promo.requiredQty === "number" &&
+      Number.isFinite(promo.requiredQty) &&
+      promo.requiredQty > 0 &&
+      typeof promo.discountBp === "number" &&
+      Number.isFinite(promo.discountBp) &&
       promo.discountBp > 0
     ) {
+      const effectiveBp = Math.min(10000, Math.round(promo.discountBp));
       for (const line of eligible) {
         if (line.baseUnitsSold >= promo.requiredQty) {
           const remaining = line.grossBeforeDiscountCents - line.discountCents;
-          const proposed = Math.round((remaining * promo.discountBp) / 10000);
+          const proposed = Math.round((remaining * effectiveBp) / 10000);
           const applied = clampDiscountByMarginGuard(
             line.grossBeforeDiscountCents,
             line.discountCents,
@@ -273,28 +330,39 @@ export function evaluateCart(
       }
     } else if (
       promo.promoType === "mix_and_match" &&
-      promo.requiredQty &&
+      typeof promo.requiredQty === "number" &&
+      Number.isFinite(promo.requiredQty) &&
       promo.requiredQty > 0 &&
-      promo.bundlePriceCents !== undefined
+      typeof promo.bundlePriceCents === "number" &&
+      Number.isFinite(promo.bundlePriceCents) &&
+      promo.bundlePriceCents >= 0
     ) {
       // Restrict mix-and-match to matching UOM packQty (defaults to 1 = single) so multi-packs/cases cannot exploit single bundles
       const targetPackQty = promo.eligiblePackQty ?? 1;
+      const requiredQty = Math.trunc(promo.requiredQty);
       const packEligible = eligible.filter((line) => line.packQty === targetPackQty);
-      type UnitSlot = { lineIdx: number; unitPriceCents: number };
+      type UnitSlot = { lineIdx: number; effectivePriceCents: number };
       const slots: UnitSlot[] = [];
       packEligible.forEach((line) => {
         const idx = working.indexOf(line);
+        // Distribute post-discount remaining balance across pack slots so stacked promos never double-discount
+        const lineRemaining = Math.max(0, line.grossBeforeDiscountCents - line.discountCents);
+        const basePerPack = Math.floor(lineRemaining / line.qtyPacks);
+        const extraCents = lineRemaining - basePerPack * line.qtyPacks;
         for (let i = 0; i < line.qtyPacks; i++) {
-          slots.push({ lineIdx: idx, unitPriceCents: line.unitPriceCents });
+          slots.push({
+            lineIdx: idx,
+            effectivePriceCents: basePerPack + (i < extraCents ? 1 : 0),
+          });
         }
       });
 
-      const bundleCount = Math.floor(slots.length / promo.requiredQty);
+      const bundleCount = Math.floor(slots.length / requiredQty);
       if (bundleCount > 0) {
-        slots.sort((a, b) => b.unitPriceCents - a.unitPriceCents);
-        const usedSlots = slots.slice(0, bundleCount * promo.requiredQty);
-        const regularSum = usedSlots.reduce((s, u) => s + u.unitPriceCents, 0);
-        const targetSum = bundleCount * promo.bundlePriceCents;
+        slots.sort((a, b) => b.effectivePriceCents - a.effectivePriceCents);
+        const usedSlots = slots.slice(0, bundleCount * requiredQty);
+        const regularSum = usedSlots.reduce((s, u) => s + u.effectivePriceCents, 0);
+        const targetSum = bundleCount * Math.round(promo.bundlePriceCents);
         const rawSavings = Math.max(0, regularSum - targetSum);
 
         if (rawSavings > 0 && regularSum > 0) {
@@ -302,20 +370,19 @@ export function evaluateCart(
           for (const slot of usedSlots) {
             perLineRegular.set(
               slot.lineIdx,
-              (perLineRegular.get(slot.lineIdx) ?? 0) + slot.unitPriceCents
+              (perLineRegular.get(slot.lineIdx) ?? 0) + slot.effectivePriceCents
             );
           }
 
-          // Compute un-clamped proportional shares first (assigning rounding remainder before margin clamping)
-          let remainingUnclamped = rawSavings;
+          // Compute exact un-clamped proportional shares first (Hamilton largest remainder; margin clamping never spills across lines)
           const lineEntries = Array.from(perLineRegular.entries());
-          lineEntries.forEach(([lineIdx, lineReg], pos) => {
+          const shares = allocateProportionalCents(
+            rawSavings,
+            lineEntries.map(([, reg]) => reg)
+          );
+          lineEntries.forEach(([lineIdx], pos) => {
             const line = working[lineIdx];
-            const share =
-              pos === lineEntries.length - 1
-                ? remainingUnclamped
-                : Math.round((rawSavings * lineReg) / regularSum);
-            remainingUnclamped -= share;
+            const share = shares[pos];
 
             const applied = clampDiscountByMarginGuard(
               line.grossBeforeDiscountCents,
@@ -335,27 +402,48 @@ export function evaluateCart(
           });
         }
       }
-    } else if (promo.promoType === "bogo" && promo.buyQty && promo.getQty) {
+    } else if (
+      promo.promoType === "bogo" &&
+      typeof promo.buyQty === "number" &&
+      Number.isFinite(promo.buyQty) &&
+      promo.buyQty > 0 &&
+      typeof promo.getQty === "number" &&
+      Number.isFinite(promo.getQty) &&
+      promo.getQty > 0
+    ) {
       const targetPackQty = promo.eligiblePackQty ?? 1;
+      const buyQty = Math.trunc(promo.buyQty);
+      const getQty = Math.trunc(promo.getQty);
       const packEligible = eligible.filter((line) => line.packQty === targetPackQty);
-      const groupSize = promo.buyQty + promo.getQty;
-      const discountBp = promo.discountBp ?? 10000;
-      const slots: { lineIdx: number; unitPriceCents: number }[] = [];
+      const groupSize = buyQty + getQty;
+      const rawDiscountBp = promo.discountBp ?? 10000;
+      const discountBp = Number.isFinite(rawDiscountBp)
+        ? Math.min(10000, Math.max(0, Math.round(rawDiscountBp)))
+        : 0;
+      if (discountBp <= 0) continue;
+
+      const slots: { lineIdx: number; effectivePriceCents: number }[] = [];
       packEligible.forEach((line) => {
         const idx = working.indexOf(line);
+        const lineRemaining = Math.max(0, line.grossBeforeDiscountCents - line.discountCents);
+        const basePerPack = Math.floor(lineRemaining / line.qtyPacks);
+        const extraCents = lineRemaining - basePerPack * line.qtyPacks;
         for (let i = 0; i < line.qtyPacks; i++) {
-          slots.push({ lineIdx: idx, unitPriceCents: line.unitPriceCents });
+          slots.push({
+            lineIdx: idx,
+            effectivePriceCents: basePerPack + (i < extraCents ? 1 : 0),
+          });
         }
       });
 
       const sets = Math.floor(slots.length / groupSize);
       if (sets > 0) {
         // Retail standard: discount applies to the cheapest eligible items in the set
-        slots.sort((a, b) => a.unitPriceCents - b.unitPriceCents);
-        const discountedSlots = slots.slice(0, sets * promo.getQty);
+        slots.sort((a, b) => a.effectivePriceCents - b.effectivePriceCents);
+        const discountedSlots = slots.slice(0, sets * getQty);
         const perLineDiscount = new Map<number, number>();
         for (const slot of discountedSlots) {
-          const disc = Math.round((slot.unitPriceCents * discountBp) / 10000);
+          const disc = Math.round((slot.effectivePriceCents * discountBp) / 10000);
           perLineDiscount.set(slot.lineIdx, (perLineDiscount.get(slot.lineIdx) ?? 0) + disc);
         }
 
@@ -380,24 +468,26 @@ export function evaluateCart(
       }
     } else if (
       promo.promoType === "basket_threshold" &&
-      promo.minBasketCents &&
-      promo.flatDiscountCents
+      typeof promo.minBasketCents === "number" &&
+      Number.isFinite(promo.minBasketCents) &&
+      promo.minBasketCents > 0 &&
+      typeof promo.flatDiscountCents === "number" &&
+      Number.isFinite(promo.flatDiscountCents) &&
+      promo.flatDiscountCents > 0
     ) {
       const eligibleNetTotal = eligible.reduce(
         (sum, l) => sum + (l.grossBeforeDiscountCents - l.discountCents),
         0
       );
       if (eligibleNetTotal >= promo.minBasketCents) {
-        // Compute un-clamped proportional shares first so margin clamping on one line never spills onto another
-        let remainingUnclamped = Math.min(promo.flatDiscountCents, eligibleNetTotal);
-        const totalAllocTarget = remainingUnclamped;
+        // Compute exact un-clamped proportional shares first so margin clamping on one line never spills onto another
+        const totalAllocTarget = Math.min(Math.round(promo.flatDiscountCents), eligibleNetTotal);
+        const shares = allocateProportionalCents(
+          totalAllocTarget,
+          eligible.map((line) => line.grossBeforeDiscountCents - line.discountCents)
+        );
         eligible.forEach((line, idx) => {
-          const lineAvail = line.grossBeforeDiscountCents - line.discountCents;
-          const share =
-            idx === eligible.length - 1
-              ? remainingUnclamped
-              : Math.round((totalAllocTarget * lineAvail) / eligibleNetTotal);
-          remainingUnclamped -= share;
+          const share = shares[idx];
 
           const applied = clampDiscountByMarginGuard(
             line.grossBeforeDiscountCents,
@@ -420,49 +510,25 @@ export function evaluateCart(
   }
 
   // Prorate targeted loyalty coupon discount (if any) proportionally across post-promo balances
-  const requestedCoupon = Math.max(0, Math.round(options?.couponDiscountCents ?? 0));
+  const rawCoupon = options?.couponDiscountCents ?? 0;
+  const requestedCoupon = Number.isFinite(rawCoupon) ? Math.max(0, Math.round(rawCoupon)) : 0;
   const totalRemainingBeforeCoupon = working.reduce(
     (sum, line) => sum + Math.max(0, line.grossBeforeDiscountCents - line.discountCents),
     0
   );
   const appliedCouponCents = Math.min(requestedCoupon, totalRemainingBeforeCoupon);
   if (appliedCouponCents > 0 && totalRemainingBeforeCoupon > 0) {
-    let couponRemaining = appliedCouponCents;
+    const couponShares = allocateProportionalCents(
+      appliedCouponCents,
+      working.map((line) => Math.max(0, line.grossBeforeDiscountCents - line.discountCents))
+    );
     working.forEach((line, idx) => {
-      if (couponRemaining <= 0) return;
-      const headroom = Math.max(0, line.grossBeforeDiscountCents - line.discountCents);
-      if (headroom <= 0) return;
-      const isLast = idx === working.length - 1;
-      const share = isLast
-        ? Math.min(couponRemaining, headroom)
-        : Math.min(
-            headroom,
-            Math.min(
-              couponRemaining,
-              Math.floor((appliedCouponCents * headroom) / totalRemainingBeforeCoupon)
-            )
-          );
+      const share = couponShares[idx];
       if (share > 0) {
         line.discountCents += share;
         line.appliedPromotions.push("Loyalty Coupon");
-        couponRemaining -= share;
       }
     });
-    // Distribute any rounding remainder cents cleanly across lines with headroom
-    if (couponRemaining > 0) {
-      for (const line of working) {
-        if (couponRemaining <= 0) break;
-        const headroom = Math.max(0, line.grossBeforeDiscountCents - line.discountCents);
-        const take = Math.min(headroom, couponRemaining);
-        if (take > 0) {
-          line.discountCents += take;
-          if (!line.appliedPromotions.includes("Loyalty Coupon")) {
-            line.appliedPromotions.push("Loyalty Coupon");
-          }
-          couponRemaining -= take;
-        }
-      }
-    }
   }
 
   let subtotalBeforeDiscountCents = 0;
@@ -483,7 +549,7 @@ export function evaluateCart(
     totalTaxCents += tax.taxCents;
     grandTotalCents += tax.grossCents;
     totalCostCents += line.lineCostCents;
-    if (line.requiresAgeCheck) requiresAgeCheck = true;
+    if (line.requiresAgeCheck && line.qtyPacks > 0) requiresAgeCheck = true;
 
     return {
       lineKey: line.lineKey,

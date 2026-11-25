@@ -205,6 +205,20 @@ export async function parseSupplierInvoice(
 
   if (!raw && input.textContent?.trim()) {
     raw = parsePlainTextInvoice(input.textContent);
+  } else if (
+    !raw &&
+    input.base64Data &&
+    (input.mimeType === "text/plain" || input.mimeType === "text/csv")
+  ) {
+    try {
+      const cleanB64 = input.base64Data.replace(/^data:[^;]+;base64,/, "");
+      const decoded = Buffer.from(cleanB64, "base64").toString("utf8");
+      if (decoded.trim()) {
+        raw = parsePlainTextInvoice(decoded);
+      }
+    } catch {
+      // Fall back to sample invoice below
+    }
   }
 
   if (!raw || !raw.lines || raw.lines.length === 0) {

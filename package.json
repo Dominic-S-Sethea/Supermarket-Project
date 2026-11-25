@@ -11,7 +11,7 @@
     "db:up": "docker compose -f infra/docker-compose.yml up -d postgres",
     "db:down": "docker compose -f infra/docker-compose.yml down",
     "db:push": "pnpm --filter @supermarket/api db:push",
-    "db:seed": "pnpm --filter @supermarket/api db:seed",
+    "db:seed": "pnpm --filter @supermarket/shared build && pnpm --filter @supermarket/api db:seed",
     "analytics:run": "uv --directory services/analytics run python run_all.py"
   },
   "devDependencies": {

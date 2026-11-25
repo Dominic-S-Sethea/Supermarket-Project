@@ -18,6 +18,12 @@ export async function applyDatabaseConstraintsAndViews() {
       WHERE folded = false;
   `);
 
+  await db.execute(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_shifts_open_register
+      ON pos_shifts (register_code)
+      WHERE closed_at IS NULL;
+  `);
+
   // Idempotent CHECK constraint helper statements
   await db.execute(sql`
     DO $$
@@ -41,6 +47,20 @@ export async function applyDatabaseConstraintsAndViews() {
       ) THEN
         ALTER TABLE sale_lines
           ADD CONSTRAINT chk_sale_lines_qty_pos CHECK (pack_qty >= 1 AND qty_packs >= 1 AND base_units_sold >= 1);
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_product_barcodes_valid'
+      ) THEN
+        ALTER TABLE product_barcodes
+          ADD CONSTRAINT chk_product_barcodes_valid CHECK (pack_qty >= 1 AND sell_price_cents >= 1);
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_sale_payments_amount_nonneg'
+      ) THEN
+        ALTER TABLE sale_payments
+          ADD CONSTRAINT chk_sale_payments_amount_nonneg CHECK (amount_cents >= 0);
       END IF;
 
       IF NOT EXISTS (

@@ -186,6 +186,7 @@ export async function syncProductEmbeddings(force = false): Promise<{
         }
       }
     } catch {
+      upsertRows.length = 0;
       actualModel = "local-semantic-256d";
     }
   }
