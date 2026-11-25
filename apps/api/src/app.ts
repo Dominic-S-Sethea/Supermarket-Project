@@ -3,11 +3,14 @@ import { sql } from "drizzle-orm";
 import Fastify from "fastify";
 import { db } from "./db/index.js";
 import { registerAuthHook } from "./plugins/auth.js";
+import { registerMetrics } from "./plugins/metrics.js";
 import { registerCsrfOriginCheck, registerSecurityHeaders } from "./plugins/security.js";
+import { adminRoutes } from "./routes/admin.js";
 import { aiRoutes } from "./routes/ai.js";
 import { analyticsRoutes } from "./routes/analytics.js";
 import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
+import { exportRoutes } from "./routes/exports.js";
 import { inventoryRoutes } from "./routes/inventory.js";
 import { loyaltyRoutes } from "./routes/loyalty.js";
 import { operationsRoutes } from "./routes/operations.js";
@@ -60,6 +63,7 @@ export async function buildApp(logger = true) {
   registerSecurityHeaders(app);
   registerCsrfOriginCheck(app, allowedOrigins);
   registerAuthHook(app);
+  registerMetrics(app);
 
   app.setErrorHandler((err, req, reply) => {
     const pgCode = getPgErrorCode(err);
@@ -127,6 +131,8 @@ export async function buildApp(logger = true) {
   await app.register(loyaltyRoutes);
   await app.register(operationsRoutes);
   await app.register(analyticsRoutes);
+  await app.register(adminRoutes);
+  await app.register(exportRoutes);
   await app.register(aiRoutes);
 
   // Periodic background stock ledger folding (every 5 minutes outside test runs)

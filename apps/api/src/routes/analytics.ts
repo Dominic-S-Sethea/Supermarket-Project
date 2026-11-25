@@ -14,6 +14,7 @@ import {
   analyticsBasketRules,
   analyticsDemandForecasts,
   analyticsLpAnomalies,
+  analyticsPromoRoi,
   analyticsShiftDiagnostics,
   auditLogs,
   categories,
@@ -25,6 +26,7 @@ import {
   shiftExperiments,
   storeFootfall,
 } from "../db/index.js";
+import { buildCsvDocument } from "../lib/helpers.js";
 import { evaluateShiftExperiment } from "../lib/shiftDid.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
 
@@ -749,30 +751,64 @@ export async function analyticsRoutes(app: FastifyInstance) {
             ORDER BY 1 DESC
           `);
 
-      const header =
-        "Date,Receipts,GrossSalesUSD,DiscountsUSD,VATCollectedUSD,NetRevenueUSD,COGS_USD,GrossProfitUSD";
-      const lines = res.rows.map((r: Record<string, unknown>) => {
-        const toUsd = (v: unknown) => (Number(v ?? 0) / 100).toFixed(2);
-        const net = Number(r.net_revenue_cents ?? 0);
-        const cogs = Number(r.cogs_cents ?? 0);
-        return [
-          r.date,
-          r.receipts,
-          toUsd(r.gross_sales_cents),
-          toUsd(r.discounts_cents),
-          toUsd(r.vat_collected_cents),
-          toUsd(net),
-          toUsd(cogs),
-          toUsd(net - cogs),
-        ].join(",");
-      });
+      const toUsd = (v: unknown) => (Number(v ?? 0) / 100).toFixed(2);
+      const csv = buildCsvDocument(
+        [
+          "Date",
+          "Receipts",
+          "GrossSalesUSD",
+          "DiscountsUSD",
+          "VATCollectedUSD",
+          "NetRevenueUSD",
+          "COGS_USD",
+          "GrossProfitUSD",
+        ],
+        (res.rows as Record<string, unknown>[]).map((r) => {
+          const net = Number(r.net_revenue_cents ?? 0);
+          const cogs = Number(r.cogs_cents ?? 0);
+          return [
+            r.date,
+            Number(r.receipts ?? 0),
+            toUsd(r.gross_sales_cents),
+            toUsd(r.discounts_cents),
+            toUsd(r.vat_collected_cents),
+            toUsd(net),
+            toUsd(cogs),
+            toUsd(net - cogs),
+          ];
+        })
+      );
 
       reply.header("Content-Type", "text/csv; charset=utf-8");
       reply.header(
         "Content-Disposition",
         `attachment; filename="supermarket-os-accounting-journal-${parsedDays ? `${parsedDays}d` : "all"}.csv"`
       );
-      return [header, ...lines].join("\n");
+      return csv;
     }
   );
+
+  // Wave 2 Phase 3: Promotion ROI & Margin Attribution
+  app.get("/api/analytics/promo-roi", { preHandler: analyticsReadOnly }, async () => {
+    const rows = await db
+      .select()
+      .from(analyticsPromoRoi)
+      .orderBy(desc(analyticsPromoRoi.estimatedProfitDeltaCents));
+
+    const totalDiscountGivenCents = rows.reduce((s, r) => s + r.discountGivenCents, 0);
+    const totalProfitDeltaCents = rows.reduce((s, r) => s + r.estimatedProfitDeltaCents, 0);
+    const accretiveCount = rows.filter((r) => r.verdict === "profit_accretive").length;
+    const dilutiveCount = rows.filter((r) => r.verdict === "margin_dilutive").length;
+
+    return {
+      summary: {
+        promotionsEvaluated: rows.length,
+        accretiveCount,
+        dilutiveCount,
+        totalDiscountGivenCents,
+        totalProfitDeltaCents,
+      },
+      items: rows,
+    };
+  });
 }

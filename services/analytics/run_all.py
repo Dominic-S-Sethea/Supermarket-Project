@@ -14,9 +14,11 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 import uuid
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 import numpy as np
 import psycopg
@@ -2358,19 +2360,435 @@ def run_loyalty_staffing_and_tasks(conn: psycopg.Connection) -> tuple[int, int, 
     return len(rfm_updates), len(roster_records), tasks_inserted
 
 
+# ============================================================================
+# 8. WAVE 2: PROMOTION ROI ATTRIBUTION & 12-CHECK DATA-QUALITY CONTRACTS
+# ============================================================================
+
+
+def compute_promo_roi_metrics(
+    discounted_units: int,
+    discounted_revenue_cents: int,
+    discounted_tax_cents: int,
+    discounted_cogs_cents: int,
+    discount_given_cents: int,
+    promo_active_days: int,
+    baseline_units: int,
+    baseline_days: int,
+) -> dict[str, float | int | str]:
+    """Pure, finite-safe Promotion ROI & Margin Attribution calculator.
+
+    Compares discounted promo daily velocity against non-discounted baseline daily velocity
+    and estimates net profit delta after discount giveaway.
+    """
+    d_units = max(0, int(safe_float(discounted_units, 0.0, lo=0.0)))
+    d_rev = max(0, int(safe_float(discounted_revenue_cents, 0.0, lo=0.0)))
+    d_tax = max(0, int(safe_float(discounted_tax_cents, 0.0, lo=0.0)))
+    d_cogs = max(0, int(safe_float(discounted_cogs_cents, 0.0, lo=0.0)))
+    d_disc = max(0, int(safe_float(discount_given_cents, 0.0, lo=0.0)))
+    p_days = max(1, int(safe_float(promo_active_days, 1.0, lo=1.0)))
+    b_units = max(0, int(safe_float(baseline_units, 0.0, lo=0.0)))
+    b_days = max(1, int(safe_float(baseline_days, 1.0, lo=1.0)))
+
+    promo_daily = safe_float(d_units / p_days, 0.0, lo=0.0)
+    baseline_daily = safe_float(b_units / b_days, 0.0, lo=0.0)
+
+    if baseline_daily > 1e-6:
+        velocity_lift_pct = safe_float(
+            ((promo_daily - baseline_daily) / baseline_daily) * 100.0,
+            default=0.0,
+            lo=-100.0,
+            hi=500.0,
+        )
+    else:
+        velocity_lift_pct = 0.0 if d_units == 0 else 100.0
+
+    net_rev_cents = max(0, d_rev - d_tax)
+    gross_profit_cents = net_rev_cents - d_cogs
+    net_margin_bp = (
+        int(round((gross_profit_cents / net_rev_cents) * 10000.0))
+        if net_rev_cents > 0
+        else 0
+    )
+    net_margin_bp = max(-10000, min(10000, net_margin_bp))
+
+    # Pre-discount gross profit per unit * incremental lifted units minus discount given
+    if d_units > 0:
+        unit_pre_disc_profit = max(
+            0.0, ((net_rev_cents + d_disc) - d_cogs) / float(d_units)
+        )
+        incremental_units = max(0.0, promo_daily - baseline_daily) * float(p_days)
+        est_profit_delta_cents = int(
+            round(incremental_units * unit_pre_disc_profit - float(d_disc))
+        )
+    else:
+        est_profit_delta_cents = 0
+
+    if d_units < 5:
+        verdict = "insufficient_data"
+    elif est_profit_delta_cents > 0 and net_margin_bp >= 800:
+        verdict = "profit_accretive"
+    elif est_profit_delta_cents >= -500 and net_margin_bp >= 500:
+        verdict = "margin_neutral"
+    else:
+        verdict = "margin_dilutive"
+
+    return {
+        "discounted_units_60d": d_units,
+        "discounted_revenue_cents": d_rev,
+        "discount_given_cents": d_disc,
+        "baseline_daily_units": round(baseline_daily, 2),
+        "promo_daily_units": round(promo_daily, 2),
+        "velocity_lift_pct": round(velocity_lift_pct, 1),
+        "net_margin_bp": net_margin_bp,
+        "estimated_profit_delta_cents": est_profit_delta_cents,
+        "verdict": verdict,
+    }
+
+
+def run_promo_roi_attribution(conn: psycopg.Connection) -> int:
+    t0 = time.perf_counter()
+    records = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id::text, name, promo_type, rules_json, daypart_start_hour, daypart_end_hour
+            FROM promotions
+            ORDER BY priority ASC, name ASC
+        """)
+        promos = cur.fetchall()
+
+        for pid, name, promo_type, rules_raw, dp_start, dp_end in promos:
+            rules = rules_raw if isinstance(rules_raw, dict) else {}
+            prod_ids = [str(x) for x in (rules.get("productIds") or []) if x]
+            cat_ids = [str(x) for x in (rules.get("categoryIds") or []) if x]
+
+            dp_clause = ""
+            dp_params: list[object] = []
+            if dp_start is not None and dp_end is not None:
+                dp_clause = " AND EXTRACT(HOUR FROM s.sold_at) >= %s AND EXTRACT(HOUR FROM s.sold_at) < %s"
+                dp_params = [int(dp_start), int(dp_end)]
+
+            if prod_ids:
+                cur.execute(
+                    f"""
+                    SELECT
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::int,
+                      COALESCE(SUM(sl.line_total_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.tax_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.discount_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents > 0))::int,
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents = 0), 0)::int,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents = 0))::int
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+                    WHERE s.sold_at >= CURRENT_DATE - interval '60 days'
+                      AND sl.product_id = ANY(%s::uuid[])
+                      {dp_clause}
+                    """,
+                    [prod_ids, *dp_params],
+                )
+            elif cat_ids:
+                cur.execute(
+                    f"""
+                    SELECT
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::int,
+                      COALESCE(SUM(sl.line_total_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.tax_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.discount_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents > 0))::int,
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents = 0), 0)::int,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents = 0))::int
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+                    JOIN products p ON p.id = sl.product_id
+                    WHERE s.sold_at >= CURRENT_DATE - interval '60 days'
+                      AND p.category_id = ANY(%s::uuid[])
+                      {dp_clause}
+                    """,
+                    [cat_ids, *dp_params],
+                )
+            else:
+                min_basket = int(safe_float(rules.get("minBasketCents", 0), 0.0, lo=0.0))
+                cur.execute(
+                    f"""
+                    SELECT
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::int,
+                      COALESCE(SUM(sl.line_total_cents) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      COALESCE(SUM(sl.tax_cents) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      COALESCE(SUM(sl.discount_cents) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s))::int,
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE s.discount_cents = 0 AND s.subtotal_cents >= %s), 0)::int,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE s.discount_cents = 0 AND s.subtotal_cents >= %s))::int
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+                    WHERE s.sold_at >= CURRENT_DATE - interval '60 days'
+                      {dp_clause}
+                    """,
+                    [min_basket] * 8 + dp_params,
+                )
+
+            row = cur.fetchone() or (0, 0, 0, 0, 0, 1, 0, 1)
+            metrics = compute_promo_roi_metrics(
+                discounted_units=int(row[0]),
+                discounted_revenue_cents=int(row[1]),
+                discounted_tax_cents=int(row[2]),
+                discounted_cogs_cents=int(row[3]),
+                discount_given_cents=int(row[4]),
+                promo_active_days=int(row[5]),
+                baseline_units=int(row[6]),
+                baseline_days=int(row[7]),
+            )
+            records.append((
+                pid,
+                name,
+                promo_type,
+                metrics["discounted_units_60d"],
+                metrics["discounted_revenue_cents"],
+                metrics["discount_given_cents"],
+                metrics["baseline_daily_units"],
+                metrics["promo_daily_units"],
+                metrics["velocity_lift_pct"],
+                metrics["net_margin_bp"],
+                metrics["estimated_profit_delta_cents"],
+                metrics["verdict"],
+            ))
+
+        cur.execute("DELETE FROM analytics_promo_roi")
+        if records:
+            cur.executemany(
+                """
+                INSERT INTO analytics_promo_roi (
+                  promotion_id, promotion_name, promo_type,
+                  discounted_units_60d, discounted_revenue_cents, discount_given_cents,
+                  baseline_daily_units, promo_daily_units, velocity_lift_pct,
+                  net_margin_bp, estimated_profit_delta_cents, verdict
+                ) VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                records,
+            )
+
+    log_event(
+        "promo_roi_attribution",
+        promotions_scored=len(records),
+        elapsed_s=round(time.perf_counter() - t0, 2),
+    )
+    return len(records)
+
+
+def evaluate_data_quality_contracts(snapshot: dict[str, int]) -> tuple[bool, list[dict[str, object]]]:
+    """Pure 12-check ML pipeline data-quality contract evaluator."""
+    checks: list[dict[str, object]] = [
+        {
+            "name": "abc_xyz_non_empty",
+            "passed": snapshot.get("abc_xyz_count", 0) > 0,
+            "observed": snapshot.get("abc_xyz_count", 0),
+            "expected": "> 0 SKUs segmented",
+        },
+        {
+            "name": "abc_xyz_valid_classes",
+            "passed": snapshot.get("abc_xyz_invalid_classes", 0) == 0,
+            "observed": snapshot.get("abc_xyz_invalid_classes", 0),
+            "expected": "0 invalid ABC/XYZ classes",
+        },
+        {
+            "name": "abc_xyz_finite_values",
+            "passed": snapshot.get("abc_xyz_non_finite", 0) == 0,
+            "observed": snapshot.get("abc_xyz_non_finite", 0),
+            "expected": "0 NaN/Inf numeric cells",
+        },
+        {
+            "name": "forecasts_finite_and_bounded",
+            "passed": snapshot.get("forecasts_bad_rows", 0) == 0 and snapshot.get("forecasts_count", 0) > 0,
+            "observed": snapshot.get("forecasts_bad_rows", 0),
+            "expected": "0 negative/NaN forecast rows & > 0 total",
+        },
+        {
+            "name": "basket_rules_valid_bounds",
+            "passed": snapshot.get("basket_bad_rows", 0) == 0,
+            "observed": snapshot.get("basket_bad_rows", 0),
+            "expected": "support/conf in [0,1], lift > 0",
+        },
+        {
+            "name": "lp_anomalies_valid_risk",
+            "passed": snapshot.get("lp_bad_rows", 0) == 0,
+            "observed": snapshot.get("lp_bad_rows", 0),
+            "expected": "0 invalid risk levels or NaN z-scores",
+        },
+        {
+            "name": "supplier_scorecards_valid_grades",
+            "passed": snapshot.get("supplier_bad_rows", 0) == 0 and snapshot.get("supplier_count", 0) > 0,
+            "observed": snapshot.get("supplier_bad_rows", 0),
+            "expected": "grade in A..D & OTIF in [0,100]",
+        },
+        {
+            "name": "phantom_stock_valid_prob",
+            "passed": snapshot.get("phantom_bad_rows", 0) == 0,
+            "observed": snapshot.get("phantom_bad_rows", 0),
+            "expected": "phantom_prob in [0,1] finite",
+        },
+        {
+            "name": "dynamic_markdowns_non_negative_recovery",
+            "passed": snapshot.get("markdown_bad_rows", 0) == 0,
+            "observed": snapshot.get("markdown_bad_rows", 0),
+            "expected": "expected_recovery_cents >= 0 & discount_bp in [0,9500]",
+        },
+        {
+            "name": "promo_roi_valid_verdicts",
+            "passed": snapshot.get("promo_roi_bad_rows", 0) == 0,
+            "observed": snapshot.get("promo_roi_bad_rows", 0),
+            "expected": "valid verdicts & finite velocity lift",
+        },
+        {
+            "name": "shift_diagnostics_fresh",
+            "passed": snapshot.get("shift_diag_count", 0) >= 1,
+            "observed": snapshot.get("shift_diag_count", 0),
+            "expected": ">= 1 diagnostics snapshot",
+        },
+        {
+            "name": "inventory_batches_non_negative",
+            "passed": snapshot.get("negative_batches", 0) == 0,
+            "observed": snapshot.get("negative_batches", 0),
+            "expected": "0 negative FEFO batches",
+        },
+    ]
+    all_passed = all(bool(c["passed"]) for c in checks)
+    return all_passed, checks
+
+
+def validate_pipeline_data_quality(conn: psycopg.Connection) -> tuple[bool, list[dict[str, object]]]:
+    t0 = time.perf_counter()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              (SELECT COUNT(*)::int FROM analytics_abc_xyz),
+              (SELECT COUNT(*)::int FROM analytics_abc_xyz
+                WHERE abc_class NOT IN ('A','B','C') OR xyz_class NOT IN ('X','Y','Z')),
+              (SELECT COUNT(*)::int FROM analytics_abc_xyz
+                WHERE demand_cv = 'NaN'::float8 OR demand_cv = 'Infinity'::float8 OR demand_cv = '-Infinity'::float8
+                   OR gmroii = 'NaN'::float8 OR days_of_stock = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_demand_forecasts),
+              (SELECT COUNT(*)::int FROM analytics_demand_forecasts
+                WHERE forecast_14d_units < 0
+                   OR wmape_pct < 0 OR wmape_pct = 'NaN'::float8 OR wmape_pct = 'Infinity'::float8
+                   OR safety_stock_units < 0),
+              (SELECT COUNT(*)::int FROM analytics_basket_rules
+                WHERE support < 0 OR support > 1 OR support = 'NaN'::float8
+                   OR confidence < 0 OR confidence > 1 OR confidence = 'NaN'::float8
+                   OR lift <= 0 OR lift = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_lp_anomalies
+                WHERE risk_level NOT IN ('normal','watch','high')
+                   OR z_score = 'NaN'::float8 OR z_score = 'Infinity'::float8),
+              (SELECT COUNT(*)::int FROM analytics_supplier_scorecards),
+              (SELECT COUNT(*)::int FROM analytics_supplier_scorecards
+                WHERE grade NOT IN ('A','B','C','D')
+                   OR otif_rate_pct < 0 OR otif_rate_pct > 100 OR otif_rate_pct = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_phantom_stock
+                WHERE phantom_prob < 0 OR phantom_prob > 1 OR phantom_prob = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_dynamic_markdowns
+                WHERE expected_recovery_cents < 0
+                   OR recommended_discount_bp < 0 OR recommended_discount_bp > 9500),
+              (SELECT COUNT(*)::int FROM analytics_promo_roi
+                WHERE verdict NOT IN ('profit_accretive','margin_neutral','margin_dilutive','insufficient_data')
+                   OR velocity_lift_pct = 'NaN'::float8 OR velocity_lift_pct = 'Infinity'::float8),
+              (SELECT COUNT(*)::int FROM analytics_shift_diagnostics),
+              (SELECT COUNT(*)::int FROM inventory_batches WHERE qty_remaining < 0)
+        """)
+        r = cur.fetchone()
+    assert r is not None
+    snapshot = {
+        "abc_xyz_count": int(r[0]),
+        "abc_xyz_invalid_classes": int(r[1]),
+        "abc_xyz_non_finite": int(r[2]),
+        "forecasts_count": int(r[3]),
+        "forecasts_bad_rows": int(r[4]),
+        "basket_bad_rows": int(r[5]),
+        "lp_bad_rows": int(r[6]),
+        "supplier_count": int(r[7]),
+        "supplier_bad_rows": int(r[8]),
+        "phantom_bad_rows": int(r[9]),
+        "markdown_bad_rows": int(r[10]),
+        "promo_roi_bad_rows": int(r[11]),
+        "shift_diag_count": int(r[12]),
+        "negative_batches": int(r[13]),
+    }
+    dq_passed, checks = evaluate_data_quality_contracts(snapshot)
+    log_event(
+        "data_quality_contracts",
+        dq_passed=dq_passed,
+        passed_count=sum(1 for c in checks if c["passed"]),
+        total_checks=len(checks),
+        elapsed_s=round(time.perf_counter() - t0, 2),
+    )
+    return dq_passed, checks
+
+
 def main() -> None:
+    started_at = datetime.now(timezone.utc)
+    t_total = time.perf_counter()
+    stages: list[dict[str, object]] = []
     log_event("pipeline_start", database_configured=bool(DATABASE_URL))
+
+    def _run_stage(name: str, fn):
+        st = time.perf_counter()
+        out = fn()
+        stages.append({"stage": name, "elapsed_s": round(time.perf_counter() - st, 3)})
+        return out
+
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.transaction():
-            supplier_std_map = run_supplier_scorecards(conn)
-            run_abc_xyz_and_forecasts(conn, supplier_std_map)
-            run_market_basket(conn)
-            run_loss_prevention_anomalies(conn)
-            run_shift_diagnostics(conn)
-            run_phantom_and_markdowns(conn)
-            run_loyalty_staffing_and_tasks(conn)
-    log_event("pipeline_complete", status="ok")
+            supplier_std_map = _run_stage("supplier_scorecards", lambda: run_supplier_scorecards(conn))
+            _run_stage("abc_xyz_and_forecasts", lambda: run_abc_xyz_and_forecasts(conn, supplier_std_map))
+            _run_stage("market_basket", lambda: run_market_basket(conn))
+            _run_stage("loss_prevention_anomalies", lambda: run_loss_prevention_anomalies(conn))
+            _run_stage("shift_diagnostics", lambda: run_shift_diagnostics(conn))
+            _run_stage("phantom_and_markdowns", lambda: run_phantom_and_markdowns(conn))
+            _run_stage("loyalty_staffing_and_tasks", lambda: run_loyalty_staffing_and_tasks(conn))
+            _run_stage("promo_roi_attribution", lambda: run_promo_roi_attribution(conn))
+            dq_passed, dq_checks = _run_stage(
+                "data_quality_contracts", lambda: validate_pipeline_data_quality(conn)
+            )
+            finished_at = datetime.now(timezone.utc)
+            elapsed_total = round(time.perf_counter() - t_total, 3)
+            run_status = "ok" if dq_passed else "dq_failed"
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO analytics_pipeline_runs (
+                      started_at, finished_at, elapsed_sec, status, stages_json, dq_passed, dq_checks_json
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s::jsonb)
+                    """,
+                    (
+                        started_at,
+                        finished_at,
+                        elapsed_total,
+                        run_status,
+                        safe_json_dumps(stages),
+                        dq_passed,
+                        safe_json_dumps(dq_checks),
+                    ),
+                )
+                # Keep latest 50 telemetry records bounded for idempotency
+                cur.execute("""
+                    DELETE FROM analytics_pipeline_runs
+                    WHERE id NOT IN (
+                      SELECT id FROM analytics_pipeline_runs
+                      ORDER BY finished_at DESC
+                      LIMIT 50
+                    )
+                """)
+
+    log_event(
+        "pipeline_complete",
+        status="ok" if dq_passed else "dq_failed",
+        dq_passed=dq_passed,
+        elapsed_s=elapsed_total,
+    )
+    if not dq_passed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+

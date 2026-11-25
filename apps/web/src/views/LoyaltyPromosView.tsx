@@ -70,6 +70,21 @@ interface PromoRow {
   rulesJson: Record<string, unknown>;
 }
 
+interface PromoRoiRow {
+  promotionId: string;
+  promotionName: string;
+  promoType: string;
+  discountedUnits60d: number;
+  discountedRevenueCents: number;
+  discountGivenCents: number;
+  baselineDailyUnits: number;
+  promoDailyUnits: number;
+  velocityLiftPct: number;
+  netMarginBp: number;
+  estimatedProfitDeltaCents: number;
+  verdict: "profit_accretive" | "margin_neutral" | "margin_dilutive" | "insufficient_data";
+}
+
 type LoyaltySubTab = "customers" | "coupons" | "promotions";
 
 function rfmBadgeClass(seg: string): string {
@@ -94,6 +109,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
   const [couponFilter, setCouponFilter] = useState("all");
 
   const [promos, setPromos] = useState<PromoRow[]>([]);
+  const [promoRoi, setPromoRoi] = useState<PromoRoiRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -131,7 +147,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       if (segFilter !== "all") custQs.set("segment", segFilter);
       const cpQs = couponFilter !== "all" ? `?status=${encodeURIComponent(couponFilter)}` : "";
 
-      const [cRes, cpRes, pRes] = await Promise.all([
+      const [cRes, cpRes, pRes, roiRes] = await Promise.all([
         apiGet<{ summary: CustomerSummary; customers: CustomerRow[] }>(
           `/api/loyalty/customers${custQs.toString() ? `?${custQs.toString()}` : ""}`,
           signal
@@ -141,6 +157,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
           signal
         ),
         apiGet<{ promotions: PromoRow[] }>("/api/promotions", signal),
+        apiGet<{ items: PromoRoiRow[] }>("/api/analytics/promo-roi", signal).catch(() => ({
+          items: [],
+        })),
       ]);
       if (signal?.aborted) return;
       setCustomers(cRes.customers);
@@ -148,6 +167,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       setCoupons(cpRes.coupons);
       setCouponSummary(cpRes.summary);
       setPromos(pRes.promotions);
+      setPromoRoi(roiRes.items);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
         setErrorMsg(err instanceof Error ? err.message : "Failed loading loyalty & promotions");
@@ -718,7 +738,8 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
 
       {/* 3. Promotions Tab */}
       {subTab === "promotions" && (
-        <div className="grid-asymmetric">
+        <>
+          <div className="grid-asymmetric">
           <section className="panel">
             <div className="panel-header">
               <div>
@@ -896,7 +917,94 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
               </div>
             </section>
           )}
-        </div>
+          </div>
+
+          <section id="promo-roi-panel" className="panel" style={{ marginTop: 18 }}>
+            <div className="panel-header">
+              <div>
+                <h2 className="panel-title">
+                  Promotion ROI &amp; Margin Attribution (60-Day Python Analytics)
+                </h2>
+                <p className="panel-desc">
+                  Measures incremental daily unit velocity lift vs. regular-price baseline and evaluates whether each campaign is profit-accretive or margin-dilutive.
+                </p>
+              </div>
+            </div>
+            {promoRoi.length === 0 ? (
+              <div className="banner banner-amber">
+                No promotion ROI rows computed yet — run the Python analytics worker to populate.
+              </div>
+            ) : (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Promotion</th>
+                      <th className="text-right">Promo Units</th>
+                      <th className="text-right">Base → Promo /Day</th>
+                      <th className="text-right">Velocity Lift</th>
+                      <th className="text-right">Discount Given</th>
+                      <th className="text-right">Net Margin</th>
+                      <th className="text-right">Est. Profit Δ</th>
+                      <th>Verdict</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {promoRoi.map((r) => (
+                      <tr key={r.promotionId}>
+                        <td>
+                          <div style={{ fontWeight: 600 }}>{r.promotionName}</div>
+                          <div className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                            {r.promoType}
+                          </div>
+                        </td>
+                        <td className="text-right mono">{r.discountedUnits60d}</td>
+                        <td className="text-right mono">
+                          {r.baselineDailyUnits.toFixed(1)} → {r.promoDailyUnits.toFixed(1)}
+                        </td>
+                        <td className="text-right mono">
+                          {r.velocityLiftPct > 0 ? `+${r.velocityLiftPct}%` : `${r.velocityLiftPct}%`}
+                        </td>
+                        <td className="text-right mono">{formatMoney(r.discountGivenCents)}</td>
+                        <td className="text-right mono">{formatBp(r.netMarginBp)}</td>
+                        <td
+                          className="text-right mono"
+                          style={{
+                            fontWeight: 700,
+                            color:
+                              r.estimatedProfitDeltaCents > 0
+                                ? "var(--accent-primary)"
+                                : r.estimatedProfitDeltaCents < 0
+                                  ? "var(--accent-crimson)"
+                                  : undefined,
+                          }}
+                        >
+                          {r.estimatedProfitDeltaCents >= 0 ? "+" : ""}
+                          {formatMoney(r.estimatedProfitDeltaCents)}
+                        </td>
+                        <td>
+                          <span
+                            className={`tag mono ${
+                              r.verdict === "profit_accretive"
+                                ? "tag-green"
+                                : r.verdict === "margin_dilutive"
+                                  ? "tag-red"
+                                  : r.verdict === "margin_neutral"
+                                    ? "tag-amber"
+                                    : "tag-neutral"
+                            }`}
+                          >
+                            {r.verdict}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </>
       )}
     </div>
   );

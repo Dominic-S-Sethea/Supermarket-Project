@@ -13,6 +13,7 @@ export interface SessionUser {
 const DEMO_PERSONAS: { label: string; role: string; username: string; pin: string }[] = [
   { label: "Owner", role: "Full Access + AI", username: "owner", pin: "1111" },
   { label: "Store Manager", role: "GRN, POs & AI", username: "manager", pin: "9999" },
+  { label: "Accountant", role: "Audit, Z-Reports & Exports", username: "accountant", pin: "4444" },
   { label: "Cashier (Lane 01)", role: "POS & Shifts", username: "cashier1", pin: "1234" },
   { label: "Stock Clerk", role: "FEFO & Counts", username: "clerk1", pin: "2222" },
 ];

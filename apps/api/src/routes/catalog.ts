@@ -26,12 +26,19 @@ import {
   taxRates,
   users,
 } from "../db/index.js";
+import { env } from "../config/env.js";
 import { buildZplBarcodeCommand, parseCsvRows, sanitizeZpl } from "../lib/helpers.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
+import { createRateLimiter } from "../plugins/security.js";
 
 const UuidSchema = z.string().uuid();
 
 export async function catalogRoutes(app: FastifyInstance) {
+  const importLimiter = createRateLimiter({
+    keyPrefix: "csv_import",
+    windowMs: 60_000,
+    max: env.isTest ? 200 : 12,
+  });
   // Metadata bootstrap for dropdowns, promos, and filters
   app.get("/api/meta", { preHandler: [requireAuth] }, async (req) => {
     const [depts, cats, taxes, sups, promos, staff] = await Promise.all([
@@ -219,67 +226,58 @@ export async function catalogRoutes(app: FastifyInstance) {
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 
-    const [{ total }] = await db
-      .select({ total: sql<number>`count(*)::int` })
-      .from(products)
-      .where(whereClause);
-
-    const unfoldedSq = db
-      .select({
-        productId: stockMovements.productId,
-        delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`.as("unfolded_delta"),
-      })
-      .from(stockMovements)
-      .where(eq(stockMovements.folded, false))
-      .groupBy(stockMovements.productId)
-      .as("unfolded_sq");
-
-    const rows = await db
-      .select({
-        id: products.id,
-        sku: products.sku,
-        name: products.name,
-        brand: products.brand,
-        sizeLabel: products.sizeLabel,
-        categoryId: products.categoryId,
-        categoryName: categories.name,
-        departmentId: departments.id,
-        departmentName: departments.name,
-        taxRateId: products.taxRateId,
-        taxRateBp: taxRates.rateBp,
-        taxInclusive: taxRates.isInclusive,
-        baseUnitLabel: products.baseUnitLabel,
-        avgCostCents: products.avgCostCents,
-        minMarginBp: products.minMarginBp,
-        requiresAgeCheck: products.requiresAgeCheck,
-        trackExpiry: products.trackExpiry,
-        expiryAlertDays: products.expiryAlertDays,
-        aisleLocation: products.aisleLocation,
-        active: products.active,
-        onHandUnits: sql<number>`(coalesce(${stockBaselines.quantity}, 0) + coalesce(${unfoldedSq.delta}, 0))::int`,
-        abcClass: analyticsAbcXyz.abcClass,
-        xyzClass: analyticsAbcXyz.xyzClass,
-        segment: analyticsAbcXyz.segment,
-        units60d: analyticsAbcXyz.units60d,
-      })
-      .from(products)
-      .innerJoin(categories, eq(products.categoryId, categories.id))
-      .innerJoin(departments, eq(categories.departmentId, departments.id))
-      .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
-      .leftJoin(stockBaselines, eq(products.id, stockBaselines.productId))
-      .leftJoin(unfoldedSq, eq(products.id, unfoldedSq.productId))
-      .leftJoin(analyticsAbcXyz, eq(products.id, analyticsAbcXyz.productId))
-      .where(whereClause)
-      .orderBy(asc(products.sku))
-      .limit(pageSize)
-      .offset(offset);
+    const [countRows, rows] = await Promise.all([
+      db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(products)
+        .where(whereClause),
+      db
+        .select({
+          id: products.id,
+          sku: products.sku,
+          name: products.name,
+          brand: products.brand,
+          sizeLabel: products.sizeLabel,
+          categoryId: products.categoryId,
+          categoryName: categories.name,
+          departmentId: departments.id,
+          departmentName: departments.name,
+          taxRateId: products.taxRateId,
+          taxRateBp: taxRates.rateBp,
+          taxInclusive: taxRates.isInclusive,
+          baseUnitLabel: products.baseUnitLabel,
+          avgCostCents: products.avgCostCents,
+          minMarginBp: products.minMarginBp,
+          requiresAgeCheck: products.requiresAgeCheck,
+          trackExpiry: products.trackExpiry,
+          expiryAlertDays: products.expiryAlertDays,
+          aisleLocation: products.aisleLocation,
+          active: products.active,
+          baselineQty: sql<number>`coalesce(${stockBaselines.quantity}, 0)::int`,
+          abcClass: analyticsAbcXyz.abcClass,
+          xyzClass: analyticsAbcXyz.xyzClass,
+          segment: analyticsAbcXyz.segment,
+          units60d: analyticsAbcXyz.units60d,
+        })
+        .from(products)
+        .innerJoin(categories, eq(products.categoryId, categories.id))
+        .innerJoin(departments, eq(categories.departmentId, departments.id))
+        .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
+        .leftJoin(stockBaselines, eq(products.id, stockBaselines.productId))
+        .leftJoin(analyticsAbcXyz, eq(products.id, analyticsAbcXyz.productId))
+        .where(whereClause)
+        .orderBy(asc(products.sku))
+        .limit(pageSize)
+        .offset(offset),
+    ]);
+    const total = countRows[0]?.total ?? 0;
 
     if (rows.length === 0) {
       return { items: [], total, page, pageSize };
     }
 
     const pIds = rows.map((r) => r.id);
-    const [bcs, nextBatches] = await Promise.all([
+    const [bcs, nextBatches, unfoldedRows] = await Promise.all([
       db
         .select()
         .from(productBarcodes)
@@ -298,6 +296,19 @@ export async function catalogRoutes(app: FastifyInstance) {
           )
         )
         .groupBy(inventoryBatches.productId),
+      db
+        .select({
+          productId: stockMovements.productId,
+          delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
+        })
+        .from(stockMovements)
+        .where(
+          and(
+            eq(stockMovements.folded, false),
+            inArray(stockMovements.productId, pIds)
+          )
+        )
+        .groupBy(stockMovements.productId),
     ]);
 
     const bcMap = new Map<string, (typeof bcs)[number][]>();
@@ -307,20 +318,24 @@ export async function catalogRoutes(app: FastifyInstance) {
       bcMap.set(bc.productId, list);
     }
     const expiryMap = new Map(nextBatches.map((b) => [b.productId, b.earliestExpiry]));
+    const unfoldedMap = new Map(unfoldedRows.map((u) => [u.productId, Number(u.delta ?? 0)]));
 
     const items = rows.map((r) => {
       const barcodes = bcMap.get(r.id) ?? [];
       const primaryBc = barcodes.find((b) => b.isPrimary) ?? barcodes[0];
       const primarySell = primaryBc?.sellPriceCents ?? 0;
       const primaryPackQty = primaryBc?.packQty ?? 1;
+      const onHandUnits = Number(r.baselineQty ?? 0) + (unfoldedMap.get(r.id) ?? 0);
       const marginBp = computeNetMarginBp(
         primarySell,
         r.avgCostCents * primaryPackQty,
         r.taxRateBp,
         r.taxInclusive
       );
+      const { baselineQty: _baselineQty, ...rest } = r;
       return {
-        ...r,
+        ...rest,
+        onHandUnits,
         primaryBarcode: primaryBc?.barcode ?? "",
         primarySellPriceCents: primarySell,
         marginBp,
@@ -336,15 +351,6 @@ export async function catalogRoutes(app: FastifyInstance) {
   app.get("/api/products/scan/:barcode", { preHandler: [requireAuth] }, async (req, reply) => {
     const { barcode } = req.params as { barcode: string };
     const clean = barcode.trim();
-    const unfoldedSq = db
-      .select({
-        productId: stockMovements.productId,
-        delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`.as("unfolded_delta"),
-      })
-      .from(stockMovements)
-      .where(eq(stockMovements.folded, false))
-      .groupBy(stockMovements.productId)
-      .as("unfolded_sq");
 
     const [found] = await db
       .select({
@@ -363,13 +369,19 @@ export async function catalogRoutes(app: FastifyInstance) {
         requiresAgeCheck: products.requiresAgeCheck,
         taxRateBp: taxRates.rateBp,
         taxInclusive: taxRates.isInclusive,
-        onHandUnits: sql<number>`(coalesce(${stockBaselines.quantity}, 0) + coalesce(${unfoldedSq.delta}, 0))::int`,
+        onHandUnits: sql<number>`(
+          coalesce(${stockBaselines.quantity}, 0) +
+          coalesce((
+            SELECT sum(sm.qty_delta)::int
+            FROM stock_movements sm
+            WHERE sm.folded = false AND sm.product_id = ${products.id}
+          ), 0)
+        )::int`,
       })
       .from(productBarcodes)
       .innerJoin(products, eq(productBarcodes.productId, products.id))
       .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
       .leftJoin(stockBaselines, eq(products.id, stockBaselines.productId))
-      .leftJoin(unfoldedSq, eq(products.id, unfoldedSq.productId))
       .where(eq(productBarcodes.barcode, clean))
       .limit(1);
 
@@ -596,7 +608,7 @@ export async function catalogRoutes(app: FastifyInstance) {
   // Bulk CSV Onboarding Preview & Validation (RFC-4180 parser + GS1 check digits + net margin)
   app.post(
     "/api/import/preview",
-    { preHandler: [requireRole(["owner", "manager"])] },
+    { preHandler: [requireRole(["owner", "manager"]), importLimiter] },
     async (req, reply) => {
       const schema = z.object({
         csvText: z.string().min(1).max(5_000_000),
@@ -697,7 +709,7 @@ export async function catalogRoutes(app: FastifyInstance) {
   // Commit validated CSV import rows into PostgreSQL (re-validates GS1 + margin server-side)
   app.post(
     "/api/import/commit",
-    { preHandler: [requireRole(["owner", "manager"])] },
+    { preHandler: [requireRole(["owner", "manager"]), importLimiter] },
     async (req, reply) => {
       const schema = z.object({
         rows: z.array(

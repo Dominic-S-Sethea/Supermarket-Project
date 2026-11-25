@@ -1,0 +1,41 @@
+name: Security, Supply Chain & Container Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * 1"
+
+jobs:
+  dependency-audit:
+    name: Dependency & Rust Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Check high/critical npm advisories
+        run: pnpm audit --audit-level=high || true
+      - name: Rust Clippy (-D warnings) & ESC/POS unit tests
+        run: |
+          cargo clippy --manifest-path apps/pos/src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path apps/pos/src-tauri/Cargo.toml
+
+  docker-build-verify:
+    name: Production Multi-Stage Docker Builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API production image
+        run: docker build -f infra/Dockerfile.api -t supermarket-os-api:ci .
+      - name: Build Web (Nginx) production image
+        run: docker build -f infra/Dockerfile.web -t supermarket-os-web:ci .
+      - name: Build Python Analytics worker image
+        run: docker build -f infra/Dockerfile.analytics -t supermarket-os-analytics:ci .

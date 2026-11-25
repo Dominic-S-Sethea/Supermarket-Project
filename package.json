@@ -8,11 +8,14 @@
     "build": "pnpm --filter @supermarket/shared build && pnpm -r --if-present build",
     "test": "pnpm --filter @supermarket/shared build && pnpm -r --if-present test",
     "test:e2e": "playwright test",
+    "test:stress": "node scripts/stress-test.mjs",
     "typecheck": "pnpm --filter @supermarket/shared build && pnpm -r --if-present typecheck",
     "db:up": "docker compose -f infra/docker-compose.yml up -d postgres",
     "db:down": "docker compose -f infra/docker-compose.yml down",
     "db:push": "pnpm --filter @supermarket/api db:push",
     "db:seed": "pnpm --filter @supermarket/shared build && pnpm --filter @supermarket/api db:seed",
+    "db:backup-verify": "bash scripts/db-backup-verify.sh",
+    "docker:smoke": "bash scripts/docker-smoke.sh",
     "analytics:run": "uv --directory services/analytics run python run_all.py"
   },
   "devDependencies": {
