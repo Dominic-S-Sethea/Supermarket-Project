@@ -8,6 +8,7 @@
     "build": "pnpm --filter @supermarket/shared build && pnpm -r --if-present build",
     "test": "pnpm --filter @supermarket/shared build && pnpm -r --if-present test",
     "test:e2e": "playwright test",
+    "test:stress": "node scripts/stress-test.mjs",
     "typecheck": "pnpm --filter @supermarket/shared build && pnpm -r --if-present typecheck",
     "db:up": "docker compose -f infra/docker-compose.yml up -d postgres",
     "db:down": "docker compose -f infra/docker-compose.yml down",
