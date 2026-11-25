@@ -7,6 +7,7 @@
     "dev:web": "pnpm --filter @supermarket/web dev",
     "build": "pnpm --filter @supermarket/shared build && pnpm -r --if-present build",
     "test": "pnpm --filter @supermarket/shared build && pnpm -r --if-present test",
+    "test:e2e": "playwright test",
     "typecheck": "pnpm --filter @supermarket/shared build && pnpm -r --if-present typecheck",
     "db:up": "docker compose -f infra/docker-compose.yml up -d postgres",
     "db:down": "docker compose -f infra/docker-compose.yml down",
@@ -15,6 +16,7 @@
     "analytics:run": "uv --directory services/analytics run python run_all.py"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "turbo": "^2.4.0",
     "typescript": "^5.8.2"
   }

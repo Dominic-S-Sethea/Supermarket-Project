@@ -1,0 +1,93 @@
+name: SupermarketOS CI
+
+on:
+  push:
+    branches: [main, "overnight/**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fullstack-verify:
+    name: Full-Stack Build, Unit/Integration, Analytics, Rust & Playwright E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: supermarket
+          POSTGRES_PASSWORD: supermarket_dev_password
+          POSTGRES_DB: supermarket_os
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U supermarket -d supermarket_os"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+
+    env:
+      DATABASE_URL: postgres://supermarket:supermarket_dev_password@localhost:5433/supermarket_os
+      AUTH_SECRET: ci-test-auth-secret-minimum-thirty-two-characters-long
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup uv (Python 3.12)
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Node workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Push schema, seed 3,120-SKU catalog & verify analytics idempotency (2x)
+        run: |
+          pnpm db:push
+          pnpm db:seed
+          pnpm analytics:run
+          pnpm analytics:run
+
+      - name: TypeScript typecheck & production build
+        run: |
+          pnpm typecheck
+          pnpm build
+
+      - name: Run shared, web & API integration tests
+        run: pnpm test
+
+      - name: Run Python analytics pytest suite
+        run: uv --directory services/analytics run pytest -v
+
+      - name: Run Rust ESC/POS unit tests
+        run: cargo test --manifest-path apps/pos/src-tauri/Cargo.toml
+
+      - name: Install Playwright Chromium & run headless E2E suite
+        run: |
+          npx playwright install --with-deps chromium
+          pnpm test:e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
