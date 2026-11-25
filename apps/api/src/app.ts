@@ -9,6 +9,7 @@ import { analyticsRoutes } from "./routes/analytics.js";
 import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { inventoryRoutes } from "./routes/inventory.js";
+import { operationsRoutes } from "./routes/operations.js";
 import { posRoutes } from "./routes/pos.js";
 
 declare module "fastify" {
@@ -98,6 +99,7 @@ export async function buildApp(logger = true) {
   await app.register(catalogRoutes);
   await app.register(posRoutes);
   await app.register(inventoryRoutes);
+  await app.register(operationsRoutes);
   await app.register(analyticsRoutes);
   await app.register(aiRoutes);
 

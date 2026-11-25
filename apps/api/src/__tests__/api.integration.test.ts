@@ -7,6 +7,8 @@ import {
   aiBriefings,
   aiConversations,
   aiProposedActions,
+  analyticsDynamicMarkdowns,
+  analyticsPhantomStock,
   auditLogs,
   db,
   goodsReceipts,
@@ -18,6 +20,7 @@ import {
   posShifts,
   productBarcodes,
   products,
+  promotions,
   purchaseOrderLines,
   purchaseOrders,
   sales,
@@ -1145,5 +1148,140 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnBody.grnId));
     await db.delete(purchaseOrders).where(eq(purchaseOrders.id, po.id));
     await db.update(products).set({ avgCostCents: origAvgCost }).where(eq(products.id, prod.id));
+  });
+
+  it("Milestone 2: supports Phantom Stock verification, Dynamic Markdown application (promo + tag), and 07:30 Shelf Tag ZPL print queue with RBAC", async () => {
+    const clerkLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "clerk1", pin: "2222" },
+    });
+    expect(clerkLogin.statusCode).toBe(200);
+    const clerkToken = (clerkLogin.json() as { token: string }).token;
+
+    // 1. Phantom stock listing: cashier blocked, clerk allowed
+    const cashierPh = await app.inject({
+      method: "GET",
+      url: "/api/inventory/phantom-stock",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierPh.statusCode).toBe(403);
+
+    const phRes = await app.inject({
+      method: "GET",
+      url: "/api/inventory/phantom-stock",
+      headers: authHeaders(clerkToken),
+    });
+    expect(phRes.statusCode).toBe(200);
+    const phBody = phRes.json() as {
+      summary: { totalFlagged: number };
+      items: {
+        productId: string;
+        status: string;
+        bookStockUnits: number;
+        estimatedValueAtRiskCents: number;
+      }[];
+    };
+    expect(phBody.summary.totalFlagged).toBeGreaterThan(0);
+    const samplePh = phBody.items[0];
+
+    // Clerk verifies phantom stock OK (non-destructive check, restored right after)
+    const verifyRes = await app.inject({
+      method: "POST",
+      url: `/api/inventory/phantom-stock/${samplePh.productId}/verify`,
+      headers: authHeaders(clerkToken),
+      payload: { markVerifiedOk: true, note: "Integration test shelf spot-check" },
+    });
+    expect(verifyRes.statusCode).toBe(200);
+    expect(verifyRes.json().status).toBe("verified_ok");
+
+    // Restore original phantom row state
+    await db
+      .update(analyticsPhantomStock)
+      .set({
+        status: samplePh.status,
+        bookStockUnits: samplePh.bookStockUnits,
+        estimatedValueAtRiskCents: samplePh.estimatedValueAtRiskCents,
+      })
+      .where(eq(analyticsPhantomStock.productId, samplePh.productId));
+
+    // 2. Dynamic markdowns: clerk can view, clerk CANNOT apply (403), owner CAN apply (201)
+    const mdRes = await app.inject({
+      method: "GET",
+      url: "/api/inventory/dynamic-markdowns",
+      headers: authHeaders(clerkToken),
+    });
+    expect(mdRes.statusCode).toBe(200);
+    const mdBody = mdRes.json() as {
+      items: { batchId: string; recommendedDiscountBp: number; status: string }[];
+    };
+    expect(mdBody.items.length).toBeGreaterThan(0);
+    const sampleMd = mdBody.items[0];
+    const [origBatch] = await db
+      .select({ status: inventoryBatches.status })
+      .from(inventoryBatches)
+      .where(eq(inventoryBatches.id, sampleMd.batchId));
+
+    const clerkApply = await app.inject({
+      method: "POST",
+      url: `/api/inventory/dynamic-markdowns/${sampleMd.batchId}/apply`,
+      headers: authHeaders(clerkToken),
+      payload: { discountBp: sampleMd.recommendedDiscountBp },
+    });
+    expect(clerkApply.statusCode).toBe(403);
+
+    const ownerApply = await app.inject({
+      method: "POST",
+      url: `/api/inventory/dynamic-markdowns/${sampleMd.batchId}/apply`,
+      headers: authHeaders(),
+      payload: { discountBp: sampleMd.recommendedDiscountBp, minMarginGuardBp: 0 },
+    });
+    expect(ownerApply.statusCode).toBe(201);
+    const applied = ownerApply.json() as {
+      promotionId: string;
+      shelfTagId: string | null;
+      status: string;
+    };
+    expect(applied.status).toBe("applied");
+    expect(applied.shelfTagId).toBeTruthy();
+
+    // 3. 07:30 Shelf Tag Queue: clerk lists pending & prints the newly queued clearance tag -> ZPL
+    const queueRes = await app.inject({
+      method: "GET",
+      url: "/api/labels/queue?status=pending",
+      headers: authHeaders(clerkToken),
+    });
+    expect(queueRes.statusCode).toBe(200);
+    const queuedTags = queueRes.json().tags as { id: string }[];
+    expect(queuedTags.some((t) => t.id === applied.shelfTagId)).toBe(true);
+
+    const printRes = await app.inject({
+      method: "POST",
+      url: "/api/labels/queue/print",
+      headers: authHeaders(clerkToken),
+      payload: { tagIds: [applied.shelfTagId] },
+    });
+    expect(printRes.statusCode).toBe(200);
+    const printed = printRes.json() as { printedCount: number; zpl: string };
+    expect(printed.printedCount).toBe(1);
+    expect(printed.zpl).toContain("^XA");
+    expect(printed.zpl).toContain("CLEARANCE");
+    expect(printed.zpl).toContain("^XZ");
+
+    // Cleanup M2 test mutations
+    if (applied.shelfTagId) {
+      await db.delete(shelfTagQueue).where(eq(shelfTagQueue.id, applied.shelfTagId));
+    }
+    await db.delete(promotions).where(eq(promotions.id, applied.promotionId));
+    await db
+      .update(analyticsDynamicMarkdowns)
+      .set({ status: sampleMd.status })
+      .where(eq(analyticsDynamicMarkdowns.batchId, sampleMd.batchId));
+    if (origBatch) {
+      await db
+        .update(inventoryBatches)
+        .set({ status: origBatch.status })
+        .where(eq(inventoryBatches.id, sampleMd.batchId));
+    }
   });
 });

@@ -5,8 +5,9 @@ import {
   formatMoney,
   type UserRole,
 } from "@supermarket/shared";
-import { AlertTriangle, Award, Check, FileUp, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Award, Check, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { ShelfIntegrityTab } from "../components/ShelfIntegrityTab";
 import { SupplierMatchTab } from "../components/SupplierMatchTab";
 
 interface MarginAlert {
@@ -83,7 +84,7 @@ interface ParsedInvoiceResponse {
   };
 }
 
-type OpsSubTab = "receiving" | "suppliers";
+type OpsSubTab = "receiving" | "shelf" | "suppliers";
 
 export function OperationsView({
   suppliers,
@@ -389,17 +390,26 @@ export function OperationsView({
               : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."}
           </p>
         </div>
-        {canManage && (
-          <div className="subtab-bar" role="tablist">
-            <button
-              id="ops-subtab-receiving"
-              role="tab"
-              aria-selected={subTab === "receiving"}
-              className={`subtab-btn ${subTab === "receiving" ? "active" : ""}`}
-              onClick={() => setSubTab("receiving")}
-            >
-              <PackageCheck size={14} /> Receiving &amp; FEFO
-            </button>
+        <div className="subtab-bar" role="tablist">
+          <button
+            id="ops-subtab-receiving"
+            role="tab"
+            aria-selected={subTab === "receiving"}
+            className={`subtab-btn ${subTab === "receiving" ? "active" : ""}`}
+            onClick={() => setSubTab("receiving")}
+          >
+            <PackageCheck size={14} /> Receiving &amp; FEFO
+          </button>
+          <button
+            id="ops-subtab-shelf"
+            role="tab"
+            aria-selected={subTab === "shelf"}
+            className={`subtab-btn ${subTab === "shelf" ? "active" : ""}`}
+            onClick={() => setSubTab("shelf")}
+          >
+            <Ghost size={14} /> Shelf Integrity &amp; 07:30 Tags
+          </button>
+          {canManage && (
             <button
               id="ops-subtab-suppliers"
               role="tab"
@@ -409,14 +419,14 @@ export function OperationsView({
             >
               <Award size={14} /> Supplier OTIF &amp; 3-Way Match
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </header>
 
       {!canManage && (
         <div className="banner banner-amber" style={{ marginBottom: 14 }}>
           <span>
-            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring is enabled. GRN receiving, vendor margin price overrides, and batch write-offs require Store Manager or Owner approval.
+            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, phantom stock blind counts, and 07:30 shelf tag batch printing are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
           </span>
         </div>
       )}
@@ -445,6 +455,16 @@ export function OperationsView({
           onFeedback={(msg) => {
             setErrorMsg(null);
             setFeedback(msg);
+          }}
+          onError={(msg) => setErrorMsg(msg)}
+        />
+      ) : subTab === "shelf" ? (
+        <ShelfIntegrityTab
+          canManage={canManage}
+          onFeedback={(msg) => {
+            setErrorMsg(null);
+            setFeedback(msg);
+            onCountsChanged?.();
           }}
           onError={(msg) => setErrorMsg(msg)}
         />
