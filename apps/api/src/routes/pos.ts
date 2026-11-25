@@ -9,6 +9,7 @@ import {
   customers,
   db,
   inventoryBatches,
+  loyaltyLedger,
   posShifts,
   productBarcodes,
   products,
@@ -17,6 +18,7 @@ import {
   salePayments,
   sales,
   stockMovements,
+  targetedCoupons,
   taxRates,
 } from "../db/index.js";
 import { getPgErrorCode } from "../app.js";
@@ -221,6 +223,8 @@ export async function posRoutes(app: FastifyInstance) {
       const sign = payload.kind === "refund" || payload.kind === "void" ? 1 : -1;
       let duplicate = false;
       let alreadyVoided = false;
+      let couponRejection: { status: 400 | 409; message: string } | null = null;
+      let pointsEarned = 0;
 
       try {
         await db.transaction(async (tx) => {
@@ -249,6 +253,57 @@ export async function posRoutes(app: FastifyInstance) {
             }
           }
 
+          // Atomic single-use loyalty coupon validation & row lock (prevents concurrent double-redemption)
+          let lockedCouponId: string | null = null;
+          if (payload.kind === "sale" && payload.couponCode) {
+            const normalizedCode = payload.couponCode.trim().toUpperCase();
+            const [coupon] = await tx
+              .select()
+              .from(targetedCoupons)
+              .where(sql`upper(${targetedCoupons.code}) = ${normalizedCode}`)
+              .for("update");
+            if (!coupon) {
+              couponRejection = {
+                status: 400,
+                message: `Coupon code "${normalizedCode}" not found.`,
+              };
+              return;
+            }
+            if (coupon.redeemedSaleId) {
+              couponRejection = {
+                status: 409,
+                message: `Coupon code "${coupon.code}" has already been redeemed.`,
+              };
+              return;
+            }
+            const soldMs = new Date(payload.soldAt).getTime();
+            if (
+              soldMs < new Date(coupon.validFrom).getTime() ||
+              soldMs > new Date(coupon.validUntil).getTime()
+            ) {
+              couponRejection = {
+                status: 400,
+                message: `Coupon code "${coupon.code}" is expired or not yet valid.`,
+              };
+              return;
+            }
+            if (coupon.customerId && coupon.customerId !== payload.customerId) {
+              couponRejection = {
+                status: 400,
+                message: `Coupon code "${coupon.code}" is restricted to a different loyalty customer.`,
+              };
+              return;
+            }
+            if (subtotalCents < coupon.minBasketCents) {
+              couponRejection = {
+                status: 400,
+                message: `Basket subtotal (${subtotalCents}c) is below coupon minimum (${coupon.minBasketCents}c).`,
+              };
+              return;
+            }
+            lockedCouponId = coupon.id;
+          }
+
           const inserted = await tx
             .insert(sales)
             .values({
@@ -274,6 +329,16 @@ export async function posRoutes(app: FastifyInstance) {
           if (inserted.length === 0) {
             duplicate = true;
             return;
+          }
+
+          if (lockedCouponId) {
+            await tx
+              .update(targetedCoupons)
+              .set({
+                redeemedSaleId: payload.id,
+                redeemedAt: new Date(),
+              })
+              .where(eq(targetedCoupons.id, lockedCouponId));
           }
 
           await tx.insert(saleLines).values(
@@ -386,6 +451,55 @@ export async function posRoutes(app: FastifyInstance) {
           if (movementRows.length > 0) {
             await tx.insert(stockMovements).values(movementRows);
           }
+
+          // Customer loyalty points accrual (1 pt / $1) or refund/void clawback
+          if (payload.customerId) {
+            const [lockedCust] = await tx
+              .select()
+              .from(customers)
+              .where(eq(customers.id, payload.customerId))
+              .for("update");
+            if (lockedCust) {
+              const pts = Math.floor(totalCents / 100);
+              if (payload.kind === "sale") {
+                pointsEarned = pts;
+                await tx
+                  .update(customers)
+                  .set({
+                    pointsBalance: lockedCust.pointsBalance + pts,
+                    lifetimeSpendCents: lockedCust.lifetimeSpendCents + totalCents,
+                    visits60d: lockedCust.visits60d + 1,
+                    lastVisitAt: new Date(payload.soldAt),
+                  })
+                  .where(eq(customers.id, lockedCust.id));
+                if (pts > 0) {
+                  await tx.insert(loyaltyLedger).values({
+                    customerId: lockedCust.id,
+                    saleId: payload.id,
+                    pointsDelta: pts,
+                    reason: "earn",
+                  });
+                }
+              } else {
+                pointsEarned = -pts;
+                await tx
+                  .update(customers)
+                  .set({
+                    pointsBalance: Math.max(0, lockedCust.pointsBalance - pts),
+                    lifetimeSpendCents: Math.max(0, lockedCust.lifetimeSpendCents - totalCents),
+                  })
+                  .where(eq(customers.id, lockedCust.id));
+                if (pts > 0) {
+                  await tx.insert(loyaltyLedger).values({
+                    customerId: lockedCust.id,
+                    saleId: payload.id,
+                    pointsDelta: -pts,
+                    reason: "refund_clawback",
+                  });
+                }
+              }
+            }
+          }
         });
       } catch (err: unknown) {
         if (getPgErrorCode(err) === "23505") {
@@ -394,6 +508,11 @@ export async function posRoutes(app: FastifyInstance) {
           });
         }
         throw err;
+      }
+
+      if (couponRejection) {
+        const rej = couponRejection as { status: 400 | 409; message: string };
+        return reply.status(rej.status).send({ error: rej.message });
       }
 
       if (alreadyVoided) {
@@ -407,11 +526,12 @@ export async function posRoutes(app: FastifyInstance) {
         receiptNo: payload.receiptNo,
         duplicate,
         totalCents,
+        pointsEarned,
       });
     }
   );
 
-  // Recent POS receipts feed
+  // Recent POS receipts feed (enriched with lines, payments, and void status for POS Receipt Lookup)
   app.get(
     "/api/pos/recent-sales",
     { preHandler: [requireRole(["owner", "manager", "cashier", "accountant"])] },
@@ -421,7 +541,65 @@ export async function posRoutes(app: FastifyInstance) {
         .from(sales)
         .orderBy(desc(sales.soldAt))
         .limit(25);
-      return { sales: recent };
+
+      if (recent.length === 0) return { sales: [] };
+      const saleIds = recent.map((r) => r.id);
+
+      const [linesRows, payRows, voidChildRows] = await Promise.all([
+        db
+          .select({
+            id: saleLines.id,
+            saleId: saleLines.saleId,
+            productId: saleLines.productId,
+            productName: products.name,
+            scannedBarcode: saleLines.scannedBarcode,
+            packLabel: saleLines.packLabel,
+            packQty: saleLines.packQty,
+            qtyPacks: saleLines.qtyPacks,
+            unitPriceCents: saleLines.unitPriceCents,
+            unitCostCents: saleLines.unitCostCents,
+            discountCents: saleLines.discountCents,
+            taxRateBp: saleLines.taxRateBp,
+            taxCents: saleLines.taxCents,
+            lineTotalCents: saleLines.lineTotalCents,
+          })
+          .from(saleLines)
+          .innerJoin(products, eq(saleLines.productId, products.id))
+          .where(inArray(saleLines.saleId, saleIds)),
+        db
+          .select()
+          .from(salePayments)
+          .where(inArray(salePayments.saleId, saleIds)),
+        db
+          .select({ originalSaleId: sales.originalSaleId })
+          .from(sales)
+          .where(and(inArray(sales.originalSaleId, saleIds), eq(sales.kind, "void"))),
+      ]);
+
+      const linesBySale = new Map<string, typeof linesRows>();
+      for (const l of linesRows) {
+        const list = linesBySale.get(l.saleId) ?? [];
+        list.push(l);
+        linesBySale.set(l.saleId, list);
+      }
+      const payBySale = new Map<string, typeof payRows>();
+      for (const p of payRows) {
+        const list = payBySale.get(p.saleId) ?? [];
+        list.push(p);
+        payBySale.set(p.saleId, list);
+      }
+      const voidedSet = new Set(
+        voidChildRows.map((v) => v.originalSaleId).filter((v): v is string => Boolean(v))
+      );
+
+      return {
+        sales: recent.map((s) => ({
+          ...s,
+          alreadyVoided: voidedSet.has(s.id),
+          lines: linesBySale.get(s.id) ?? [],
+          payments: payBySale.get(s.id) ?? [],
+        })),
+      };
     }
   );
 

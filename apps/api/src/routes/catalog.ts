@@ -114,6 +114,39 @@ export async function catalogRoutes(app: FastifyInstance) {
     }
   );
 
+  app.patch(
+    "/api/promotions/:id",
+    { preHandler: [requireRole(["owner", "manager"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid promotion ID format." });
+      }
+      const schema = z.object({
+        active: z.boolean(),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+
+      const [updated] = await db
+        .update(promotions)
+        .set({ active: parsed.data.active })
+        .where(eq(promotions.id, id))
+        .returning();
+      if (!updated) return reply.status(404).send({ error: "Promotion not found." });
+
+      await db.insert(auditLogs).values({
+        actor: req.authUser!.fullName,
+        action: "promo_toggle",
+        entityType: "promotion",
+        entityId: updated.id,
+        detailsJson: { name: updated.name, active: updated.active },
+      });
+
+      return { promotion: updated };
+    }
+  );
+
   // High-speed paginated & searchable 3,000+ SKU catalog query (consistent live stock + net margin)
   app.get("/api/products", { preHandler: [requireAuth] }, async (req, reply) => {
     const q = req.query as Record<string, string | undefined>;

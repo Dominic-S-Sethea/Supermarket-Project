@@ -10,11 +10,13 @@ import {
   analyticsDynamicMarkdowns,
   analyticsPhantomStock,
   auditLogs,
+  customers,
   db,
   goodsReceipts,
   grnVariances,
   hourlyStockSnapshots,
   inventoryBatches,
+  loyaltyLedger,
   marginAlerts,
   pool,
   posShifts,
@@ -28,6 +30,7 @@ import {
   shiftExperiments,
   stockMovements,
   storeFootfall,
+  targetedCoupons,
   users,
 } from "../db/index.js";
 import { SESSION_COOKIE_NAME } from "../plugins/auth.js";
@@ -1283,5 +1286,252 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
         .set({ status: origBatch.status })
         .where(eq(inventoryBatches.id, sampleMd.batchId));
     }
+  });
+
+  it("Milestone 3: supports Loyalty CRM enrollment, single-use coupon concurrency locking, points accrual/clawback, and promo toggling", async () => {
+    // 1. Enroll new loyalty customer + duplicate phone 409 check
+    const uniquePhone = `555-${String(Date.now()).slice(-7)}`;
+    const enrollRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(cashierToken),
+      payload: {
+        phone: uniquePhone,
+        fullName: "Test Shopper Loyalty",
+        email: "loyalty.test@example.com",
+      },
+    });
+    expect(enrollRes.statusCode).toBe(201);
+    const customer = enrollRes.json().customer as { id: string; phone: string };
+
+    const dupEnroll = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(cashierToken),
+      payload: { phone: uniquePhone, fullName: "Duplicate Phone" },
+    });
+    expect(dupEnroll.statusCode).toBe(409);
+
+    // 2. Cashier cannot issue coupons (403); owner issues single-use $2 coupon (min $5)
+    const couponCode = `TESTC-${String(Date.now()).slice(-6)}`;
+    const cashierIssue = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(cashierToken),
+      payload: { code: couponCode, discountCents: 200, minBasketCents: 500, validDays: 7 },
+    });
+    expect(cashierIssue.statusCode).toBe(403);
+
+    const issueRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(),
+      payload: {
+        code: couponCode,
+        customerId: customer.id,
+        discountCents: 200,
+        minBasketCents: 500,
+        validDays: 7,
+      },
+    });
+    expect(issueRes.statusCode).toBe(201);
+    const issuedCoupon = issueRes.json().coupon as { id: string; code: string };
+
+    // 3. Validate coupon: fails below min basket, passes at $10 with matching customer
+    const valLow = await app.inject({
+      method: "GET",
+      url: `/api/loyalty/coupons/validate/${couponCode}?basketCents=300&customerId=${customer.id}`,
+      headers: authHeaders(cashierToken),
+    });
+    expect(valLow.statusCode).toBe(200);
+    expect(valLow.json().valid).toBe(false);
+
+    const valOk = await app.inject({
+      method: "GET",
+      url: `/api/loyalty/coupons/validate/${couponCode}?basketCents=1000&customerId=${customer.id}`,
+      headers: authHeaders(cashierToken),
+    });
+    expect(valOk.statusCode).toBe(200);
+    expect(valOk.json().valid).toBe(true);
+    expect(valOk.json().coupon.discountCents).toBe(200);
+
+    // 4. Concurrent double-redemption race on single-use coupon -> strictly one 201 and one 409!
+    const bootRes = await app.inject({
+      method: "GET",
+      url: "/api/pos/bootstrap",
+      headers: authHeaders(cashierToken),
+    });
+    const boot = bootRes.json() as {
+      products: { id: string; taxRateId: string; avgCostCents: number; requiresAgeCheck: boolean }[];
+      barcodes: { productId: string; barcode: string; packQty: number; packLabel: string; sellPriceCents: number }[];
+      taxRates: { id: string; rateBp: number; isInclusive: boolean }[];
+    };
+    const safeProd = boot.products.find((p) => !p.requiresAgeCheck)!;
+    const bc = boot.barcodes.find((b) => b.productId === safeProd.id)!;
+    const tax = boot.taxRates.find((t) => t.id === safeProd.taxRateId)!;
+
+    const unitPrice = 1000;
+    const discountCents = 200;
+    const afterDiscount = unitPrice - discountCents; // 800c
+    const lineTax = tax.isInclusive
+      ? Math.round((afterDiscount * tax.rateBp) / (10000 + tax.rateBp))
+      : Math.round((afterDiscount * tax.rateBp) / 10000);
+    const lineTotal = tax.isInclusive ? afterDiscount : afterDiscount + lineTax;
+
+    const makeSalePayload = (saleId: string, rcpt: string) => ({
+      id: saleId,
+      registerCode: "REG-01",
+      receiptNo: rcpt,
+      kind: "sale" as const,
+      soldAt: new Date().toISOString(),
+      ageVerified: false,
+      customerId: customer.id,
+      couponCode,
+      lines: [
+        {
+          id: generateUuidV7(),
+          productId: safeProd.id,
+          scannedBarcode: bc.barcode,
+          packLabel: bc.packLabel,
+          packQty: bc.packQty,
+          qtyPacks: 1,
+          unitPriceCents: unitPrice,
+          unitCostCents: safeProd.avgCostCents,
+          discountCents,
+          taxRateBp: tax.rateBp,
+          taxCents: lineTax,
+          lineTotalCents: lineTotal,
+        },
+      ],
+      payments: [
+        {
+          id: generateUuidV7(),
+          method: "card" as const,
+          amountCents: lineTotal,
+          tenderedCents: lineTotal,
+          changeCents: 0,
+        },
+      ],
+    });
+
+    const raceAId = generateUuidV7();
+    const raceBId = generateUuidV7();
+    const payloadA = makeSalePayload(raceAId, `TEST-CPN-A-${raceAId.slice(-6)}`);
+    const payloadB = makeSalePayload(raceBId, `TEST-CPN-B-${raceBId.slice(-6)}`);
+
+    const [resA, resB] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: payloadA,
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: payloadB,
+      }),
+    ]);
+    expect([resA.statusCode, resB.statusCode].sort()).toEqual([201, 409]);
+
+    const winnerPayload = resA.statusCode === 201 ? payloadA : payloadB;
+    const winnerBody = (resA.statusCode === 201 ? resA : resB).json() as {
+      id: string;
+      pointsEarned: number;
+    };
+    expect(winnerBody.pointsEarned).toBe(Math.floor(lineTotal / 100));
+
+    // Idempotent retry of winning sale ID still returns 200 duplicate: true!
+    const retryWin = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(cashierToken),
+      payload: winnerPayload,
+    });
+    expect(retryWin.statusCode).toBe(200);
+    expect(retryWin.json().duplicate).toBe(true);
+
+    // 5. Verify customer accrued points and recent-sales includes lines + alreadyVoided=false
+    const [custAfterSale] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.id, customer.id));
+    expect(custAfterSale.pointsBalance).toBe(Math.floor(lineTotal / 100));
+
+    const recentRes = await app.inject({
+      method: "GET",
+      url: "/api/pos/recent-sales",
+      headers: authHeaders(),
+    });
+    expect(recentRes.statusCode).toBe(200);
+    const recentRow = (
+      recentRes.json().sales as { id: string; alreadyVoided: boolean; lines: unknown[] }[]
+    ).find((s) => s.id === winnerPayload.id);
+    expect(recentRow).toBeDefined();
+    expect(recentRow?.alreadyVoided).toBe(false);
+    expect(recentRow?.lines.length).toBe(1);
+
+    // 6. Owner voids the sale -> points clawed back to 0
+    const voidId = generateUuidV7();
+    const voidRes = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(),
+      payload: {
+        ...winnerPayload,
+        id: voidId,
+        receiptNo: `TEST-CPN-VOID-${voidId.slice(-6)}`,
+        kind: "void",
+        originalSaleId: winnerPayload.id,
+        couponCode: null,
+        lines: [{ ...winnerPayload.lines[0], id: generateUuidV7() }],
+        payments: [{ ...winnerPayload.payments[0], id: generateUuidV7() }],
+      },
+    });
+    expect(voidRes.statusCode).toBe(201);
+    const [custAfterVoid] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.id, customer.id));
+    expect(custAfterVoid.pointsBalance).toBe(0);
+
+    // 7. Create & toggle a promotion via PATCH /api/promotions/:id
+    const promoCreate = await app.inject({
+      method: "POST",
+      url: "/api/promotions",
+      headers: authHeaders(),
+      payload: {
+        name: "Test M3 Morning Basket Promo",
+        promoType: "basket_threshold",
+        priority: 30,
+        combinable: true,
+        minMarginGuardBp: 500,
+        daypartStartHour: 8,
+        daypartEndHour: 12,
+        rulesJson: { minBasketCents: 2000, flatDiscountCents: 200 },
+      },
+    });
+    expect(promoCreate.statusCode).toBe(201);
+    const createdPromoId = (promoCreate.json() as { id: string }).id;
+
+    const promoPause = await app.inject({
+      method: "PATCH",
+      url: `/api/promotions/${createdPromoId}`,
+      headers: authHeaders(),
+      payload: { active: false },
+    });
+    expect(promoPause.statusCode).toBe(200);
+    expect(promoPause.json().promotion.active).toBe(false);
+
+    // Cleanup test rows
+    await db.delete(promotions).where(eq(promotions.id, createdPromoId));
+    await db.delete(loyaltyLedger).where(eq(loyaltyLedger.customerId, customer.id));
+    await db.delete(targetedCoupons).where(eq(targetedCoupons.id, issuedCoupon.id));
+    await db
+      .delete(stockMovements)
+      .where(inArray(stockMovements.refId, [winnerPayload.id, voidId]));
+    await db.delete(sales).where(inArray(sales.id, [voidId, winnerPayload.id]));
+    await db.delete(customers).where(eq(customers.id, customer.id));
   });
 });
