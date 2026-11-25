@@ -1,0 +1,21 @@
+{
+  "name": "supermarket-os",
+  "private": true,
+  "packageManager": "pnpm@12.21.0",
+  "scripts": {
+    "dev:api": "pnpm --filter @supermarket/api dev",
+    "dev:web": "pnpm --filter @supermarket/web dev",
+    "build": "pnpm --filter @supermarket/shared build && pnpm -r --if-present build",
+    "test": "pnpm --filter @supermarket/shared build && pnpm -r --if-present test",
+    "typecheck": "pnpm --filter @supermarket/shared build && pnpm -r --if-present typecheck",
+    "db:up": "docker compose -f infra/docker-compose.yml up -d postgres",
+    "db:down": "docker compose -f infra/docker-compose.yml down",
+    "db:push": "pnpm --filter @supermarket/api db:push",
+    "db:seed": "pnpm --filter @supermarket/api db:seed",
+    "analytics:run": "uv --directory services/analytics run python run_all.py"
+  },
+  "devDependencies": {
+    "turbo": "^2.4.0",
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: supermarket-os-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: supermarket
+      POSTGRES_PASSWORD: supermarket_dev_password
+      POSTGRES_DB: supermarket_os
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supermarket -d supermarket_os"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pg_data:

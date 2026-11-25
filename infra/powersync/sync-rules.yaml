@@ -1,0 +1,19 @@
+# PowerSync Sync Rules for SupermarketOS Offline-First POS Terminals
+# Streams read-optimized store catalog, barcodes, promos, tax rates, and stock state
+# directly to each POS terminal's embedded SQLite database.
+
+bucket_definitions:
+  global_catalog:
+    data:
+      - SELECT id, code, name FROM departments
+      - SELECT id, department_id, name FROM categories
+      - SELECT id, name, rate_bp, is_inclusive FROM tax_rates
+      - SELECT id, sku, name, brand, category_id, tax_rate_id, base_unit_label, avg_cost_cents, min_margin_bp, requires_age_check, track_expiry, expiry_alert_days, active FROM products WHERE active = true
+      - SELECT id, product_id, barcode, pack_qty, pack_label, sell_price_cents, is_primary, is_orderable_case FROM product_barcodes
+      - SELECT id, name, promo_type, rules_json, priority, combinable, starts_at, ends_at, min_margin_guard_bp, active FROM promotions WHERE active = true
+      - SELECT id, username, full_name, role, active FROM users WHERE active = true
+
+  store_stock:
+    data:
+      - SELECT id, product_id, quantity FROM stock_baselines
+      - SELECT id, product_id, batch_id, qty_delta, unit_cost_cents, reason, ref_id, created_at FROM stock_movements WHERE folded = false

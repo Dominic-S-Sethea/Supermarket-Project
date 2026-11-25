@@ -1,0 +1,14 @@
+[project]
+name = "supermarket-analytics"
+version = "0.1.0"
+description = "Python Analytics & ML Forecasting Worker for SupermarketOS (ABC-XYZ, Demand Forecasting, Market Basket, Loss Prevention)"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.1.0",
+    "psycopg[binary]>=3.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]

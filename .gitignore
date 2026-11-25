@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.turbo/
+.env
+*.local
+.venv/
+__pycache__/
+*.pyc
+target/
