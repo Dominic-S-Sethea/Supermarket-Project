@@ -5,8 +5,9 @@ import {
   formatMoney,
   type UserRole,
 } from "@supermarket/shared";
-import { AlertTriangle, Check, FileUp, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Award, Check, FileUp, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { SupplierMatchTab } from "../components/SupplierMatchTab";
 
 interface MarginAlert {
   id: string;
@@ -82,6 +83,8 @@ interface ParsedInvoiceResponse {
   };
 }
 
+type OpsSubTab = "receiving" | "suppliers";
+
 export function OperationsView({
   suppliers,
   userRole = "owner",
@@ -92,6 +95,7 @@ export function OperationsView({
   onCountsChanged?: () => void;
 }) {
   const canManage = userRole === "owner" || userRole === "manager";
+  const [subTab, setSubTab] = useState<OpsSubTab>("receiving");
 
   const [marginAlerts, setMarginAlerts] = useState<MarginAlert[]>([]);
   const [expiryBatches, setExpiryBatches] = useState<ExpiryBatch[]>([]);
@@ -378,13 +382,35 @@ export function OperationsView({
     <div>
       <header className="page-header">
         <div>
-          <h1>Receiving (GRN), FEFO Expiry &amp; Margin Protection</h1>
+          <h1>Receiving (GRN), FEFO Expiry &amp; Operations</h1>
           <p className="page-subtitle">
             {canManage
-              ? "Protect your 1–3% supermarket net profit by catching vendor wholesale price creep, accounting for free bonus cases, and clearing near-expiry packaged stock."
+              ? "Protect your 1–3% supermarket net profit across receiving, vendor OTIF scorecards, 3-way dock variance matching, and FEFO expiry control."
               : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."}
           </p>
         </div>
+        {canManage && (
+          <div className="subtab-bar" role="tablist">
+            <button
+              id="ops-subtab-receiving"
+              role="tab"
+              aria-selected={subTab === "receiving"}
+              className={`subtab-btn ${subTab === "receiving" ? "active" : ""}`}
+              onClick={() => setSubTab("receiving")}
+            >
+              <PackageCheck size={14} /> Receiving &amp; FEFO
+            </button>
+            <button
+              id="ops-subtab-suppliers"
+              role="tab"
+              aria-selected={subTab === "suppliers"}
+              className={`subtab-btn ${subTab === "suppliers" ? "active" : ""}`}
+              onClick={() => setSubTab("suppliers")}
+            >
+              <Award size={14} /> Supplier OTIF &amp; 3-Way Match
+            </button>
+          </div>
+        )}
       </header>
 
       {!canManage && (
@@ -413,7 +439,18 @@ export function OperationsView({
         </div>
       )}
 
-      {canManage && (
+      {subTab === "suppliers" && canManage ? (
+        <SupplierMatchTab
+          canManage={canManage}
+          onFeedback={(msg) => {
+            setErrorMsg(null);
+            setFeedback(msg);
+          }}
+          onError={(msg) => setErrorMsg(msg)}
+        />
+      ) : (
+        <>
+          {canManage && (
         <>
           {/* Multimodal AI Invoice -> GRN Scanner */}
           <section className="panel" style={{ marginBottom: 20 }}>
@@ -878,6 +915,8 @@ export function OperationsView({
           </table>
         </div>
       </section>
+        </>
+      )}
     </div>
   );
 }

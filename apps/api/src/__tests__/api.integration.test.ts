@@ -10,6 +10,7 @@ import {
   auditLogs,
   db,
   goodsReceipts,
+  grnVariances,
   hourlyStockSnapshots,
   inventoryBatches,
   marginAlerts,
@@ -1011,5 +1012,138 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(promoAction).toBeDefined();
     expect(promoAction?.previewJson.daypartWindow).toBe("08:00-12:00");
     await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
+  });
+
+  it("Milestone 1: serves Supplier OTIF scorecards, auto-detects PO vs GRN short/cost variances, and resolves them with RBAC", async () => {
+    // 1. Cashier blocked from scorecards & variances
+    const cashierSc = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/supplier-scorecards",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierSc.statusCode).toBe(403);
+
+    const cashierVar = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/variances",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierVar.statusCode).toBe(403);
+
+    // 2. Owner reads seeded Supplier OTIF Scorecards
+    const scRes = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/supplier-scorecards",
+      headers: authHeaders(),
+    });
+    expect(scRes.statusCode).toBe(200);
+    const scBody = scRes.json() as {
+      summary: { supplierCount: number; avgOtifPct: number };
+      scorecards: { supplierId: string; grade: string; otifRatePct: number }[];
+    };
+    expect(scBody.summary.supplierCount).toBeGreaterThanOrEqual(5);
+    expect(scBody.scorecards.length).toBeGreaterThanOrEqual(5);
+
+    // 3. Create PO (4 cases @ origAvgCost) and receive short (2 cases) at +20% unit cost overcharge
+    const prodRes = await app.inject({
+      method: "GET",
+      url: "/api/products?page=1&pageSize=1",
+      headers: authHeaders(),
+    });
+    const prod = prodRes.json().items[0] as { id: string; avgCostCents: number };
+    const origAvgCost = prod.avgCostCents;
+    const supplierId = scBody.scorecards[0].supplierId;
+
+    const poRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/orders",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        notes: "M1 3-way variance test PO",
+        lines: [
+          {
+            productId: prod.id,
+            caseQty: 10,
+            orderedCases: 4,
+            unitCostCents: Math.max(100, origAvgCost),
+          },
+        ],
+      },
+    });
+    expect(poRes.statusCode).toBe(201);
+    const po = poRes.json() as { id: string };
+
+    const poUnitCost = Math.max(100, origAvgCost);
+    const overchargedUnitCost = Math.round(poUnitCost * 1.25);
+    const invNo = `TEST-M1-VAR-${Date.now()}`;
+    const grnRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/grn",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        poId: po.id,
+        invoiceNumber: invNo,
+        lines: [
+          {
+            productId: prod.id,
+            caseQty: 10,
+            paidCases: 2,
+            freeBonusCases: 0,
+            invoiceLineTotalCents: 20 * overchargedUnitCost,
+          },
+        ],
+      },
+    });
+    expect(grnRes.statusCode).toBe(201);
+    const grnBody = grnRes.json() as { grnId: string; variancesCreated: number };
+    expect(grnBody.variancesCreated).toBe(2); // short_delivery + cost_overcharge
+
+    // 4. Query variances endpoint and verify both variance types exist
+    const varListRes = await app.inject({
+      method: "GET",
+      url: `/api/purchasing/variances?status=open&supplierId=${supplierId}`,
+      headers: authHeaders(),
+    });
+    expect(varListRes.statusCode).toBe(200);
+    const createdVars = (
+      varListRes.json().variances as { id: string; grnId: string; varianceType: string }[]
+    ).filter((v) => v.grnId === grnBody.grnId);
+    expect(createdVars.map((v) => v.varianceType).sort()).toEqual([
+      "cost_overcharge",
+      "short_delivery",
+    ]);
+
+    // 5. Resolve one variance via PATCH (credit note), verify resolvedAt & audit; cashier blocked
+    const targetVar = createdVars[0];
+    const cashierPatch = await app.inject({
+      method: "PATCH",
+      url: `/api/purchasing/variances/${targetVar.id}`,
+      headers: authHeaders(cashierToken),
+      payload: { status: "disputed" },
+    });
+    expect(cashierPatch.statusCode).toBe(403);
+
+    const resolveRes = await app.inject({
+      method: "PATCH",
+      url: `/api/purchasing/variances/${targetVar.id}`,
+      headers: authHeaders(),
+      payload: {
+        status: "resolved_credit_note",
+        resolutionNote: "Credit memo CN-9921 issued by distributor",
+      },
+    });
+    expect(resolveRes.statusCode).toBe(200);
+    expect(resolveRes.json().variance.status).toBe("resolved_credit_note");
+    expect(resolveRes.json().variance.resolvedAt).toBeTruthy();
+
+    // Cleanup test rows and restore avgCostCents
+    await db.delete(marginAlerts).where(eq(marginAlerts.grnId, grnBody.grnId));
+    await db.delete(stockMovements).where(eq(stockMovements.refId, grnBody.grnId));
+    await db.delete(grnVariances).where(eq(grnVariances.grnId, grnBody.grnId));
+    await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnBody.grnId));
+    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, po.id));
+    await db.update(products).set({ avgCostCents: origAvgCost }).where(eq(products.id, prod.id));
   });
 });
