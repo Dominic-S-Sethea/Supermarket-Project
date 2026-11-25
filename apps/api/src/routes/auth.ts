@@ -11,7 +11,12 @@ import {
   signSessionToken,
   verifyPin,
 } from "../plugins/auth.js";
-import { createRateLimiter } from "../plugins/security.js";
+import {
+  checkLoginLockout,
+  clearLoginFailures,
+  createRateLimiter,
+  recordFailedLogin,
+} from "../plugins/security.js";
 
 export async function authRoutes(app: FastifyInstance) {
   const loginLimiter = createRateLimiter({
@@ -27,19 +32,53 @@ export async function authRoutes(app: FastifyInstance) {
     }
 
     const username = parsed.data.username.trim().toLowerCase();
+    const lockState = checkLoginLockout(username);
+    if (lockState.locked) {
+      reply.header("Retry-After", String(lockState.retryAfterSec));
+      return reply.status(429).send({
+        error: `Account temporarily locked due to repeated failed PIN attempts. Retry in ${lockState.retryAfterSec}s.`,
+      });
+    }
+
     const [found] = await db
       .select()
       .from(users)
       .where(and(eq(users.username, username), eq(users.active, true)))
       .limit(1);
 
+    let pinValid = false;
     if (!found) {
       await runDummyPinWork(parsed.data.pin);
+    } else {
+      pinValid = await verifyPin(parsed.data.pin, found.pinHash);
+    }
+
+    if (!found || !pinValid) {
+      const failState = recordFailedLogin(username);
+      if (failState.newlyLocked) {
+        await db.insert(auditLogs).values({
+          actor: found?.fullName ?? username,
+          action: "auth_lockout",
+          entityType: "user",
+          entityId: found?.id ?? null,
+          detailsJson: {
+            username,
+            ip: req.ip,
+            failures: failState.failures,
+            lockoutSeconds: failState.retryAfterSec,
+          },
+        });
+      }
+      if (failState.locked) {
+        reply.header("Retry-After", String(failState.retryAfterSec));
+        return reply.status(429).send({
+          error: `Account temporarily locked due to repeated failed PIN attempts. Retry in ${failState.retryAfterSec}s.`,
+        });
+      }
       return reply.status(401).send({ error: "Invalid username or PIN." });
     }
-    if (!(await verifyPin(parsed.data.pin, found.pinHash))) {
-      return reply.status(401).send({ error: "Invalid username or PIN." });
-    }
+
+    clearLoginFailures(username);
 
     const user = {
       id: found.id,

@@ -26,12 +26,19 @@ import {
   taxRates,
   users,
 } from "../db/index.js";
+import { env } from "../config/env.js";
 import { buildZplBarcodeCommand, parseCsvRows, sanitizeZpl } from "../lib/helpers.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
+import { createRateLimiter } from "../plugins/security.js";
 
 const UuidSchema = z.string().uuid();
 
 export async function catalogRoutes(app: FastifyInstance) {
+  const importLimiter = createRateLimiter({
+    keyPrefix: "csv_import",
+    windowMs: 60_000,
+    max: env.isTest ? 200 : 12,
+  });
   // Metadata bootstrap for dropdowns, promos, and filters
   app.get("/api/meta", { preHandler: [requireAuth] }, async (req) => {
     const [depts, cats, taxes, sups, promos, staff] = await Promise.all([
@@ -596,7 +603,7 @@ export async function catalogRoutes(app: FastifyInstance) {
   // Bulk CSV Onboarding Preview & Validation (RFC-4180 parser + GS1 check digits + net margin)
   app.post(
     "/api/import/preview",
-    { preHandler: [requireRole(["owner", "manager"])] },
+    { preHandler: [requireRole(["owner", "manager"]), importLimiter] },
     async (req, reply) => {
       const schema = z.object({
         csvText: z.string().min(1).max(5_000_000),
@@ -697,7 +704,7 @@ export async function catalogRoutes(app: FastifyInstance) {
   // Commit validated CSV import rows into PostgreSQL (re-validates GS1 + margin server-side)
   app.post(
     "/api/import/commit",
-    { preHandler: [requireRole(["owner", "manager"])] },
+    { preHandler: [requireRole(["owner", "manager"]), importLimiter] },
     async (req, reply) => {
       const schema = z.object({
         rows: z.array(

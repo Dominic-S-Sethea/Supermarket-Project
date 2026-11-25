@@ -85,7 +85,7 @@ export function buildZplBarcodeCommand(barcode: string): string {
 export function escapeCsvCell(value: unknown): string {
   let str = value === null || value === undefined ? "" : String(value);
   const isPlainSignedNumber = /^-?\d+(?:\.\d+)?$/.test(str);
-  if (!isPlainSignedNumber && /^[\t\r]*[=+\-@\t\r]/.test(str)) {
+  if (!isPlainSignedNumber && (/^[\t\r]/.test(str) || /^\s*[=+\-@]/.test(str))) {
     str = `'${str}`;
   }
   if (/[",\r\n]/.test(str)) {

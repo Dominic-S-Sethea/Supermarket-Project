@@ -3,12 +3,19 @@ import { CreateUserSchema, UpdateUserSchema } from "@supermarket/shared";
 import { and, desc, eq, gt, ilike, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getPgErrorCode } from "../app.js";
+import { env } from "../config/env.js";
 import { auditLogs, db, posShifts, userSessions, users } from "../db/index.js";
 import { hashPin, requireRole } from "../plugins/auth.js";
+import { createRateLimiter } from "../plugins/security.js";
 
 const UuidSchema = z.string().uuid();
 
 export async function adminRoutes(app: FastifyInstance) {
+  const adminMutationLimiter = createRateLimiter({
+    keyPrefix: "admin_mutations",
+    windowMs: 60_000,
+    max: env.isTest ? 200 : 30,
+  });
   // =========================================================================
   // STAFF USER GOVERNANCE & SESSION REVOCATION (OWNER ONLY)
   // =========================================================================
@@ -57,7 +64,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   app.post(
     "/api/admin/users",
-    { preHandler: [requireRole(["owner"])] },
+    { preHandler: [requireRole(["owner"]), adminMutationLimiter] },
     async (req, reply) => {
       const parsed = CreateUserSchema.safeParse(req.body);
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
@@ -104,7 +111,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   app.patch(
     "/api/admin/users/:id",
-    { preHandler: [requireRole(["owner"])] },
+    { preHandler: [requireRole(["owner"]), adminMutationLimiter] },
     async (req, reply) => {
       const { id } = req.params as { id: string };
       if (!UuidSchema.safeParse(id).success) {
@@ -198,7 +205,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   app.post(
     "/api/admin/users/:id/revoke-sessions",
-    { preHandler: [requireRole(["owner"])] },
+    { preHandler: [requireRole(["owner"]), adminMutationLimiter] },
     async (req, reply) => {
       const { id } = req.params as { id: string };
       if (!UuidSchema.safeParse(id).success) {

@@ -10,11 +10,18 @@ import {
   purchaseOrders,
   suppliers,
 } from "../db/index.js";
+import { env } from "../config/env.js";
 import { buildCsvDocument } from "../lib/helpers.js";
 import { requireRole } from "../plugins/auth.js";
+import { createRateLimiter } from "../plugins/security.js";
 
 export async function exportRoutes(app: FastifyInstance) {
-  const financeRoles = [requireRole(["owner", "manager", "accountant"])];
+  const exportLimiter = createRateLimiter({
+    keyPrefix: "csv_exports",
+    windowMs: 60_000,
+    max: env.isTest ? 300 : 20,
+  });
+  const financeRoles = [requireRole(["owner", "manager", "accountant"]), exportLimiter];
 
   // 1. Live 3,120-SKU Inventory Valuation CSV (formula-injection safe)
   app.get(

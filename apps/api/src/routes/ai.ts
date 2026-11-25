@@ -32,7 +32,9 @@ import {
   shelfTagQueue,
   taxRates,
 } from "../db/index.js";
+import { env } from "../config/env.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
+import { createRateLimiter } from "../plugins/security.js";
 
 const UuidSchema = z.string().uuid();
 
@@ -76,7 +78,13 @@ const ExecuteCreatePromoPayloadSchema = z
   );
 
 export async function aiRoutes(app: FastifyInstance) {
+  const aiComputeLimiter = createRateLimiter({
+    keyPrefix: "ai_compute",
+    windowMs: 60_000,
+    max: env.isTest ? 300 : 25,
+  });
   const managerOnly = [requireRole(["owner", "manager"])];
+  const managerAiLimited = [requireRole(["owner", "manager"]), aiComputeLimiter];
   const executiveReadOnly = [requireRole(["owner", "manager", "accountant"])];
 
   app.get("/api/ai/status", { preHandler: managerOnly }, async () => {
@@ -101,12 +109,12 @@ export async function aiRoutes(app: FastifyInstance) {
     return getOrCreateDailyBriefing(false);
   });
 
-  app.post("/api/ai/briefing/refresh", { preHandler: managerOnly }, async () => {
+  app.post("/api/ai/briefing/refresh", { preHandler: managerAiLimited }, async () => {
     return getOrCreateDailyBriefing(true);
   });
 
   // Semantic Catalog Search + Embeddings Sync
-  app.post("/api/ai/embeddings/sync", { preHandler: managerOnly }, async (req, reply) => {
+  app.post("/api/ai/embeddings/sync", { preHandler: managerAiLimited }, async (req, reply) => {
     const schema = z.object({ force: z.boolean().optional().default(false) });
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
@@ -128,7 +136,7 @@ export async function aiRoutes(app: FastifyInstance) {
   });
 
   // Multimodal Supplier Invoice / Delivery Note -> GRN Scanner
-  app.post("/api/ai/grn/parse-invoice", { preHandler: managerOnly }, async (req, reply) => {
+  app.post("/api/ai/grn/parse-invoice", { preHandler: managerAiLimited }, async (req, reply) => {
     const parsed = ParseInvoiceSchema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
     return parseSupplierInvoice(parsed.data);
@@ -191,7 +199,7 @@ export async function aiRoutes(app: FastifyInstance) {
   });
 
   // Standard unary chat endpoint
-  app.post("/api/ai/chat", { preHandler: managerOnly }, async (req, reply) => {
+  app.post("/api/ai/chat", { preHandler: managerAiLimited }, async (req, reply) => {
     const parsed = AiChatRequestSchema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
 
@@ -268,7 +276,7 @@ export async function aiRoutes(app: FastifyInstance) {
   });
 
   // Live SSE Streaming Copilot Endpoint
-  app.post("/api/ai/chat/stream", { preHandler: managerOnly }, async (req, reply) => {
+  app.post("/api/ai/chat/stream", { preHandler: managerAiLimited }, async (req, reply) => {
     const parsed = AiChatRequestSchema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
 
@@ -311,6 +319,7 @@ export async function aiRoutes(app: FastifyInstance) {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "X-Request-Id": req.correlationId || generateUuidV7(),
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
       "Referrer-Policy": "same-origin",
@@ -405,6 +414,12 @@ export async function aiRoutes(app: FastifyInstance) {
         .where(eq(aiProposedActions.id, id))
         .for("update");
       if (!action) return { status: 404 as const, error: "Proposed action not found" };
+      const [ownerConv] = await tx
+        .select({ id: aiConversations.id })
+        .from(aiConversations)
+        .where(and(eq(aiConversations.id, action.conversationId), eq(aiConversations.userId, actor.id)))
+        .limit(1);
+      if (!ownerConv) return { status: 404 as const, error: "Proposed action not found" };
       if (action.status !== "pending") {
         return { status: 409 as const, error: `Action is already "${action.status}".` };
       }
@@ -600,6 +615,19 @@ export async function aiRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     if (!UuidSchema.safeParse(id).success) {
       return reply.status(400).send({ error: "Invalid action ID format." });
+    }
+    const [existing] = await db
+      .select({
+        id: aiProposedActions.id,
+        status: aiProposedActions.status,
+        userId: aiConversations.userId,
+      })
+      .from(aiProposedActions)
+      .innerJoin(aiConversations, eq(aiProposedActions.conversationId, aiConversations.id))
+      .where(eq(aiProposedActions.id, id))
+      .limit(1);
+    if (!existing || existing.userId !== req.authUser!.id || existing.status !== "pending") {
+      return reply.status(404).send({ error: "Pending action not found" });
     }
     const [updated] = await db
       .update(aiProposedActions)
