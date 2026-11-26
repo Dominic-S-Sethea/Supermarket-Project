@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { formatBp, formatMoney } from "@supermarket/shared/money";
 import {
@@ -13,6 +13,7 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { SubTabBar } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
 interface CustomerRow {
@@ -158,7 +159,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  const loadCustomers = async (signal?: AbortSignal) => {
+  const loadCustomers = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setErrorMsg(null);
     try {
@@ -179,9 +180,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, [custSearch, segFilter]);
 
-  const loadCoupons = async (signal?: AbortSignal) => {
+  const loadCoupons = useCallback(async (signal?: AbortSignal) => {
     try {
       const cpQs = couponFilter !== "all" ? `?status=${encodeURIComponent(couponFilter)}` : "";
       const cpRes = await apiGet<{ summary: CouponSummary; coupons: CouponRow[] }>(
@@ -196,9 +197,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
         setErrorMsg(err instanceof Error ? err.message : "Failed loading loyalty coupons");
       }
     }
-  };
+  }, [couponFilter]);
 
-  const loadPromos = async (signal?: AbortSignal) => {
+  const loadPromos = useCallback(async (signal?: AbortSignal) => {
     try {
       const pRes = await apiGet<{ promotions: PromoRow[] }>("/api/promotions", signal);
       if (!signal?.aborted) setPromos(pRes.promotions);
@@ -207,9 +208,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
         setErrorMsg(err instanceof Error ? err.message : "Failed loading promotions");
       }
     }
-  };
+  }, []);
 
-  const loadPromoRoi = async (signal?: AbortSignal) => {
+  const loadPromoRoi = useCallback(async (signal?: AbortSignal) => {
     setPromoRoiWarning(null);
     try {
       const roiRes = await apiGet<{ items: PromoRoiRow[] }>("/api/analytics/promo-roi", signal);
@@ -223,7 +224,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
         );
       }
     }
-  };
+  }, []);
 
   const loadAll = async (signal?: AbortSignal) => {
     await Promise.all([
@@ -243,20 +244,20 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       clearTimeout(timer);
       controller.abort();
     };
-  }, [custSearch, segFilter]);
+  }, [loadCustomers]);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadCoupons(controller.signal);
     return () => controller.abort();
-  }, [couponFilter]);
+  }, [loadCoupons]);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadPromos(controller.signal);
     void loadPromoRoi(controller.signal);
     return () => controller.abort();
-  }, []);
+  }, [loadPromos, loadPromoRoi]);
 
   const handleEnrollCustomer = async () => {
     if (busy) return;
@@ -390,38 +391,43 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
             Manage RFM shopper segments, issue single-use POS coupons with atomic double-redeem locking, and configure daypart promotions.
           </p>
         </div>
-        <div className="subtab-bar" role="tablist">
-          <button
-            id="loyalty-subtab-customers"
-            type="button"
-            role="tab"
-            aria-selected={subTab === "customers"}
-            className={`subtab-btn ${subTab === "customers" ? "active" : ""}`}
-            onClick={() => selectSubTab("customers")}
-          >
-            <Users size={14} aria-hidden="true" /> Customers ({custSummary?.totalCustomers ?? 0})
-          </button>
-          <button
-            id="loyalty-subtab-coupons"
-            type="button"
-            role="tab"
-            aria-selected={subTab === "coupons"}
-            className={`subtab-btn ${subTab === "coupons" ? "active" : ""}`}
-            onClick={() => selectSubTab("coupons")}
-          >
-            <Ticket size={14} aria-hidden="true" /> Coupons ({couponSummary?.activeCount ?? 0} Active)
-          </button>
-          <button
-            id="loyalty-subtab-promotions"
-            type="button"
-            role="tab"
-            aria-selected={subTab === "promotions"}
-            className={`subtab-btn ${subTab === "promotions" ? "active" : ""}`}
-            onClick={() => selectSubTab("promotions")}
-          >
-            <Tag size={14} aria-hidden="true" /> Promotions ({activePromoCount} Active)
-          </button>
-        </div>
+        <SubTabBar
+          ariaLabel="Loyalty and promotion sections"
+          activeId={subTab}
+          onSelect={selectSubTab}
+          tabs={[
+            {
+              id: "customers",
+              elementId: "loyalty-subtab-customers",
+              panelId: "loyalty-panel-customers",
+              label: (
+                <>
+                  <Users size={14} aria-hidden="true" /> Customers ({custSummary?.totalCustomers ?? 0})
+                </>
+              ),
+            },
+            {
+              id: "coupons",
+              elementId: "loyalty-subtab-coupons",
+              panelId: "loyalty-panel-coupons",
+              label: (
+                <>
+                  <Ticket size={14} aria-hidden="true" /> Coupons ({couponSummary?.activeCount ?? 0} Active)
+                </>
+              ),
+            },
+            {
+              id: "promotions",
+              elementId: "loyalty-subtab-promotions",
+              panelId: "loyalty-panel-promotions",
+              label: (
+                <>
+                  <Tag size={14} aria-hidden="true" /> Promotions ({activePromoCount} Active)
+                </>
+              ),
+            },
+          ]}
+        />
       </header>
 
       {errorMsg && (
@@ -443,13 +449,19 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       )}
 
       {feedback && (
-        <div className="banner banner-green" style={{ marginBottom: 14 }}>
+        <div className="banner banner-green" role="status" style={{ marginBottom: 14 }}>
           <span>{feedback}</span>
-          <button className="btn btn-sm" onClick={() => setFeedback(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setFeedback(null)}>
             Dismiss
           </button>
         </div>
       )}
+
+      <div
+        role="tabpanel"
+        id={`loyalty-panel-${subTab}`}
+        aria-labelledby={`loyalty-subtab-${subTab}`}
+      >
 
       <div className="kpi-strip">
         <div className="kpi-tile">
@@ -466,7 +478,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
         </div>
         <div className="kpi-tile">
           <div className="kpi-label">Active Single-Use Coupons</div>
-          <div className="kpi-value" style={{ color: "var(--accent-primary)" }}>
+          <div className="kpi-value" style={{ color: "var(--accent-primary-ink)" }}>
             {couponSummary?.activeCount ?? 0}
           </div>
           <div className="kpi-meta">
@@ -528,7 +540,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
               </div>
             </div>
 
-            <div className="table-wrap">
+            <div className="table-wrap" role="region" aria-label="Loyalty customer directory" tabIndex={0}>
               <table className="data-table">
                 <thead>
                   <tr>
@@ -622,6 +634,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                   />
                 </div>
                 <button
+                  type="button"
                   id="enroll-customer-btn"
                   className="btn btn-primary"
                   disabled={busy !== null}
@@ -659,7 +672,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
               </select>
             </div>
 
-            <div className="table-wrap">
+            <div className="table-wrap" role="region" aria-label="Loyalty coupons ledger" tabIndex={0}>
               <table className="data-table">
                 <thead>
                   <tr>
@@ -698,7 +711,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                             <span className="tag tag-neutral">Any Shopper</span>
                           )}
                         </td>
-                        <td className="text-right mono" style={{ color: "var(--accent-primary)", fontWeight: 700 }}>
+                        <td className="text-right mono" style={{ color: "var(--accent-primary-ink)", fontWeight: 700 }}>
                           -{formatMoney(cp.discountCents)}
                         </td>
                         <td className="text-right mono">{formatMoney(cp.minBasketCents)}</td>
@@ -815,6 +828,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                   </div>
                 </div>
                 <button
+                  type="button"
                   id="issue-coupon-btn"
                   className="btn btn-primary"
                   disabled={busy !== null}
@@ -841,7 +855,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 </p>
               </div>
             </div>
-            <div className="table-wrap">
+            <div className="table-wrap" role="region" aria-label="Active promotions list" tabIndex={0}>
               <table className="data-table">
                 <thead>
                   <tr>
@@ -882,6 +896,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                       {canManage && (
                         <td className="text-right">
                           <button
+                            type="button"
                             className="btn btn-sm"
                             disabled={busy !== null}
                             onClick={() => void handleTogglePromo(p)}
@@ -970,16 +985,18 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 {promoType === "basket_threshold" && (
                   <div className="form-grid">
                     <div className="field">
-                      <label>Min Basket ($)</label>
+                      <label htmlFor="promo-min-basket">Min Basket ($)</label>
                       <input
+                        id="promo-min-basket"
                         className="input mono"
                         value={promoMinBasketUsd}
                         onChange={(e) => setPromoMinBasketUsd(e.target.value)}
                       />
                     </div>
                     <div className="field">
-                      <label>Flat Discount ($)</label>
+                      <label htmlFor="promo-flat-discount">Flat Discount ($)</label>
                       <input
+                        id="promo-flat-discount"
                         className="input mono"
                         value={promoFlatDiscountUsd}
                         onChange={(e) => setPromoFlatDiscountUsd(e.target.value)}
@@ -989,8 +1006,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 )}
                 {(promoType === "clearance" || promoType === "tier_price") && (
                   <div className="field">
-                    <label>Discount Percentage (%)</label>
+                    <label htmlFor="promo-discount-pct">Discount Percentage (%)</label>
                     <input
+                      id="promo-discount-pct"
                       className="input mono"
                       type="number"
                       min={5}
@@ -1002,6 +1020,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 )}
                 <button
                   id="create-promo-btn"
+                  type="button"
                   className="btn btn-primary"
                   disabled={busy !== null}
                   onClick={() => void handleCreatePromo()}
@@ -1029,7 +1048,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 No promotion ROI rows computed yet — run the Python analytics worker to populate.
               </div>
             ) : (
-              <div className="table-wrap">
+              <div className="table-wrap" role="region" aria-label="Promotion ROI lift table" tabIndex={0}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -1067,7 +1086,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                             fontWeight: 700,
                             color:
                               r.estimatedProfitDeltaCents > 0
-                                ? "var(--accent-primary)"
+                                ? "var(--accent-primary-ink)"
                                 : r.estimatedProfitDeltaCents < 0
                                   ? "var(--accent-crimson)"
                                   : undefined,
@@ -1100,6 +1119,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
           </section>
         </>
       )}
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CheckCircle2, ClipboardList, RefreshCw } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 
@@ -57,7 +57,10 @@ export function FloorTasksTab({
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const loadTasks = async (signal?: AbortSignal) => {
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  const loadTasks = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     try {
       const qs = new URLSearchParams();
@@ -73,18 +76,20 @@ export function FloorTasksTab({
       setSummary(res.summary);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        onError(err instanceof Error ? err.message : "Failed loading floor task checklist");
+        onErrorRef.current(
+          err instanceof Error ? err.message : "Failed loading floor task checklist"
+        );
       }
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, [dateFilter, typeFilter, statusFilter]);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadTasks(controller.signal);
     return () => controller.abort();
-  }, [dateFilter, typeFilter, statusFilter]);
+  }, [loadTasks]);
 
   const handleComplete = async (task: FloorTask) => {
     if (busyId) return;
@@ -127,7 +132,7 @@ export function FloorTasksTab({
           <div
             className="kpi-value"
             style={{
-              color: (summary?.pending ?? 0) > 0 ? "var(--accent-amber)" : "var(--accent-primary)",
+              color: (summary?.pending ?? 0) > 0 ? "var(--accent-amber)" : "var(--accent-primary-ink)",
             }}
           >
             {summary?.pending ?? 0}
@@ -139,7 +144,7 @@ export function FloorTasksTab({
           <div
             className="kpi-value"
             style={{
-              color: (summary?.urgentPending ?? 0) > 0 ? "var(--accent-crimson)" : "var(--accent-primary)",
+              color: (summary?.urgentPending ?? 0) > 0 ? "var(--accent-crimson)" : "var(--accent-primary-ink)",
             }}
           >
             {summary?.urgentPending ?? 0}
@@ -148,7 +153,7 @@ export function FloorTasksTab({
         </div>
         <div className="kpi-tile">
           <div className="kpi-label">Completed Today</div>
-          <div className="kpi-value" style={{ color: "var(--accent-primary)" }}>
+          <div className="kpi-value" style={{ color: "var(--accent-primary-ink)" }}>
             {summary?.completed ?? 0}
           </div>
           <div className="kpi-meta">Audit-logged by operator &amp; timestamp</div>
@@ -159,7 +164,7 @@ export function FloorTasksTab({
         <div className="panel-header">
           <div>
             <h2 className="panel-title">
-              <ClipboardList size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
+              <ClipboardList size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
               Daily Floor Operations Checklist (Restocks, Blind Counts, Tags &amp; Markdowns)
             </h2>
             <p className="panel-desc">
@@ -210,7 +215,7 @@ export function FloorTasksTab({
           </div>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Store floor task checklist" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -286,6 +291,7 @@ export function FloorTasksTab({
                                 type="number"
                                 min={0}
                                 placeholder="Count"
+                                aria-label={`Counted quantity for ${t.title}`}
                                 style={{ width: 70, fontSize: 12, padding: "4px 6px" }}
                                 value={qtyById[t.id] ?? ""}
                                 onChange={(e) =>
@@ -296,6 +302,7 @@ export function FloorTasksTab({
                             <input
                               className="input"
                               placeholder="Optional note..."
+                              aria-label={`Completion note for ${t.title}`}
                               style={{ fontSize: 12, padding: "4px 8px", minWidth: 140 }}
                               value={notesById[t.id] ?? ""}
                               onChange={(e) =>
@@ -308,11 +315,12 @@ export function FloorTasksTab({
                       <td className="text-right">
                         {t.status === "completed" ? (
                           <span style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                            <CheckCircle2 size={13} style={{ verticalAlign: "middle", marginRight: 4 }} />
+                            <CheckCircle2 size={13} aria-hidden="true" style={{ verticalAlign: "middle", marginRight: 4 }} />
                             Completed
                           </span>
                         ) : (
                           <button
+                            type="button"
                             className="btn btn-primary btn-sm"
                             disabled={busyId !== null}
                             onClick={() => void handleComplete(t)}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { buildValidEan13 } from "@supermarket/shared/barcodes";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { formatBp, formatMoney } from "@supermarket/shared/money";
@@ -74,7 +74,7 @@ export function CatalogView({
     setNewBc(buildValidEan13("887", Math.floor(100000 + Math.random() * 899999)));
   };
 
-  const loadProducts = async (p = page, signal?: AbortSignal) => {
+  const loadProducts = useCallback(async (p = page, signal?: AbortSignal) => {
     setLoading(true);
     setLoadError(null);
     try {
@@ -86,10 +86,10 @@ export function CatalogView({
         if (signal?.aborted) return;
         setSemanticEngine(res.engine);
         setData({ items: res.items, total: res.items.length, pageSize: 40 });
-        if (selected) {
-          const refreshed = res.items.find((i) => i.id === selected.id);
-          if (refreshed) setSelected(refreshed);
-        }
+        setSelected((prev) => {
+          if (!prev) return prev;
+          return res.items.find((i) => i.id === prev.id) ?? prev;
+        });
         return;
       }
 
@@ -107,10 +107,10 @@ export function CatalogView({
       );
       if (signal?.aborted) return;
       setData(res);
-      if (selected) {
-        const refreshed = res.items.find((i) => i.id === selected.id);
-        if (refreshed) setSelected(refreshed);
-      }
+      setSelected((prev) => {
+        if (!prev) return prev;
+        return res.items.find((i) => i.id === prev.id) ?? prev;
+      });
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
         setLoadError(err instanceof Error ? err.message : "Failed loading catalog");
@@ -120,7 +120,7 @@ export function CatalogView({
         setLoading(false);
       }
     }
-  };
+  }, [page, search, deptId, segment, semanticMode]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -131,7 +131,7 @@ export function CatalogView({
       clearTimeout(t);
       controller.abort();
     };
-  }, [search, deptId, segment, page, semanticMode]);
+  }, [page, loadProducts]);
 
   const handleAddBarcode = async () => {
     if (!selected || drawerBusy) return;
@@ -414,7 +414,7 @@ export function CatalogView({
           </div>
         )}
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Product catalog table" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>

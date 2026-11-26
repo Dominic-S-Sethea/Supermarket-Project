@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { formatBp, formatMoney } from "@supermarket/shared/money";
 import {
   CheckCircle2,
@@ -110,7 +110,10 @@ export function ShelfIntegrityTab({
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
-  const loadAll = async (signal?: AbortSignal) => {
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  const loadAll = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     try {
       const [phRes, mdRes, tagRes] = await Promise.all([
@@ -136,18 +139,20 @@ export function ShelfIntegrityTab({
       );
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        onError(err instanceof Error ? err.message : "Failed loading shelf integrity data");
+        onErrorRef.current(
+          err instanceof Error ? err.message : "Failed loading shelf integrity data"
+        );
       }
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadAll(controller.signal);
     return () => controller.abort();
-  }, []);
+  }, [loadAll]);
 
   const handleVerifyPhantom = async (item: PhantomItem, markVerifiedOk: boolean) => {
     if (busyAction) return;
@@ -255,7 +260,7 @@ export function ShelfIntegrityTab({
           <div
             className="kpi-value"
             style={{
-              color: (phantomSummary?.openCount ?? 0) > 0 ? "var(--accent-crimson)" : "var(--accent-primary)",
+              color: (phantomSummary?.openCount ?? 0) > 0 ? "var(--accent-crimson)" : "var(--accent-primary-ink)",
             }}
           >
             {phantomSummary?.openCount ?? 0}
@@ -274,7 +279,7 @@ export function ShelfIntegrityTab({
         </div>
         <div className="kpi-tile">
           <div className="kpi-label">Incremental FEFO Cash Recovery</div>
-          <div className="kpi-value" style={{ color: "var(--accent-primary)" }}>
+          <div className="kpi-value" style={{ color: "var(--accent-primary-ink)" }}>
             +{formatMoney(Math.max(0, markdownSummary?.incrementalRecoveryCents ?? 0))}
           </div>
           <div className="kpi-meta">Expected net lift vs. no-markdown spoilage</div>
@@ -284,7 +289,7 @@ export function ShelfIntegrityTab({
           <div
             className="kpi-value"
             style={{
-              color: (tagSummary?.pendingCount ?? 0) > 0 ? "var(--accent-amber)" : "var(--accent-primary)",
+              color: (tagSummary?.pendingCount ?? 0) > 0 ? "var(--accent-amber)" : "var(--accent-primary-ink)",
             }}
           >
             {tagSummary?.pendingCount ?? 0} pending
@@ -298,7 +303,7 @@ export function ShelfIntegrityTab({
         <div className="panel-header">
           <div>
             <h2 className="panel-title">
-              <Printer size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
+              <Printer size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
               07:30 Shelf Tag Batch ZPL Print Queue ({tagSummary?.pendingCount ?? 0} Pending)
             </h2>
             <p className="panel-desc">
@@ -307,6 +312,7 @@ export function ShelfIntegrityTab({
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button
+              type="button"
               className="btn btn-sm"
               disabled={loading || pendingTags.length === 0}
               onClick={() => setSelectedTagIds(new Set(pendingTags.map((t) => t.id)))}
@@ -314,6 +320,7 @@ export function ShelfIntegrityTab({
               Select All Pending ({pendingTags.length})
             </button>
             <button
+              type="button"
               id="print-shelf-tags-btn"
               className="btn btn-primary btn-sm"
               disabled={busyAction !== null || selectedTagIds.size === 0}
@@ -324,7 +331,7 @@ export function ShelfIntegrityTab({
                 ? "Generating ZPL..."
                 : `Print Selected Batch (${selectedTagIds.size})`}
             </button>
-            <button className="btn btn-sm" disabled={loading} onClick={() => void loadAll()}>
+            <button type="button" className="btn btn-sm" disabled={loading} onClick={() => void loadAll()}>
               <RefreshCw size={13} /> Refresh
             </button>
           </div>
@@ -338,6 +345,7 @@ export function ShelfIntegrityTab({
               </strong>
               <div style={{ display: "flex", gap: 6 }}>
                 <button
+                  type="button"
                   className="btn btn-sm"
                   onClick={() => {
                     void navigator.clipboard?.writeText(printedZpl.zpl);
@@ -346,10 +354,10 @@ export function ShelfIntegrityTab({
                 >
                   <Copy size={12} /> Copy ZPL
                 </button>
-                <button className="btn btn-primary btn-sm" onClick={handleDownloadZpl}>
+                <button type="button" className="btn btn-primary btn-sm" onClick={handleDownloadZpl}>
                   <Download size={12} /> Download .zpl
                 </button>
-                <button className="btn btn-sm" onClick={() => setPrintedZpl(null)}>
+                <button type="button" className="btn btn-sm" onClick={() => setPrintedZpl(null)}>
                   Close
                 </button>
               </div>
@@ -371,11 +379,13 @@ export function ShelfIntegrityTab({
           </div>
         )}
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Shelf tag print queue" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
-                <th style={{ width: 34 }} />
+                <th style={{ width: 34 }}>
+                  <span className="sr-only">Select</span>
+                </th>
                 <th>SKU / Product</th>
                 <th>Aisle &amp; Barcode</th>
                 <th>Reason</th>
@@ -429,7 +439,7 @@ export function ShelfIntegrityTab({
                     </td>
                     <td className="text-right mono">
                       {formatMoney(t.oldPriceCents)} →{" "}
-                      <strong style={{ color: "var(--accent-primary)" }}>
+                      <strong style={{ color: "var(--accent-primary-ink)" }}>
                         {formatMoney(t.newPriceCents)}
                       </strong>
                     </td>
@@ -464,7 +474,7 @@ export function ShelfIntegrityTab({
           </div>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Phantom stock audit table" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -510,7 +520,7 @@ export function ShelfIntegrityTab({
                     <td className="text-right mono">{m.qtyRemaining}</td>
                     <td className="text-right mono">
                       {formatMoney(m.currentSellPriceCents)} →{" "}
-                      <strong style={{ color: "var(--accent-primary)" }}>
+                      <strong style={{ color: "var(--accent-primary-ink)" }}>
                         {formatMoney(m.recommendedPromoPriceCents)}
                       </strong>{" "}
                       <span className="tag tag-amber mono">-{formatBp(m.recommendedDiscountBp)}</span>
@@ -518,7 +528,7 @@ export function ShelfIntegrityTab({
                     <td className="text-right mono">
                       {m.predictedClearanceUnits} / {m.qtyRemaining} u
                     </td>
-                    <td className="text-right mono" style={{ color: "var(--accent-primary)", fontWeight: 700 }}>
+                    <td className="text-right mono" style={{ color: "var(--accent-primary-ink)", fontWeight: 700 }}>
                       +{formatMoney(Math.max(0, m.incrementalRecoveryCents))}
                     </td>
                     <td>
@@ -535,6 +545,7 @@ export function ShelfIntegrityTab({
                           </span>
                         ) : (
                           <button
+                            type="button"
                             className="btn btn-primary btn-sm"
                             disabled={busyAction !== null}
                             onClick={() => void handleApplyMarkdown(m)}
@@ -566,7 +577,7 @@ export function ShelfIntegrityTab({
           </div>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Dynamic FEFO markdown recommendations" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -641,6 +652,7 @@ export function ShelfIntegrityTab({
                             type="number"
                             min={0}
                             placeholder="Count"
+                            aria-label={`Physical blind count for ${p.name}`}
                             style={{ width: 72, padding: "4px 6px", fontSize: 12 }}
                             value={countInputs[p.productId] ?? ""}
                             onChange={(e) =>
@@ -648,13 +660,15 @@ export function ShelfIntegrityTab({
                             }
                           />
                           <button
+                            type="button"
                             className="btn btn-primary btn-sm"
                             disabled={busyAction !== null}
                             onClick={() => void handleVerifyPhantom(p, false)}
                           >
-                            <ClipboardCheck size={12} /> Post Count
+                            <ClipboardCheck size={12} aria-hidden="true" /> Post Count
                           </button>
                           <button
+                            type="button"
                             className="btn btn-sm"
                             disabled={busyAction !== null}
                             onClick={() => void handleVerifyPhantom(p, true)}

@@ -179,11 +179,11 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
         </div>
         <div className="header-actions">
           {selectedSegment && (
-            <button className="btn" onClick={() => setSelectedSegment("")}>
+            <button type="button" className="btn" onClick={() => setSelectedSegment("")}>
               Clear Filter ({selectedSegment})
             </button>
           )}
-          <button className="btn" disabled={loading} onClick={() => void loadData(selectedSegment)}>
+          <button type="button" className="btn" disabled={loading} onClick={() => void loadData(selectedSegment)}>
             <RefreshCw size={14} /> {loading ? "Loading..." : "Refresh"}
           </button>
         </div>
@@ -192,7 +192,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
       {errorMsg && (
         <div className="banner banner-red" style={{ marginBottom: 16 }}>
           <span>{errorMsg}</span>
-          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
           </button>
         </div>
@@ -209,7 +209,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
           </div>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="ABC-XYZ portfolio summary" tabIndex={0}>
           <div className="abc-grid">
             <div />
             <div className="abc-axis-head">X · Steady / Smooth</div>
@@ -273,7 +273,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
             </h2>
           </div>
         </div>
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="ABC segment SKU drilldown" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -353,7 +353,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
               </p>
             </div>
           </div>
-          <div className="table-wrap">
+          <div className="table-wrap" role="region" aria-label="Cashier loss-prevention scorecard" tabIndex={0}>
             <table className="data-table">
               <thead>
                 <tr>
@@ -365,7 +365,11 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
                   <th className="text-right">Void %</th>
                   <th className="text-right">MAD Z</th>
                   <th>Risk</th>
-                  {canTriage && <th />}
+                  {canTriage && (
+                    <th>
+                      <span className="sr-only">Actions</span>
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -405,6 +409,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
                       {canTriage && (
                         <td className="text-right">
                           <button
+                            type="button"
                             className="btn btn-sm"
                             disabled={triageLoading !== null}
                             onClick={() => void runCashierTriage(c)}
@@ -473,7 +478,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
               </p>
             </div>
           </div>
-          <div className="table-wrap">
+          <div className="table-wrap" role="region" aria-label="Shrinkage ledger" tabIndex={0}>
             <table className="data-table">
               <thead>
                 <tr>

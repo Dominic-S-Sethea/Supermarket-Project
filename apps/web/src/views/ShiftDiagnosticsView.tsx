@@ -13,7 +13,9 @@ import {
 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import { ModalDialog } from "../components/AccessibleDialog";
+import { HourlyFootfallChart } from "../components/HourlyFootfallChart";
 import { StaffingRosterTab } from "../components/StaffingRosterTab";
+import { SubTabBar } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
 interface ShiftRow {
@@ -207,7 +209,6 @@ export function ShiftDiagnosticsView({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ kind: "green" | "amber" | "red"; text: string } | null>(null);
   const [subTab, setSubTab] = useState<ShiftSubTab>(() => resolveShiftSubTab());
-  const [hoverHour, setHoverHour] = useState<number | null>(null);
 
   const selectSubTab = (next: ShiftSubTab) => {
     setSubTab(next);
@@ -267,15 +268,6 @@ export function ShiftDiagnosticsView({
     void load(controller.signal);
     return () => controller.abort();
   }, []);
-
-  useEffect(() => {
-    if (!showFootfallModal) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setShowFootfallModal(false);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [showFootfallModal]);
 
   const canManage = userRole === "owner" || userRole === "manager";
   const canOperate = canManage || userRole === "stock_clerk";
@@ -405,31 +397,6 @@ export function ShiftDiagnosticsView({
   const drivers = diag?.driverAttribution?.drivers ?? [];
   const missions = diag?.shopperMissions?.clusters ?? [];
 
-  // Hourly SVG dimensions
-  const chartW = 720;
-  const chartH = 225;
-  const padL = 48;
-  const padR = 46;
-  const padT = 20;
-  const padB = 30;
-  const plotW = chartW - padL - padR;
-  const plotH = chartH - padT - padB;
-  const maxTraffic = Math.max(10, ...hourly.map((h) => Math.max(h.walkIns, h.receipts)));
-  const stepW = hourly.length > 0 ? plotW / hourly.length : plotW;
-  const barW = Math.max(8, stepW * 0.34);
-
-  const convPolyline = hourly
-    .map((h, i) => {
-      if (h.walkIns === 0) return null;
-      const cx = padL + i * stepW + stepW / 2;
-      const cy = padT + plotH - (Math.min(100, Math.max(0, h.conversionPct)) / 100) * plotH;
-      return `${cx.toFixed(1)},${cy.toFixed(1)}`;
-    })
-    .filter(Boolean)
-    .join(" ");
-
-  const morningCols = hourly.filter((h) => h.hour < 12).length;
-
   return (
     <div>
       <header className="page-header">
@@ -448,6 +415,7 @@ export function ShiftDiagnosticsView({
           {canOperate && (
             <>
               <button
+                type="button"
                 id="capture-snapshot-btn"
                 className="btn"
                 disabled={busyAction !== null}
@@ -456,6 +424,7 @@ export function ShiftDiagnosticsView({
                 <Camera size={14} /> Capture Shelf Snapshot
               </button>
               <button
+                type="button"
                 id="log-footfall-btn"
                 className="btn"
                 disabled={busyAction !== null}
@@ -468,6 +437,7 @@ export function ShiftDiagnosticsView({
           {canManage && (
             <>
               <button
+                type="button"
                 id="recompute-shift-ml-btn"
                 className="btn"
                 disabled={busyAction !== null}
@@ -477,6 +447,7 @@ export function ShiftDiagnosticsView({
               </button>
               {onAskCopilot && (
                 <button
+                  type="button"
                   id="ask-ai-shift-fix-btn"
                   className="btn btn-primary"
                   onClick={() =>
@@ -501,7 +472,7 @@ export function ShiftDiagnosticsView({
           style={{ marginBottom: 16 }}
         >
           <span>{banner.text}</span>
-          <button className="btn btn-sm" onClick={() => setBanner(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setBanner(null)}>
             Dismiss
           </button>
         </div>
@@ -516,11 +487,12 @@ export function ShiftDiagnosticsView({
               : "Ask a Store Manager or Owner to run the analytics worker."}
           </p>
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn" disabled={loading} onClick={() => void load()}>
+            <button type="button" className="btn" disabled={loading} onClick={() => void load()}>
               <RefreshCw size={14} /> Retry
             </button>
             {canManage && (
               <button
+                type="button"
                 className="btn btn-primary"
                 disabled={busyAction !== null}
                 onClick={() => void handleRecompute()}
@@ -584,140 +556,7 @@ export function ShiftDiagnosticsView({
           </section>
 
           <div className="grid-asymmetric">
-            <section className="panel">
-              <div className="panel-header">
-                <div>
-                  <h2 className="panel-title">Hourly Footfall Funnel (Walk-Ins vs. Receipts &amp; Conversion %)</h2>
-                  <p className="panel-desc">
-                    Shaded amber = Morning (08–11). Slate bars = door entries; Emerald bars = paid receipts; Line = conversion %.
-                  </p>
-                </div>
-                {hoverHour !== null && (
-                  <div className="tag tag-green mono">
-                    {(() => {
-                      const pt = hourly.find((x) => x.hour === hoverHour);
-                      return pt
-                        ? `${String(pt.hour).padStart(2, "0")}:00 — ${pt.walkIns} in → ${pt.receipts} paid (${pt.conversionPct}%)`
-                        : "";
-                    })()}
-                  </div>
-                )}
-              </div>
-
-              {hourly.length === 0 ? (
-                <div style={{ color: "var(--ink-muted)", padding: "24px 0", textAlign: "center" }}>
-                  No hourly footfall telemetry recorded yet.
-                </div>
-              ) : (
-                <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="group" aria-label="Hourly footfall funnel">
-                  {morningCols > 0 && (
-                    <rect
-                      x={padL}
-                      y={padT}
-                      width={morningCols * stepW}
-                      height={plotH}
-                      fill="var(--chart-morning-band)"
-                    />
-                  )}
-                  {[0, 0.5, 1].map((t) => {
-                    const y = padT + plotH - t * plotH;
-                    return (
-                      <g key={t}>
-                        <line
-                          x1={padL}
-                          y1={y}
-                          x2={chartW - padR}
-                          y2={y}
-                          stroke="var(--chart-grid)"
-                          strokeDasharray={t === 0 ? undefined : "3 3"}
-                        />
-                        <text
-                          x={padL - 6}
-                          y={y + 4}
-                          textAnchor="end"
-                          fontSize="10"
-                          fill="var(--chart-label)"
-                          fontFamily="var(--font-mono)"
-                        >
-                          {Math.round(maxTraffic * t)}
-                        </text>
-                        <text
-                          x={chartW - padR + 6}
-                          y={y + 4}
-                          textAnchor="start"
-                          fontSize="10"
-                          fill="var(--accent-primary-ink)"
-                          fontFamily="var(--font-mono)"
-                        >
-                          {Math.round(t * 100)}%
-                        </text>
-                      </g>
-                    );
-                  })}
-                  {hourly.map((h, i) => {
-                    const baseX = padL + i * stepW + stepW / 2;
-                    const hWalk = (h.walkIns / maxTraffic) * plotH;
-                    const hRcpt = (h.receipts / maxTraffic) * plotH;
-                    return (
-                      <g
-                        key={h.hour}
-                        tabIndex={0}
-                        role="button"
-                        aria-label={`${String(h.hour).padStart(2, "0")}:00 — ${h.walkIns} walk-ins, ${h.receipts} receipts, ${h.conversionPct}% conversion`}
-                        onMouseEnter={() => setHoverHour(h.hour)}
-                        onMouseLeave={() => setHoverHour((curr) => (curr === h.hour ? null : curr))}
-                        onFocus={() => setHoverHour(h.hour)}
-                        onBlur={() => setHoverHour((curr) => (curr === h.hour ? null : curr))}
-                        onClick={() => setHoverHour((curr) => (curr === h.hour ? null : h.hour))}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
-                            setHoverHour((curr) => (curr === h.hour ? null : h.hour));
-                          }
-                        }}
-                        style={{ cursor: "pointer" }}
-                      >
-                        <rect
-                          x={baseX - barW - 1}
-                          y={padT + plotH - hWalk}
-                          width={barW}
-                          height={Math.max(1, hWalk)}
-                          rx={2}
-                          fill="var(--chart-bar-muted)"
-                        />
-                        <rect
-                          x={baseX + 1}
-                          y={padT + plotH - hRcpt}
-                          width={barW}
-                          height={Math.max(1, hRcpt)}
-                          rx={2}
-                          fill="var(--chart-bar-secondary)"
-                        />
-                        <text
-                          x={baseX}
-                          y={chartH - 8}
-                          textAnchor="middle"
-                          fontSize="10"
-                          fill={h.hour < 12 ? "var(--accent-amber-ink)" : "var(--chart-label)"}
-                          fontWeight={h.hour < 12 ? "700" : "400"}
-                          fontFamily="var(--font-mono)"
-                        >
-                          {String(h.hour).padStart(2, "0")}
-                        </text>
-                      </g>
-                    );
-                  })}
-                  {convPolyline && (
-                    <polyline
-                      fill="none"
-                      stroke="var(--chart-line-amber)"
-                      strokeWidth="2.4"
-                      points={convPolyline}
-                    />
-                  )}
-                </svg>
-              )}
-            </section>
+            <HourlyFootfallChart hourly={hourly} />
 
             <section className="panel">
               <div className="panel-header">
@@ -762,59 +601,49 @@ export function ShiftDiagnosticsView({
             </section>
           </div>
 
-          <div className="subtab-bar" role="tablist">
-            <button
-              id="subtab-oos"
-              type="button"
-              role="tab"
-              aria-selected={subTab === "oos"}
-              className={`subtab-btn ${subTab === "oos" ? "active" : ""}`}
-              onClick={() => selectSubTab("oos")}
-            >
-              Morning OOS &amp; Restock Lag ({oosList.length})
-            </button>
-            <button
-              id="subtab-queue"
-              type="button"
-              role="tab"
-              aria-selected={subTab === "queue"}
-              className={`subtab-btn ${subTab === "queue" ? "active" : ""}`}
-              onClick={() => selectSubTab("queue")}
-            >
-              Checkout Queue Saturation
-            </button>
-            <button
-              id="subtab-missions"
-              type="button"
-              role="tab"
-              aria-selected={subTab === "missions"}
-              className={`subtab-btn ${subTab === "missions" ? "active" : ""}`}
-              onClick={() => selectSubTab("missions")}
-            >
-              K-Means Missions &amp; Morning Basket ({missions.length})
-            </button>
-            <button
-              id="subtab-experiments"
-              type="button"
-              role="tab"
-              aria-selected={subTab === "experiments"}
-              className={`subtab-btn ${subTab === "experiments" ? "active" : ""}`}
-              onClick={() => selectSubTab("experiments")}
-            >
-              DiD Impact Trials ({data?.experiments.length ?? 0})
-            </button>
-            <button
-              id="subtab-roster"
-              type="button"
-              role="tab"
-              aria-selected={subTab === "roster"}
-              className={`subtab-btn ${subTab === "roster" ? "active" : ""}`}
-              onClick={() => selectSubTab("roster")}
-            >
-              Hourly Lane Staffing Roster
-            </button>
-          </div>
+          <SubTabBar
+            ariaLabel="Shift diagnostics detail sections"
+            activeId={subTab}
+            onSelect={selectSubTab}
+            tabs={[
+              {
+                id: "oos",
+                elementId: "subtab-oos",
+                panelId: "shift-panel-oos",
+                label: `Morning OOS & Restock Lag (${oosList.length})`,
+              },
+              {
+                id: "queue",
+                elementId: "subtab-queue",
+                panelId: "shift-panel-queue",
+                label: "Checkout Queue Saturation",
+              },
+              {
+                id: "missions",
+                elementId: "subtab-missions",
+                panelId: "shift-panel-missions",
+                label: `K-Means Missions & Morning Basket (${missions.length})`,
+              },
+              {
+                id: "experiments",
+                elementId: "subtab-experiments",
+                panelId: "shift-panel-experiments",
+                label: `DiD Impact Trials (${data?.experiments.length ?? 0})`,
+              },
+              {
+                id: "roster",
+                elementId: "subtab-roster",
+                panelId: "shift-panel-roster",
+                label: "Hourly Lane Staffing Roster",
+              },
+            ]}
+          />
 
+          <div
+            role="tabpanel"
+            id={`shift-panel-${subTab}`}
+            aria-labelledby={`subtab-${subTab}`}
+          >
           {subTab === "oos" && (
             <section className="panel" style={{ marginBottom: 20 }}>
               <div className="panel-header">
@@ -825,7 +654,7 @@ export function ShiftDiagnosticsView({
                   </p>
                 </div>
               </div>
-              <div className="table-wrap">
+              <div className="table-wrap" role="region" aria-label="Morning stockout diagnostics" tabIndex={0}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -892,7 +721,7 @@ export function ShiftDiagnosticsView({
                   </p>
                 </div>
               </div>
-              <div className="table-wrap">
+              <div className="table-wrap" role="region" aria-label="Queue friction by hour" tabIndex={0}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -986,7 +815,7 @@ export function ShiftDiagnosticsView({
                     </p>
                   </div>
                 </div>
-                <div className="table-wrap">
+                <div className="table-wrap" role="region" aria-label="Controlled experiment results" tabIndex={0}>
                   <table className="data-table">
                     <thead>
                       <tr>
@@ -1097,8 +926,9 @@ export function ShiftDiagnosticsView({
                   </div>
                   <form className="stack-md" onSubmit={(e) => void handleCreateExperiment(e)}>
                     <div className="field">
-                      <label>Experiment Name</label>
+                      <label htmlFor="did-exp-name">Experiment Name</label>
                       <input
+                        id="did-exp-name"
                         className="input"
                         value={expName}
                         onChange={(e) => setExpName(e.target.value)}
@@ -1106,8 +936,9 @@ export function ShiftDiagnosticsView({
                       />
                     </div>
                     <div className="field">
-                      <label>Hypothesis</label>
+                      <label htmlFor="did-exp-hyp">Hypothesis</label>
                       <input
+                        id="did-exp-hyp"
                         className="input"
                         value={expHyp}
                         onChange={(e) => setExpHyp(e.target.value)}
@@ -1116,9 +947,9 @@ export function ShiftDiagnosticsView({
                     </div>
                     <div className="form-grid">
                       <div className="field">
-                        <label>Intervention</label>
+                        <label htmlFor="did-exp-type">Intervention</label>
                         <select
-                          aria-label="Experiment intervention type"
+                          id="did-exp-type"
                           className="select"
                           value={expType}
                           onChange={(e) => setExpType(e.target.value)}
@@ -1130,16 +961,20 @@ export function ShiftDiagnosticsView({
                         </select>
                       </div>
                       <div className="field">
-                        <label>Pre Window</label>
+                        <label htmlFor="did-pre-start">Pre Window</label>
                         <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                           <input
+                            id="did-pre-start"
                             type="date"
+                            aria-label="Pre window start date"
                             className="input"
                             value={preStart}
                             onChange={(e) => setPreStart(e.target.value)}
                           />
                           <input
+                            id="did-pre-end"
                             type="date"
+                            aria-label="Pre window end date"
                             className="input"
                             value={preEnd}
                             onChange={(e) => setPreEnd(e.target.value)}
@@ -1147,16 +982,20 @@ export function ShiftDiagnosticsView({
                         </div>
                       </div>
                       <div className="field">
-                        <label>Post Window</label>
+                        <label htmlFor="did-post-start">Post Window</label>
                         <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                           <input
+                            id="did-post-start"
                             type="date"
+                            aria-label="Post window start date"
                             className="input"
                             value={postStart}
                             onChange={(e) => setPostStart(e.target.value)}
                           />
                           <input
+                            id="did-post-end"
                             type="date"
+                            aria-label="Post window end date"
                             className="input"
                             value={postEnd}
                             onChange={(e) => setPostEnd(e.target.value)}
@@ -1170,7 +1009,7 @@ export function ShiftDiagnosticsView({
                       className="btn btn-primary"
                       disabled={busyAction !== null}
                     >
-                      <FlaskConical size={14} />{" "}
+                      <FlaskConical size={14} aria-hidden="true" />{" "}
                       {busyAction === "experiment" ? "Evaluating..." : "Run DiD Evaluation"}
                     </button>
                   </form>
@@ -1182,6 +1021,7 @@ export function ShiftDiagnosticsView({
           {subTab === "roster" && (
             <StaffingRosterTab canOperate={canOperate} onBanner={(b) => setBanner(b)} />
           )}
+          </div>
 
           <section className="panel">
             <div className="panel-header">

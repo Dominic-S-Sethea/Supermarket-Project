@@ -82,7 +82,10 @@ export function AiCopilotDrawer({
   const [error, setError] = useState<string | null>(null);
 
   const streamAbortRef = useRef<AbortController | null>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
   const conversationIdRef = useRef<string | null>(conversationId);
   const sendingRef = useRef(sending);
   const sendMessageRef = useRef<(text?: string) => Promise<void>>(async () => {});
@@ -118,6 +121,7 @@ export function AiCopilotDrawer({
       abortActiveStream();
       return;
     }
+    autoScrollRef.current = true;
     const controller = new AbortController();
     void loadStatusAndHistory(controller.signal);
     return () => {
@@ -128,18 +132,33 @@ export function AiCopilotDrawer({
   useEffect(() => {
     return () => {
       abortActiveStream();
+      if (scrollRafRef.current !== null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(scrollRafRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
-    const prefersReducedMotion =
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    messagesEndRef.current?.scrollIntoView({
-      behavior: prefersReducedMotion ? "auto" : "smooth",
-      block: "end",
-    });
+    if (!autoScrollRef.current) return;
+    if (scrollRafRef.current !== null && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(scrollRafRef.current);
+    }
+    const runScroll = () => {
+      scrollRafRef.current = null;
+      const prefersReducedMotion =
+        typeof window !== "undefined" &&
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      messagesEndRef.current?.scrollIntoView({
+        behavior: prefersReducedMotion || streamingText.length > 0 ? "auto" : "smooth",
+        block: "end",
+      });
+    };
+    if (typeof requestAnimationFrame === "function") {
+      scrollRafRef.current = requestAnimationFrame(runScroll);
+    } else {
+      runScroll();
+    }
   }, [messages.length, streamingText, liveTools.length]);
 
   const loadConversation = async (id: string) => {
@@ -338,7 +357,7 @@ export function AiCopilotDrawer({
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Sparkles size={17} color="var(--accent-primary)" aria-hidden="true" />
+            <Sparkles size={17} color="var(--accent-primary-ink)" aria-hidden="true" />
             <h2 id="ai-copilot-drawer-title" style={{ margin: 0, fontSize: 18 }}>
               Store Manager AI Copilot
             </h2>
@@ -400,7 +419,15 @@ export function AiCopilotDrawer({
         </div>
       )}
 
-      <div className="ai-messages">
+      <div
+        ref={messagesContainerRef}
+        className="ai-messages"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+          autoScrollRef.current = distanceFromBottom <= 48;
+        }}
+      >
         {messages.length === 0 && !sending ? (
           <div className="stack-md" style={{ gap: 10 }}>
             <p className="panel-desc">

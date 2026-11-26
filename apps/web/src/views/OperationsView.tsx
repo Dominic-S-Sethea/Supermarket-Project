@@ -1,13 +1,24 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { computeEffectiveUnitCostCents, formatBp, formatMoney } from "@supermarket/shared/money";
 import { AlertTriangle, Award, Check, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
-import { FloorTasksTab } from "../components/FloorTasksTab";
-import { PurchaseOrdersTab, type ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
-import { ShelfIntegrityTab } from "../components/ShelfIntegrityTab";
-import { SupplierMatchTab } from "../components/SupplierMatchTab";
+import type { ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
+import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
+
+const FloorTasksTab = lazy(() =>
+  import("../components/FloorTasksTab").then((m) => ({ default: m.FloorTasksTab }))
+);
+const PurchaseOrdersTab = lazy(() =>
+  import("../components/PurchaseOrdersTab").then((m) => ({ default: m.PurchaseOrdersTab }))
+);
+const ShelfIntegrityTab = lazy(() =>
+  import("../components/ShelfIntegrityTab").then((m) => ({ default: m.ShelfIntegrityTab }))
+);
+const SupplierMatchTab = lazy(() =>
+  import("../components/SupplierMatchTab").then((m) => ({ default: m.SupplierMatchTab }))
+);
 
 interface MarginAlert {
   id: string;
@@ -150,7 +161,7 @@ export function OperationsView({
     }
   }, [suppliers, supplierId]);
 
-  const loadMarginAlerts = async (signal?: AbortSignal) => {
+  const loadMarginAlerts = useCallback(async (signal?: AbortSignal) => {
     if (!canManage) {
       setMarginAlerts([]);
       return;
@@ -163,9 +174,9 @@ export function OperationsView({
         setErrorMsg(err instanceof Error ? err.message : "Failed loading margin alerts");
       }
     }
-  };
+  }, [canManage]);
 
-  const loadExpiryBatches = async (days = horizonDays, signal?: AbortSignal) => {
+  const loadExpiryBatches = useCallback(async (days = horizonDays, signal?: AbortSignal) => {
     setLoading(true);
     setErrorMsg(null);
     try {
@@ -183,7 +194,7 @@ export function OperationsView({
         setLoading(false);
       }
     }
-  };
+  }, [horizonDays]);
 
   const refreshAfterMutation = async () => {
     await Promise.all([loadMarginAlerts(), loadExpiryBatches(horizonDays)]);
@@ -194,13 +205,13 @@ export function OperationsView({
     const controller = new AbortController();
     void loadMarginAlerts(controller.signal);
     return () => controller.abort();
-  }, [canManage]);
+  }, [loadMarginAlerts]);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadExpiryBatches(horizonDays, controller.signal);
     return () => controller.abort();
-  }, [horizonDays]);
+  }, [horizonDays, loadExpiryBatches]);
 
   // Searchable 3,120-SKU picker for GRN receiving (manager/owner only)
   useEffect(() => {
@@ -217,8 +228,10 @@ export function OperationsView({
           );
           if (controller.signal.aborted) return;
           setProductOptions(res.items);
-          if (res.items.length > 0 && !res.items.some((i) => i.id === selectedProdId)) {
-            setSelectedProdId(res.items[0].id);
+          if (res.items.length > 0) {
+            setSelectedProdId((prev) =>
+              res.items.some((i) => i.id === prev) ? prev : res.items[0].id
+            );
           }
         } catch (err) {
           if ((err as Error).name !== "AbortError") {
@@ -450,62 +463,73 @@ export function OperationsView({
               : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."}
           </p>
         </div>
-        <div className="subtab-bar" role="tablist">
-          <button
-            id="ops-subtab-receiving"
-            type="button"
-            role="tab"
-            aria-selected={subTab === "receiving"}
-            className={`subtab-btn ${subTab === "receiving" ? "active" : ""}`}
-            onClick={() => selectSubTab("receiving")}
-          >
-            <PackageCheck size={14} aria-hidden="true" /> Receiving &amp; FEFO
-          </button>
-          {canManage && (
-            <button
-              id="ops-subtab-orders"
-              type="button"
-              role="tab"
-              aria-selected={subTab === "orders"}
-              className={`subtab-btn ${subTab === "orders" ? "active" : ""}`}
-              onClick={() => selectSubTab("orders")}
-            >
-              <FileText size={14} aria-hidden="true" /> Purchase Orders
-            </button>
+        <SubTabBar
+          ariaLabel="Operations sections"
+          activeId={subTab}
+          onSelect={selectSubTab}
+          tabs={(
+            [
+              {
+                id: "receiving" as const,
+                elementId: "ops-subtab-receiving",
+                panelId: "ops-panel-receiving",
+                label: (
+                  <>
+                    <PackageCheck size={14} aria-hidden="true" /> Receiving &amp; FEFO
+                  </>
+                ),
+              },
+              ...(canManage
+                ? [
+                    {
+                      id: "orders" as const,
+                      elementId: "ops-subtab-orders",
+                      panelId: "ops-panel-orders",
+                      label: (
+                        <>
+                          <FileText size={14} aria-hidden="true" /> Purchase Orders
+                        </>
+                      ),
+                    },
+                  ]
+                : []),
+              {
+                id: "shelf" as const,
+                elementId: "ops-subtab-shelf",
+                panelId: "ops-panel-shelf",
+                label: (
+                  <>
+                    <Ghost size={14} aria-hidden="true" /> Shelf Integrity &amp; 07:30 Tags
+                  </>
+                ),
+              },
+              {
+                id: "tasks" as const,
+                elementId: "ops-subtab-tasks",
+                panelId: "ops-panel-tasks",
+                label: (
+                  <>
+                    <ClipboardList size={14} aria-hidden="true" /> Daily Floor Tasks
+                  </>
+                ),
+              },
+              ...(canManage
+                ? [
+                    {
+                      id: "suppliers" as const,
+                      elementId: "ops-subtab-suppliers",
+                      panelId: "ops-panel-suppliers",
+                      label: (
+                        <>
+                          <Award size={14} aria-hidden="true" /> Supplier OTIF &amp; 3-Way Match
+                        </>
+                      ),
+                    },
+                  ]
+                : []),
+            ] satisfies SubTabItem<OpsSubTab>[]
           )}
-          <button
-            id="ops-subtab-shelf"
-            type="button"
-            role="tab"
-            aria-selected={subTab === "shelf"}
-            className={`subtab-btn ${subTab === "shelf" ? "active" : ""}`}
-            onClick={() => selectSubTab("shelf")}
-          >
-            <Ghost size={14} aria-hidden="true" /> Shelf Integrity &amp; 07:30 Tags
-          </button>
-          <button
-            id="ops-subtab-tasks"
-            type="button"
-            role="tab"
-            aria-selected={subTab === "tasks"}
-            className={`subtab-btn ${subTab === "tasks" ? "active" : ""}`}
-            onClick={() => selectSubTab("tasks")}
-          >
-            <ClipboardList size={14} aria-hidden="true" /> Daily Floor Tasks
-          </button>
-          {canManage && (
-            <button
-              id="ops-subtab-suppliers"
-              type="button"
-              role="tab"
-              aria-selected={subTab === "suppliers"}
-              className={`subtab-btn ${subTab === "suppliers" ? "active" : ""}`}
-              onClick={() => selectSubTab("suppliers")}
-            >
-              <Award size={14} aria-hidden="true" /> Supplier OTIF &amp; 3-Way Match
-            </button>
-          )}
-        </div>
+        />
       </header>
 
       {!canManage && (
@@ -517,59 +541,72 @@ export function OperationsView({
       )}
 
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 14 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
           <span>{errorMsg}</span>
-          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
           </button>
         </div>
       )}
 
       {feedback && (
-        <div className="banner banner-green" style={{ marginBottom: 16 }}>
+        <div className="banner banner-green" role="status" style={{ marginBottom: 16 }}>
           <span>{feedback}</span>
-          <button className="btn btn-sm" onClick={() => setFeedback(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setFeedback(null)}>
             Dismiss
           </button>
         </div>
       )}
 
+      <div
+        role="tabpanel"
+        id={`ops-panel-${subTab}`}
+        aria-labelledby={`ops-subtab-${subTab}`}
+      >
       {subTab === "orders" && canManage ? (
-        <PurchaseOrdersTab
-          onReceiveAgainstPo={handleReceiveAgainstPo}
-          onFeedback={(msg) => {
-            setErrorMsg(null);
-            setFeedback(msg);
-          }}
-          onError={(msg) => setErrorMsg(msg)}
-        />
+        <Suspense fallback={<div className="panel">Loading Purchase Orders...</div>}>
+          <PurchaseOrdersTab
+            onReceiveAgainstPo={handleReceiveAgainstPo}
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
       ) : subTab === "suppliers" && canManage ? (
-        <SupplierMatchTab
-          canManage={canManage}
-          onFeedback={(msg) => {
-            setErrorMsg(null);
-            setFeedback(msg);
-          }}
-          onError={(msg) => setErrorMsg(msg)}
-        />
+        <Suspense fallback={<div className="panel">Loading Supplier Scorecards...</div>}>
+          <SupplierMatchTab
+            canManage={canManage}
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
       ) : subTab === "shelf" ? (
-        <ShelfIntegrityTab
-          canManage={canManage}
-          onFeedback={(msg) => {
-            setErrorMsg(null);
-            setFeedback(msg);
-            onCountsChanged?.();
-          }}
-          onError={(msg) => setErrorMsg(msg)}
-        />
+        <Suspense fallback={<div className="panel">Loading Shelf Integrity...</div>}>
+          <ShelfIntegrityTab
+            canManage={canManage}
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+              onCountsChanged?.();
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
       ) : subTab === "tasks" ? (
-        <FloorTasksTab
-          onFeedback={(msg) => {
-            setErrorMsg(null);
-            setFeedback(msg);
-          }}
-          onError={(msg) => setErrorMsg(msg)}
-        />
+        <Suspense fallback={<div className="panel">Loading Floor Tasks...</div>}>
+          <FloorTasksTab
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
       ) : (
         <>
           {canManage && (
@@ -579,7 +616,7 @@ export function OperationsView({
             <div className="panel-header">
               <div>
                 <h2 className="panel-title">
-                  <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
+                  <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
                   Multimodal AI Supplier Invoice → GRN Scanner
                 </h2>
                 <p className="panel-desc">
@@ -602,6 +639,7 @@ export function OperationsView({
                   />
                 </label>
                 <button
+                  type="button"
                   id="scan-sample-invoice-btn"
                   className="btn btn-primary btn-sm"
                   disabled={scanningInvoice}
@@ -624,7 +662,7 @@ export function OperationsView({
                   )}
                 </div>
 
-                <div className="table-wrap">
+                <div className="table-wrap" role="region" aria-label="Scanned supplier invoice lines" tabIndex={0}>
                   <table className="data-table">
                     <thead>
                       <tr>
@@ -633,7 +671,9 @@ export function OperationsView({
                         <th className="text-right">Line Total</th>
                         <th className="text-right">Eff. Unit Cost</th>
                         <th className="text-right">Cost Delta</th>
-                        <th />
+                        <th>
+                          <span className="sr-only">Actions</span>
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
@@ -659,6 +699,7 @@ export function OperationsView({
                           </td>
                           <td className="text-right">
                             <button
+                              type="button"
                               className="btn btn-primary btn-sm"
                               onClick={() => applyScannedLineToGrn(l)}
                             >
@@ -712,7 +753,7 @@ export function OperationsView({
                   All product retail prices currently meet target margin floors!
                 </div>
               ) : (
-                <div className="table-wrap">
+                <div className="table-wrap" role="region" aria-label="Vendor margin erosion alerts" tabIndex={0}>
                   <table className="data-table">
                     <thead>
                       <tr>
@@ -721,7 +762,9 @@ export function OperationsView({
                         <th className="text-right">Current Price</th>
                         <th className="text-right">Compressed Margin</th>
                         <th className="text-right">Suggested Price</th>
-                        <th />
+                        <th>
+                          <span className="sr-only">Actions</span>
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
@@ -743,11 +786,12 @@ export function OperationsView({
                           <td className="text-right">
                             <span className="tag tag-red mono">{formatBp(a.resultingMarginBp)}</span>
                           </td>
-                          <td className="text-right mono" style={{ fontWeight: 700, color: "var(--accent-primary)" }}>
+                          <td className="text-right mono" style={{ fontWeight: 700, color: "var(--accent-primary-ink)" }}>
                             {formatMoney(a.suggestedSellPriceCents)}
                           </td>
                           <td className="text-right">
                             <button
+                              type="button"
                               className="btn btn-primary btn-sm"
                               disabled={busyAction !== null}
                               onClick={() => void handleApplySuggestedPrice(a.id, a.sku)}
@@ -930,7 +974,7 @@ export function OperationsView({
                     <span>Invoice Cost / Paid Unit</span>
                     <span className="mono">{formatMoney(paidOnlyCost)}</span>
                   </div>
-                  <div className="total-row" style={{ color: "var(--accent-primary)", fontWeight: 700 }}>
+                  <div className="total-row" style={{ color: "var(--accent-primary-ink)", fontWeight: 700 }}>
                     <span>True Effective Unit Cost (incl. Free Cases)</span>
                     <span className="mono">{formatMoney(effectiveUnitCost)}</span>
                   </div>
@@ -978,7 +1022,7 @@ export function OperationsView({
           </select>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="FEFO expiry alerts table" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -1041,6 +1085,7 @@ export function OperationsView({
                         <div style={{ display: "inline-flex", gap: 6 }}>
                           {b.status !== "clearance" && (
                             <button
+                              type="button"
                               className="btn btn-amber btn-sm"
                               disabled={busyAction !== null}
                               onClick={() => void handleBatchAction(b.batchId, "clearance", b.sku)}
@@ -1049,6 +1094,7 @@ export function OperationsView({
                             </button>
                           )}
                           <button
+                            type="button"
                             className="btn btn-sm"
                             disabled={busyAction !== null}
                             onClick={() => void handleBatchAction(b.batchId, "write_off", b.sku)}
@@ -1067,6 +1113,7 @@ export function OperationsView({
       </section>
         </>
       )}
+      </div>
     </div>
   );
 }

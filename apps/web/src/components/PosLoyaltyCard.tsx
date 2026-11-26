@@ -67,7 +67,7 @@ export function PosLoyaltyCard({
       {attachedCustomer ? (
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
           <span style={{ fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
-            <UserCheck size={14} aria-hidden="true" style={{ color: "var(--accent-primary)" }} />
+            <UserCheck size={14} aria-hidden="true" style={{ color: "var(--accent-primary-ink)" }} />
             <strong>{attachedCustomer.fullName}</strong>
             <span className="tag tag-blue mono" style={{ fontSize: 10 }}>
               {attachedCustomer.pointsBalance} pts
@@ -136,7 +136,7 @@ export function PosLoyaltyCard({
             <Ticket
               size={14}
               aria-hidden="true"
-              style={{ color: couponEligibleNow ? "var(--accent-primary)" : "var(--accent-amber)" }}
+              style={{ color: couponEligibleNow ? "var(--accent-primary-ink)" : "var(--accent-amber)" }}
             />
             <strong className="mono">{appliedCoupon.code}</strong>
             <span className={`tag ${couponEligibleNow ? "tag-green" : "tag-amber"} mono`} style={{ fontSize: 10 }}>

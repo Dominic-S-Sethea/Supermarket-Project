@@ -222,7 +222,7 @@ export function RecentReceiptsModal({
           {recentError}
         </div>
       )}
-      <div className="table-wrap" style={{ maxHeight: 420, overflowY: "auto" }}>
+      <div className="table-wrap" role="region" aria-label="Receipt lookup results" tabIndex={0} style={{ maxHeight: 420, overflowY: "auto" }}>
         <table className="data-table">
           <thead>
             <tr>

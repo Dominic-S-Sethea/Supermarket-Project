@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { formatMoney } from "@supermarket/shared/money";
 import { Award, CheckCircle2, FileWarning, RefreshCw, Scale } from "lucide-react";
 import { apiGet, apiPatch } from "../api";
@@ -107,7 +107,10 @@ export function SupplierMatchTab({
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const loadData = async (status = statusFilter, signal?: AbortSignal) => {
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  const loadData = useCallback(async (status = statusFilter, signal?: AbortSignal) => {
     setLoading(true);
     try {
       const qs = status === "all" ? "" : `?status=${encodeURIComponent(status)}`;
@@ -128,18 +131,20 @@ export function SupplierMatchTab({
       setVarSummary(varRes.summary);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        onError(err instanceof Error ? err.message : "Failed loading supplier scorecards & variances");
+        onErrorRef.current(
+          err instanceof Error ? err.message : "Failed loading supplier scorecards & variances"
+        );
       }
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, [statusFilter]);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadData(statusFilter, controller.signal);
     return () => controller.abort();
-  }, [statusFilter]);
+  }, [statusFilter, loadData]);
 
   const handleUpdateVariance = async (
     variance: GrnVariance,
@@ -184,7 +189,7 @@ export function SupplierMatchTab({
           <div
             className="kpi-value"
             style={{
-              color: (scSummary?.atRiskSuppliers ?? 0) > 0 ? "var(--accent-crimson)" : "var(--accent-primary)",
+              color: (scSummary?.atRiskSuppliers ?? 0) > 0 ? "var(--accent-crimson)" : "var(--accent-primary-ink)",
             }}
           >
             {scSummary?.atRiskSuppliers ?? 0}
@@ -205,7 +210,7 @@ export function SupplierMatchTab({
           <div
             className="kpi-value"
             style={{
-              color: (varSummary?.openImpactCents ?? 0) > 0 ? "var(--accent-amber)" : "var(--accent-primary)",
+              color: (varSummary?.openImpactCents ?? 0) > 0 ? "var(--accent-amber)" : "var(--accent-primary-ink)",
             }}
           >
             {formatMoney(varSummary?.openImpactCents ?? 0)}
@@ -219,7 +224,7 @@ export function SupplierMatchTab({
         <div className="panel-header">
           <div>
             <h2 className="panel-title">
-              <Award size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
+              <Award size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
               90-Day Supplier OTIF &amp; Lead-Time Reliability Scorecards
             </h2>
             <p className="panel-desc">
@@ -227,6 +232,7 @@ export function SupplierMatchTab({
             </p>
           </div>
           <button
+            type="button"
             className="btn btn-sm"
             disabled={loading}
             onClick={() => void loadData(statusFilter)}
@@ -235,7 +241,7 @@ export function SupplierMatchTab({
           </button>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Supplier delivery scorecards" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -333,7 +339,7 @@ export function SupplierMatchTab({
           </select>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Three-way GRN invoice variances" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -396,6 +402,7 @@ export function SupplierMatchTab({
                         {canManage && !isClosed ? (
                           <input
                             className="input"
+                            aria-label={`Resolution or credit note for ${v.invoiceNumber}`}
                             style={{ marginTop: 6, fontSize: 12, padding: "4px 8px", minWidth: 160 }}
                             placeholder="Credit note # or dispute note..."
                             value={notesById[v.id] ?? v.resolutionNote ?? ""}
@@ -415,21 +422,23 @@ export function SupplierMatchTab({
                         <td className="text-right">
                           {isClosed ? (
                             <span style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                              <CheckCircle2 size={13} style={{ verticalAlign: "middle", marginRight: 4 }} />
+                              <CheckCircle2 size={13} aria-hidden="true" style={{ verticalAlign: "middle", marginRight: 4 }} />
                               Closed
                             </span>
                           ) : (
                             <div style={{ display: "inline-flex", gap: 5, flexWrap: "wrap", justifyContent: "flex-end" }}>
                               {v.status !== "disputed" && (
                                 <button
+                                  type="button"
                                   className="btn btn-amber btn-sm"
                                   disabled={busyId !== null}
                                   onClick={() => void handleUpdateVariance(v, "disputed")}
                                 >
-                                  <FileWarning size={12} /> Dispute
+                                  <FileWarning size={12} aria-hidden="true" /> Dispute
                                 </button>
                               )}
                               <button
+                                type="button"
                                 className="btn btn-primary btn-sm"
                                 disabled={busyId !== null}
                                 onClick={() => void handleUpdateVariance(v, "resolved_credit_note")}
@@ -437,6 +446,7 @@ export function SupplierMatchTab({
                                 Credit Note
                               </button>
                               <button
+                                type="button"
                                 className="btn btn-sm"
                                 disabled={busyId !== null}
                                 onClick={() => void handleUpdateVariance(v, "written_off")}

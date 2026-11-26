@@ -176,7 +176,7 @@ export function CatalogInspectorDrawer({
                 <Printer size={13} aria-hidden="true" /> ZPL Shelf Tag
               </button>
             </div>
-            <div className="table-wrap">
+            <div className="table-wrap" role="region" aria-label="Product pack-tier barcodes" tabIndex={0}>
               <table className="data-table">
                 <thead>
                   <tr>
@@ -184,7 +184,11 @@ export function CatalogInspectorDrawer({
                     <th>GS1 Barcode</th>
                     <th className="text-right">Price</th>
                     {typeof selected.avgCostCents === "number" && <th className="text-right">Net Margin</th>}
-                    {canEditCatalog && <th />}
+                    {canEditCatalog && (
+                      <th>
+                        <span className="sr-only">Actions</span>
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
@@ -443,7 +447,7 @@ export function CatalogCsvImportModal({
             <span className="tag tag-amber">Duplicates: {preview.duplicateCount}</span>
             <span className="tag tag-red">Errors Blocked: {preview.errorCount}</span>
           </div>
-          <div className="table-wrap">
+          <div className="table-wrap" role="region" aria-label="CSV import preview table" tabIndex={0}>
             <table className="data-table">
               <thead>
                 <tr>

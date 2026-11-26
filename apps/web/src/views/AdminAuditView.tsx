@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { formatMoney } from "@supermarket/shared/money";
 import {
@@ -15,6 +15,8 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
+import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
 interface StaffUserRow {
   id: string;
@@ -144,7 +146,37 @@ export function AdminAuditView({
   currentUsername: string;
 }) {
   const isOwner = userRole === "owner";
-  const [subTab, setSubTab] = useState<AdminSubTab>(isOwner ? "users" : "audit");
+  const allowedSubTabs: AdminSubTab[] = useMemo(
+    () =>
+      isOwner
+        ? ["users", "audit", "reconciliation", "pipeline", "security"]
+        : ["audit", "reconciliation", "pipeline", "security"],
+    [isOwner]
+  );
+  const resolveSubTab = (): AdminSubTab => {
+    const fromUrl = readQueryParam("sub") as AdminSubTab | null;
+    if (fromUrl && allowedSubTabs.includes(fromUrl)) return fromUrl;
+    return isOwner ? "users" : "audit";
+  };
+  const [subTab, setSubTab] = useState<AdminSubTab>(resolveSubTab);
+  const selectSubTab = (next: AdminSubTab) => {
+    setSubTab(next);
+    syncQueryParam("sub", next, { push: true });
+  };
+
+  useEffect(() => {
+    const onPopState = () => {
+      const fromUrl = readQueryParam("sub") as AdminSubTab | null;
+      if (fromUrl && allowedSubTabs.includes(fromUrl)) {
+        setSubTab(fromUrl);
+      } else {
+        setSubTab(isOwner ? "users" : "audit");
+      }
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [isOwner, allowedSubTabs]);
+
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -180,7 +212,7 @@ export function AdminAuditView({
   const [nextPin, setNextPin] = useState("");
   const [confirmNextPin, setConfirmNextPin] = useState("");
 
-  const loadUsers = async (signal?: AbortSignal) => {
+  const loadUsers = useCallback(async (signal?: AbortSignal) => {
     if (!isOwner) return;
     setLoadingUsers(true);
     try {
@@ -193,9 +225,9 @@ export function AdminAuditView({
     } finally {
       if (!signal?.aborted) setLoadingUsers(false);
     }
-  };
+  }, [isOwner]);
 
-  const loadAuditLogs = async (page = auditPage, signal?: AbortSignal) => {
+  const loadAuditLogs = useCallback(async (page = auditPage, signal?: AbortSignal) => {
     setLoadingAudit(true);
     try {
       const qs = new URLSearchParams({
@@ -214,9 +246,9 @@ export function AdminAuditView({
     } finally {
       if (!signal?.aborted) setLoadingAudit(false);
     }
-  };
+  }, [auditPage, auditAction, auditEntity, auditSearch]);
 
-  const loadShiftSummary = async (signal?: AbortSignal) => {
+  const loadShiftSummary = useCallback(async (signal?: AbortSignal) => {
     setLoadingShifts(true);
     try {
       const res = await apiGet<ShiftSummaryPayload>("/api/pos/shifts/summary", signal);
@@ -228,9 +260,9 @@ export function AdminAuditView({
     } finally {
       if (!signal?.aborted) setLoadingShifts(false);
     }
-  };
+  }, []);
 
-  const loadPipelineRuns = async (signal?: AbortSignal) => {
+  const loadPipelineRuns = useCallback(async (signal?: AbortSignal) => {
     setLoadingPipeline(true);
     try {
       const res = await apiGet<{ runs: PipelineRunRow[] }>("/api/admin/pipeline-runs", signal);
@@ -242,7 +274,7 @@ export function AdminAuditView({
     } finally {
       if (!signal?.aborted) setLoadingPipeline(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -250,7 +282,7 @@ export function AdminAuditView({
     if (subTab === "reconciliation") void loadShiftSummary(controller.signal);
     if (subTab === "pipeline") void loadPipelineRuns(controller.signal);
     return () => controller.abort();
-  }, [subTab, isOwner]);
+  }, [subTab, isOwner, loadUsers, loadShiftSummary, loadPipelineRuns]);
 
   useEffect(() => {
     if (subTab !== "audit") return;
@@ -262,7 +294,7 @@ export function AdminAuditView({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [subTab, auditAction, auditEntity, auditSearch, auditPage]);
+  }, [subTab, auditPage, loadAuditLogs]);
 
   const handleCreateUser = async () => {
     if (busy) return;
@@ -400,97 +432,116 @@ export function AdminAuditView({
               : "Inspect the immutable store audit trail, reconcile cashier Z-Reports, rotate your PIN, and export formula-safe ERP registers."}
           </p>
         </div>
-        <div className="subtab-bar" role="tablist">
-          {isOwner && (
-            <button
-              id="admin-subtab-users"
-              role="tab"
-              aria-selected={subTab === "users"}
-              className={`subtab-btn ${subTab === "users" ? "active" : ""}`}
-              onClick={() => setSubTab("users")}
-            >
-              <Users size={14} /> Staff &amp; Sessions
-            </button>
+        <SubTabBar
+          ariaLabel="Governance and audit sections"
+          activeId={subTab}
+          onSelect={selectSubTab}
+          tabs={(
+            [
+              ...(isOwner
+                ? [
+                    {
+                      id: "users" as const,
+                      elementId: "admin-subtab-users",
+                      panelId: "admin-panel-users",
+                      label: (
+                        <>
+                          <Users size={14} aria-hidden="true" /> Staff &amp; Sessions
+                        </>
+                      ),
+                    },
+                  ]
+                : []),
+              {
+                id: "audit" as const,
+                elementId: "admin-subtab-audit",
+                panelId: "admin-panel-audit",
+                label: (
+                  <>
+                    <ShieldCheck size={14} aria-hidden="true" /> Immutable Audit Log
+                  </>
+                ),
+              },
+              {
+                id: "reconciliation" as const,
+                elementId: "admin-subtab-reconciliation",
+                panelId: "admin-panel-reconciliation",
+                label: (
+                  <>
+                    <Receipt size={14} aria-hidden="true" /> Z-Reports &amp; Exports
+                  </>
+                ),
+              },
+              {
+                id: "pipeline" as const,
+                elementId: "admin-subtab-pipeline",
+                panelId: "admin-panel-pipeline",
+                label: (
+                  <>
+                    <Activity size={14} aria-hidden="true" /> ML Pipeline Health
+                  </>
+                ),
+              },
+              {
+                id: "security" as const,
+                elementId: "admin-subtab-security",
+                panelId: "admin-panel-security",
+                label: (
+                  <>
+                    <KeyRound size={14} aria-hidden="true" /> My PIN Security
+                  </>
+                ),
+              },
+            ] satisfies SubTabItem<AdminSubTab>[]
           )}
-          <button
-            id="admin-subtab-audit"
-            role="tab"
-            aria-selected={subTab === "audit"}
-            className={`subtab-btn ${subTab === "audit" ? "active" : ""}`}
-            onClick={() => setSubTab("audit")}
-          >
-            <ShieldCheck size={14} /> Immutable Audit Log
-          </button>
-          <button
-            id="admin-subtab-reconciliation"
-            role="tab"
-            aria-selected={subTab === "reconciliation"}
-            className={`subtab-btn ${subTab === "reconciliation" ? "active" : ""}`}
-            onClick={() => setSubTab("reconciliation")}
-          >
-            <Receipt size={14} /> Z-Reports &amp; Exports
-          </button>
-          <button
-            id="admin-subtab-pipeline"
-            role="tab"
-            aria-selected={subTab === "pipeline"}
-            className={`subtab-btn ${subTab === "pipeline" ? "active" : ""}`}
-            onClick={() => setSubTab("pipeline")}
-          >
-            <Activity size={14} /> ML Pipeline Health
-          </button>
-          <button
-            id="admin-subtab-security"
-            role="tab"
-            aria-selected={subTab === "security"}
-            className={`subtab-btn ${subTab === "security" ? "active" : ""}`}
-            onClick={() => setSubTab("security")}
-          >
-            <KeyRound size={14} /> My PIN Security
-          </button>
-        </div>
+        />
       </header>
 
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 14 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
           <span>{errorMsg}</span>
-          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
           </button>
         </div>
       )}
 
       {feedback && (
-        <div className="banner banner-green" style={{ marginBottom: 14 }}>
+        <div className="banner banner-green" role="status" style={{ marginBottom: 14 }}>
           <span>{feedback}</span>
-          <button className="btn btn-sm" onClick={() => setFeedback(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setFeedback(null)}>
             Dismiss
           </button>
         </div>
       )}
 
+      <div
+        role="tabpanel"
+        id={`admin-panel-${subTab}`}
+        aria-labelledby={`admin-subtab-${subTab}`}
+      >
       {subTab === "users" && isOwner && (
         <div className="grid-asymmetric">
           <section className="panel">
             <div className="panel-header">
               <div>
                 <h2 className="panel-title">
-                  <Users size={15} style={{ verticalAlign: "middle", marginRight: 6 }} />
+                  <Users size={15} aria-hidden="true" style={{ verticalAlign: "middle", marginRight: 6 }} />
                   Staff Accounts &amp; Active Sessions ({staffUsers.length})
                 </h2>
                 <p className="panel-desc">
                   Deactivating an account or resetting a PIN atomically revokes all active JWT sessions in PostgreSQL.
                 </p>
               </div>
-              <button className="btn btn-sm" disabled={loadingUsers} onClick={() => void loadUsers()}>
-                <RefreshCw size={13} /> Refresh
+              <button type="button" className="btn btn-sm" disabled={loadingUsers} onClick={() => void loadUsers()}>
+                <RefreshCw size={13} aria-hidden="true" /> Refresh
               </button>
             </div>
 
             {loadingUsers && staffUsers.length === 0 ? (
               <div style={{ padding: "14px 0", color: "var(--ink-muted)" }}>Loading staff accounts...</div>
             ) : (
-              <div className="table-wrap">
+              <div className="table-wrap" role="region" aria-label="Staff user accounts" tabIndex={0}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -526,11 +577,13 @@ export function AdminAuditView({
                                 className="input mono"
                                 type="password"
                                 placeholder="New PIN"
+                                aria-label={`New PIN for ${u.fullName}`}
                                 style={{ width: 96, padding: "4px 8px" }}
                                 value={resetPinValue}
                                 onChange={(e) => setResetPinValue(e.target.value)}
                               />
                               <button
+                                type="button"
                                 className="btn btn-primary btn-sm"
                                 disabled={busy !== null}
                                 onClick={() => void handleResetPin(u.id, u.username)}
@@ -538,6 +591,7 @@ export function AdminAuditView({
                                 Save
                               </button>
                               <button
+                                type="button"
                                 className="btn btn-sm"
                                 onClick={() => {
                                   setResetPinTarget(null);
@@ -550,6 +604,7 @@ export function AdminAuditView({
                           ) : (
                             <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                               <button
+                                type="button"
                                 className="btn btn-sm"
                                 disabled={busy !== null}
                                 onClick={() => {
@@ -561,6 +616,7 @@ export function AdminAuditView({
                               </button>
                               {u.activeSessions > 0 && (
                                 <button
+                                  type="button"
                                   className="btn btn-sm"
                                   disabled={busy !== null}
                                   onClick={() => void handleRevokeSessions(u)}
@@ -569,8 +625,9 @@ export function AdminAuditView({
                                 </button>
                               )}
                               <button
+                                type="button"
                                 className="btn btn-sm"
-                                style={{ color: u.active ? "var(--accent-crimson)" : "var(--accent-primary)" }}
+                                style={{ color: u.active ? "var(--accent-crimson)" : "var(--accent-primary-ink)" }}
                                 disabled={busy !== null}
                                 onClick={() => void handleToggleActive(u)}
                               >
@@ -748,7 +805,7 @@ export function AdminAuditView({
             <div className="banner banner-amber">No audit events match your current filters.</div>
           ) : (
             <>
-              <div className="table-wrap">
+              <div className="table-wrap" role="region" aria-label="Immutable audit trail" tabIndex={0}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -805,6 +862,7 @@ export function AdminAuditView({
                 </span>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button
+                    type="button"
                     className="btn btn-sm"
                     disabled={auditPage <= 1}
                     onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
@@ -812,6 +870,7 @@ export function AdminAuditView({
                     Previous
                   </button>
                   <button
+                    type="button"
                     className="btn btn-sm"
                     disabled={auditPage >= totalAuditPages}
                     onClick={() => setAuditPage((p) => Math.min(totalAuditPages, p + 1))}
@@ -844,7 +903,7 @@ export function AdminAuditView({
                     color:
                       shiftSummary.summary.netVarianceCents < 0
                         ? "var(--accent-crimson)"
-                        : "var(--accent-primary)",
+                        : "var(--accent-primary-ink)",
                   }}
                 >
                   {formatMoney(shiftSummary.summary.netVarianceCents)}
@@ -918,6 +977,7 @@ export function AdminAuditView({
                 </p>
               </div>
               <button
+                type="button"
                 className="btn btn-sm"
                 disabled={loadingShifts}
                 onClick={() => void loadShiftSummary()}
@@ -930,7 +990,7 @@ export function AdminAuditView({
             ) : !shiftSummary || shiftSummary.byCashier.length === 0 ? (
               <div className="banner banner-amber">No closed Z-Report shifts recorded yet.</div>
             ) : (
-              <div className="table-wrap">
+              <div className="table-wrap" role="region" aria-label="Z-report shift reconciliation" tabIndex={0}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -979,6 +1039,7 @@ export function AdminAuditView({
                 </p>
               </div>
               <button
+                type="button"
                 className="btn btn-sm"
                 disabled={loadingPipeline}
                 onClick={() => void loadPipelineRuns()}
@@ -1040,7 +1101,7 @@ export function AdminAuditView({
                         <h3 style={{ fontSize: 13.5, margin: "0 0 8px" }}>
                           12-Check Data-Quality Contract Matrix
                         </h3>
-                        <div className="table-wrap">
+                        <div className="table-wrap" role="region" aria-label="Data-quality contract matrix" tabIndex={0}>
                           <table className="data-table">
                             <thead>
                               <tr>
@@ -1076,7 +1137,7 @@ export function AdminAuditView({
                         <h3 style={{ fontSize: 13.5, margin: "0 0 8px" }}>
                           Stage Execution Timings
                         </h3>
-                        <div className="table-wrap">
+                        <div className="table-wrap" role="region" aria-label="Pipeline stage execution timings" tabIndex={0}>
                           <table className="data-table">
                             <thead>
                               <tr>
@@ -1177,6 +1238,7 @@ export function AdminAuditView({
           </form>
         </section>
       )}
+      </div>
     </div>
   );
 }

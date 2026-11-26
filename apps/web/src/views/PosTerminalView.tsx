@@ -28,6 +28,7 @@ import {
   type RecentSaleRow,
   type ZReportSummary,
 } from "../components/PosModals";
+import { PosScanBar } from "../components/PosScanBar";
 import {
   appendDeadLetterSale,
   classifySaleSyncError,
@@ -78,7 +79,6 @@ export function PosTerminalView({
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [simulatedOffline, setSimulatedOffline] = useState(false);
 
-  const [scanInput, setScanInput] = useState("");
   const [scanError, setScanError] = useState<string | null>(null);
   const [cart, setCart] = useState<CartInputLine[]>([]);
   const [ageVerified, setAgeVerified] = useState(false);
@@ -176,13 +176,58 @@ export function PosTerminalView({
   const hydrateFromSnapshot = useCallback(
     (data: PosBootstrapSnapshot, source: "live" | "indexeddb") => {
       const pMap = new Map(data.products.map((p) => [p.id, p]));
-      const bMap = new Map(data.barcodes.map((b) => [b.barcode, b]));
+      const bMap = new Map<string, BootstrapBarcode>();
       const primMap = new Map<string, BootstrapBarcode>();
+
+      type QuickPick = {
+        barcode: string;
+        name: string;
+        packLabel: string;
+        packQty: number;
+        priceCents: number;
+        badge: string;
+      };
+      const quickRules: { prefix: string; packQty: number; badge: string; limit: number; items: QuickPick[] }[] = [
+        { prefix: "BEER", packQty: 6, badge: "Beer 6-Pack · 18+", limit: 2, items: [] },
+        { prefix: "BEER", packQty: 1, badge: "Beer Single · 18+", limit: 1, items: [] },
+        { prefix: "NDLS", packQty: 1, badge: "5 for $3.95 Promo", limit: 3, items: [] },
+        { prefix: "NDLS", packQty: 5, badge: "5-Pack Bundle", limit: 1, items: [] },
+        { prefix: "SNCK", packQty: 1, badge: "Buy 2 Get 1 Free", limit: 3, items: [] },
+        { prefix: "SODA", packQty: 6, badge: "Soda 6-Pack", limit: 1, items: [] },
+        { prefix: "ENRG", packQty: 1, badge: "Energy Can", limit: 1, items: [] },
+      ];
+      let quickRemaining = quickRules.reduce((acc, r) => acc + r.limit, 0);
+
       for (const bc of data.barcodes) {
+        bMap.set(bc.barcode, bc);
         if (bc.isPrimary || !primMap.has(bc.productId)) {
           primMap.set(bc.productId, bc);
         }
+        if (quickRemaining > 0) {
+          const p = pMap.get(bc.productId);
+          if (p) {
+            for (const rule of quickRules) {
+              if (
+                rule.items.length < rule.limit &&
+                bc.packQty === rule.packQty &&
+                p.sku.startsWith(rule.prefix)
+              ) {
+                rule.items.push({
+                  barcode: bc.barcode,
+                  name: p.name,
+                  packLabel: bc.packLabel,
+                  packQty: bc.packQty,
+                  priceCents: bc.sellPriceCents,
+                  badge: rule.badge,
+                });
+                quickRemaining -= 1;
+                break;
+              }
+            }
+          }
+        }
       }
+
       const tMap = new Map(data.taxRates.map((t) => [t.id, t]));
       const parsedPromos = mapBootstrapPromotions(data.promotions);
 
@@ -195,42 +240,7 @@ export function PosTerminalView({
       setSyncedAt(data.syncedAt);
       setCacheSource(source);
       setBootstrapError(null);
-
-      const picks: {
-        barcode: string;
-        name: string;
-        packLabel: string;
-        packQty: number;
-        priceCents: number;
-        badge: string;
-      }[] = [];
-      const findMatching = (prefix: string, packQty: number, badge: string, limit: number) => {
-        let added = 0;
-        for (const bc of data.barcodes) {
-          const p = pMap.get(bc.productId);
-          if (p && p.sku.startsWith(prefix) && bc.packQty === packQty) {
-            picks.push({
-              barcode: bc.barcode,
-              name: p.name,
-              packLabel: bc.packLabel,
-              packQty: bc.packQty,
-              priceCents: bc.sellPriceCents,
-              badge,
-            });
-            added++;
-            if (added >= limit) break;
-          }
-        }
-      };
-
-      findMatching("BEER", 6, "Beer 6-Pack · 18+", 2);
-      findMatching("BEER", 1, "Beer Single · 18+", 1);
-      findMatching("NDLS", 1, "5 for $3.95 Promo", 3);
-      findMatching("NDLS", 5, "5-Pack Bundle", 1);
-      findMatching("SNCK", 1, "Buy 2 Get 1 Free", 3);
-      findMatching("SODA", 6, "Soda 6-Pack", 1);
-      findMatching("ENRG", 1, "Energy Can", 1);
-      setQuickItems(picks);
+      setQuickItems(quickRules.flatMap((r) => r.items));
     },
     []
   );
@@ -287,11 +297,15 @@ export function PosTerminalView({
     return () => controller.abort();
   }, [catalogRefreshTick, loadBootstrap]);
 
+  const flushOfflineQueueRef = useRef<(queueToFlush?: QueuedPosSale[]) => Promise<void>>(
+    async () => {}
+  );
+
   // Automatically flush offline queue when browser network connectivity returns
   useEffect(() => {
     const handleOnline = () => {
       if (!simulatedOfflineRef.current && offlineQueueRef.current.length > 0) {
-        void flushOfflineQueue(offlineQueueRef.current);
+        void flushOfflineQueueRef.current(offlineQueueRef.current);
       }
     };
     window.addEventListener("online", handleOnline);
@@ -405,19 +419,19 @@ export function PosTerminalView({
     setScanError(null);
   };
 
-  const handleScanSubmit = (raw: string) => {
+  const handleScanSubmit = (raw: string): boolean => {
     const clean = raw.trim();
-    if (!clean) return;
+    if (!clean) return false;
     const bc = barcodesMap.get(clean);
     if (!bc) {
       setScanError(`Barcode "${clean}" not found in local POS catalog (${barcodesMap.size} cached).`);
       scanRef.current?.focus();
       scanRef.current?.select();
-      return;
+      return false;
     }
     addBarcodeToCart(bc);
-    setScanInput("");
     scanRef.current?.focus();
+    return true;
   };
 
   const flushOfflineQueue = async (queueToFlush = offlineQueueRef.current) => {
@@ -483,6 +497,7 @@ export function PosTerminalView({
       setSyncingQueue(false);
     }
   };
+  flushOfflineQueueRef.current = flushOfflineQueue;
 
   const handleRetryDeadLetter = async (entry: DeadLetterPosSale, stripCoupon = false) => {
     if (syncingQueue) return;
@@ -991,27 +1006,12 @@ export function PosTerminalView({
       <div className="pos-layout">
         <div className="stack-md">
           <section className="panel">
-            <form
-              className="pos-scan-bar"
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleScanSubmit(scanInput);
-              }}
-            >
-              <input
-                ref={scanRef}
-                id="pos-barcode-input"
-                aria-label="Scan EAN-13 or UPC-A barcode"
-                className="input"
-                placeholder="Scan EAN-13 / UPC-A barcode (USB HID scanner or paste code) + Enter..."
-                value={scanInput}
-                onChange={(e) => setScanInput(e.target.value)}
-                autoFocus
-              />
-              <button type="submit" className="btn btn-primary" disabled={barcodesMap.size === 0}>
-                Scan Item
-              </button>
-            </form>
+            <PosScanBar
+              inputRef={scanRef}
+              isActive={isActive}
+              disabled={barcodesMap.size === 0}
+              onScan={handleScanSubmit}
+            />
             {scanError && (
               <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
                 <span>{scanError}</span>
@@ -1178,7 +1178,7 @@ export function PosTerminalView({
 
           {upsellSuggestions.length > 0 && (
             <div className="upsell-box">
-              <div style={{ fontSize: 11, fontWeight: 700, color: "var(--accent-primary)", display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "var(--accent-primary-ink)", display: "flex", alignItems: "center", gap: 5 }}>
                 <Sparkles size={12} aria-hidden="true" /> OFFLINE-SAFE BASKET UPSELLS
               </div>
               {upsellSuggestions.map((u) => (
@@ -1236,12 +1236,12 @@ export function PosTerminalView({
               <span>Subtotal</span>
               <span className="mono">{formatMoney(evaluated.subtotalBeforeDiscountCents)}</span>
             </div>
-            <div className="total-row" style={{ color: "var(--accent-primary)", fontWeight: 600 }}>
+            <div className="total-row" style={{ color: "var(--accent-primary-ink)", fontWeight: 600 }}>
               <span>Auto Promotions &amp; Coupons</span>
               <span className="mono">-{formatMoney(evaluated.totalDiscountCents)}</span>
             </div>
             {evaluated.couponDiscountCents > 0 && (
-              <div className="total-row" style={{ fontSize: 11.5, color: "var(--accent-primary)" }}>
+              <div className="total-row" style={{ fontSize: 11.5, color: "var(--accent-primary-ink)" }}>
                 <span>↳ Loyalty Coupon ({appliedCoupon?.code})</span>
                 <span className="mono">-{formatMoney(evaluated.couponDiscountCents)}</span>
               </div>

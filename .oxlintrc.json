@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "react"],
+  "plugins": ["typescript", "react", "jsx-a11y"],
   "categories": {
     "correctness": "error",
     "suspicious": "warn"
@@ -16,7 +16,11 @@
     "react/purity": "off",
     "react/immutability": "off",
     "react/exhaustive-effect-dependencies": "off",
-    "react-hooks/exhaustive-deps": "off"
+    "react-hooks/exhaustive-deps": "warn",
+    "jsx-a11y/prefer-tag-over-role": "off",
+    "jsx-a11y/no-autofocus": "error",
+    "jsx-a11y/label-has-associated-control": "error",
+    "jsx-a11y/no-noninteractive-tabindex": ["error", { "roles": ["tabpanel", "region"] }]
   },
   "ignorePatterns": ["**/dist/**", "**/node_modules/**", "apps/api/drizzle/**"]
 }

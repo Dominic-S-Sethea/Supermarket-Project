@@ -1,4 +1,5 @@
 import { useEffect, useRef, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 const FOCUSABLE_SELECTOR = [
   'a[href]:not([tabindex="-1"])',
@@ -10,6 +11,47 @@ const FOCUSABLE_SELECTOR = [
 ].join(", ");
 
 let openDialogCount = 0;
+let initialBodyOverflow = "";
+const dialogStack: symbol[] = [];
+
+interface BackgroundRestoreEntry {
+  el: HTMLElement & { inert?: boolean };
+  prevInert: boolean;
+  prevAriaHidden: string | null;
+}
+
+const lockedBackgrounds = new Map<HTMLElement, BackgroundRestoreEntry>();
+
+function lockBackgroundForDialog(overlayNode: HTMLElement | null) {
+  if (typeof document === "undefined") return;
+  for (const child of Array.from(document.body.children)) {
+    if (!(child instanceof HTMLElement)) continue;
+    if (child === overlayNode) continue;
+    if (child.dataset.supermarketDialogOverlay === "true") continue;
+    if (!lockedBackgrounds.has(child)) {
+      const target = child as HTMLElement & { inert?: boolean };
+      lockedBackgrounds.set(child, {
+        el: target,
+        prevInert: Boolean(target.inert),
+        prevAriaHidden: target.getAttribute("aria-hidden"),
+      });
+      target.inert = true;
+      target.setAttribute("aria-hidden", "true");
+    }
+  }
+}
+
+function unlockAllBackgrounds() {
+  for (const entry of lockedBackgrounds.values()) {
+    entry.el.inert = entry.prevInert;
+    if (entry.prevAriaHidden === null) {
+      entry.el.removeAttribute("aria-hidden");
+    } else {
+      entry.el.setAttribute("aria-hidden", entry.prevAriaHidden);
+    }
+  }
+  lockedBackgrounds.clear();
+}
 
 function getFocusableElements(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter((el) => {
@@ -40,6 +82,7 @@ function AccessibleDialogSurface({
   style,
   children,
 }: DialogBaseProps & { overlayClassName: string; surfaceClassName: string }) {
+  const overlayRef = useRef<HTMLDivElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -47,15 +90,19 @@ function AccessibleDialogSurface({
   useEffect(() => {
     if (!open) return;
 
+    const dialogId = Symbol("accessible-dialog");
+    dialogStack.push(dialogId);
+
     const previouslyFocused =
       typeof document !== "undefined" && document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
 
     openDialogCount += 1;
-    const prevOverflow = document.body.style.overflow;
     if (openDialogCount === 1) {
+      initialBodyOverflow = document.body.style.overflow;
       document.body.style.overflow = "hidden";
+      lockBackgroundForDialog(overlayRef.current);
     }
 
     const focusTimer = window.setTimeout(() => {
@@ -71,6 +118,8 @@ function AccessibleDialogSurface({
     }, 0);
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (dialogStack[dialogStack.length - 1] !== dialogId) return;
+
       if (e.key === "Escape") {
         e.stopPropagation();
         onCloseRef.current();
@@ -107,9 +156,13 @@ function AccessibleDialogSurface({
     return () => {
       window.clearTimeout(focusTimer);
       document.removeEventListener("keydown", handleKeyDown);
+      const stackIdx = dialogStack.lastIndexOf(dialogId);
+      if (stackIdx >= 0) dialogStack.splice(stackIdx, 1);
+
       openDialogCount = Math.max(0, openDialogCount - 1);
       if (openDialogCount === 0) {
-        document.body.style.overflow = prevOverflow;
+        document.body.style.overflow = initialBodyOverflow;
+        unlockAllBackgrounds();
       }
       if (previouslyFocused && typeof previouslyFocused.focus === "function" && previouslyFocused.isConnected) {
         previouslyFocused.focus();
@@ -119,15 +172,17 @@ function AccessibleDialogSurface({
 
   if (!open) return null;
 
-  return (
+  const dialogNode = (
     <div
+      ref={overlayRef}
+      data-supermarket-dialog-overlay="true"
       className={overlayClassName}
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) {
-          onClose();
-        }
-      }}
     >
+      <div
+        className="overlay-backdrop"
+        aria-hidden="true"
+        onMouseDown={onClose}
+      />
       <div
         ref={surfaceRef}
         className={surfaceClassName}
@@ -138,12 +193,16 @@ function AccessibleDialogSurface({
         aria-describedby={describedBy}
         tabIndex={-1}
         style={style}
-        onClick={(e) => e.stopPropagation()}
       >
         {children}
       </div>
     </div>
   );
+
+  if (typeof document !== "undefined" && document.body) {
+    return createPortal(dialogNode, document.body);
+  }
+  return dialogNode;
 }
 
 export function ModalDialog({ className, ...props }: DialogBaseProps) {

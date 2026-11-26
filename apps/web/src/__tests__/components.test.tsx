@@ -1,10 +1,13 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ModalDialog, SlideDrawer } from "../components/AccessibleDialog";
 import { ErrorBoundary } from "../components/ErrorBoundary";
+import { HourlyFootfallChart } from "../components/HourlyFootfallChart";
 import { LoginScreen } from "../components/LoginScreen";
+import { PosScanBar } from "../components/PosScanBar";
 import { SalesTrendChart } from "../components/SalesTrendChart";
+import { SubTabBar } from "../components/SubTabBar";
 import { ThemeSwitcher } from "../components/ThemeSwitcher";
 import {
   clearRecentClientErrors,
@@ -272,4 +275,163 @@ describe("ThemeSwitcher & useTheme (Blue-Navy, Dark, Light)", () => {
     window.localStorage.removeItem(THEME_STORAGE_KEY);
   });
 });
+
+describe("SubTabBar WAI-ARIA tablist keyboard navigation", () => {
+  function TabHarness() {
+    const [active, setActive] = useState<"alpha" | "beta" | "gamma">("alpha");
+    return (
+      <div>
+        <SubTabBar
+          ariaLabel="Demo sub-views"
+          activeId={active}
+          onSelect={setActive}
+          tabs={[
+            { id: "alpha", elementId: "tab-alpha", panelId: "panel-alpha", label: "Alpha" },
+            { id: "beta", elementId: "tab-beta", panelId: "panel-beta", label: "Beta" },
+            { id: "gamma", elementId: "tab-gamma", panelId: "panel-gamma", label: "Gamma" },
+          ]}
+        />
+        <div role="tabpanel" id={`panel-${active}`} aria-labelledby={`tab-${active}`}>
+          Active: {active}
+        </div>
+      </div>
+    );
+  }
+
+  it("supports roving tabIndex and ArrowRight / ArrowLeft / Home / End focus & selection", () => {
+    render(<TabHarness />);
+    const alpha = screen.getByRole("tab", { name: "Alpha" });
+    const beta = screen.getByRole("tab", { name: "Beta" });
+    const gamma = screen.getByRole("tab", { name: "Gamma" });
+
+    expect(alpha).toHaveAttribute("aria-selected", "true");
+    expect(alpha).toHaveAttribute("tabindex", "0");
+    expect(beta).toHaveAttribute("tabindex", "-1");
+    expect(gamma).toHaveAttribute("tabindex", "-1");
+
+    alpha.focus();
+    fireEvent.keyDown(alpha, { key: "ArrowRight" });
+    expect(beta).toHaveAttribute("aria-selected", "true");
+    expect(document.activeElement).toBe(beta);
+    expect(screen.getByRole("tabpanel")).toHaveTextContent("Active: beta");
+
+    fireEvent.keyDown(beta, { key: "End" });
+    expect(gamma).toHaveAttribute("aria-selected", "true");
+    expect(document.activeElement).toBe(gamma);
+
+    fireEvent.keyDown(gamma, { key: "ArrowRight" });
+    expect(alpha).toHaveAttribute("aria-selected", "true");
+    expect(document.activeElement).toBe(alpha);
+
+    fireEvent.keyDown(alpha, { key: "ArrowLeft" });
+    expect(gamma).toHaveAttribute("aria-selected", "true");
+    expect(document.activeElement).toBe(gamma);
+
+    fireEvent.keyDown(gamma, { key: "Home" });
+    expect(alpha).toHaveAttribute("aria-selected", "true");
+    expect(document.activeElement).toBe(alpha);
+  });
+});
+
+describe("AccessibleDialog background inert isolation & stacked scroll lock", () => {
+  function StackedDialogHarness() {
+    const [firstOpen, setFirstOpen] = useState(false);
+    const [secondOpen, setSecondOpen] = useState(false);
+    return (
+      <div data-testid="app-shell">
+        <button type="button" onClick={() => setFirstOpen(true)}>
+          Open Outer
+        </button>
+        <ModalDialog open={firstOpen} onClose={() => setFirstOpen(false)} ariaLabel="Outer Dialog">
+          <button type="button" onClick={() => setSecondOpen(true)}>
+            Open Inner
+          </button>
+          <ModalDialog
+            open={secondOpen}
+            onClose={() => setSecondOpen(false)}
+            ariaLabel="Inner Dialog"
+          >
+            <button type="button" onClick={() => setSecondOpen(false)}>
+              Close Inner
+            </button>
+          </ModalDialog>
+        </ModalDialog>
+      </div>
+    );
+  }
+
+  it("marks app root inert/aria-hidden while open and only unlocks body overflow after last stacked modal closes", () => {
+    document.body.style.overflow = "auto";
+    const { container } = render(<StackedDialogHarness />);
+    expect(container.getAttribute("aria-hidden")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Outer" }));
+    expect(document.body.style.overflow).toBe("hidden");
+    expect(container.getAttribute("aria-hidden")).toBe("true");
+    expect((container as HTMLElement & { inert?: boolean }).inert).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Inner" }));
+    expect(screen.getByRole("dialog", { name: "Inner Dialog" })).toBeInTheDocument();
+
+    // Pressing Escape closes only the topmost Inner Dialog; overflow stays locked
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Inner Dialog" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Outer Dialog" })).toBeInTheDocument();
+    expect(document.body.style.overflow).toBe("hidden");
+
+    // Closing Outer Dialog restores overflow and unlocks background container
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Outer Dialog" })).not.toBeInTheDocument();
+    expect(document.body.style.overflow).toBe("auto");
+    expect(container.getAttribute("aria-hidden")).toBeNull();
+    expect((container as HTMLElement & { inert?: boolean }).inert).toBe(false);
+  });
+});
+
+describe("PosScanBar & HourlyFootfallChart localized interaction state", () => {
+  it("submits barcode, clears only when accepted, and focuses when active", () => {
+    const onScan = vi.fn((code: string) => code === "8850000000014");
+    function Harness() {
+      const ref = useRef<HTMLInputElement>(null);
+      return <PosScanBar inputRef={ref} isActive disabled={false} onScan={onScan} />;
+    }
+
+    render(<Harness />);
+    const input = screen.getByLabelText(/Scan EAN-13 or UPC-A barcode/i);
+    expect(document.activeElement).toBe(input);
+
+    fireEvent.change(input, { target: { value: "0000" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(onScan).toHaveBeenCalledWith("0000");
+    expect(input).toHaveValue("0000");
+
+    fireEvent.change(input, { target: { value: "8850000000014" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(onScan).toHaveBeenCalledWith("8850000000014");
+    expect(input).toHaveValue("");
+  });
+
+  it("reveals hourly funnel readout on keyboard focus", () => {
+    render(
+      <HourlyFootfallChart
+        hourly={[
+          {
+            hour: 9,
+            shiftKey: "morning",
+            walkIns: 48,
+            receipts: 36,
+            conversionPct: 75,
+            revenueCents: 120000,
+            avgOpenLanes: 2,
+            avgDwellSec: 180,
+          },
+        ]}
+      />
+    );
+    const bar = screen.getByRole("button", { name: /09:00 — 48 walk-ins, 36 receipts/i });
+    fireEvent.focus(bar);
+    expect(screen.getByRole("status")).toHaveTextContent(/09:00 — 48 in → 36 paid \(75%\)/i);
+  });
+});
+
 

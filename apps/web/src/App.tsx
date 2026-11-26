@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import {
   BarChart3,
@@ -180,15 +180,89 @@ export function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, [user]);
 
-  // Close mobile navigation drawer on Escape (M-20)
+  const [isMobileViewport, setIsMobileViewport] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(max-width: 820px)").matches
+      : false
+  );
+  const sidebarRef = useRef<HTMLElement>(null);
+  const mobileToggleRef = useRef<HTMLButtonElement>(null);
+  const prevMobileNavOpenRef = useRef(false);
+
   useEffect(() => {
-    if (!mobileNavOpen) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMobileNavOpen(false);
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(max-width: 820px)");
+    const sync = () => {
+      setIsMobileViewport(mq.matches);
+      if (!mq.matches) setMobileNavOpen(false);
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [mobileNavOpen]);
+    sync();
+    if (typeof mq.addEventListener === "function") {
+      mq.addEventListener("change", sync);
+      return () => mq.removeEventListener("change", sync);
+    }
+    return undefined;
+  }, []);
+
+  // Keep collapsed mobile drawer non-focusable & hidden from assistive technology
+  useEffect(() => {
+    const el = sidebarRef.current as (HTMLElement & { inert?: boolean }) | null;
+    if (!el) return;
+    el.inert = isMobileViewport && !mobileNavOpen;
+  }, [isMobileViewport, mobileNavOpen, user]);
+
+  // Close mobile navigation drawer on Escape, trap Tab focus while open, and restore trigger focus on close
+  useEffect(() => {
+    if (!isMobileViewport) {
+      prevMobileNavOpenRef.current = mobileNavOpen;
+      return;
+    }
+
+    if (mobileNavOpen) {
+      const container = sidebarRef.current;
+      if (container) {
+        const firstFocusable = container.querySelector<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        );
+        firstFocusable?.focus();
+      }
+
+      const onKeyDown = (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setMobileNavOpen(false);
+          return;
+        }
+        if (e.key !== "Tab" || !container) return;
+        const focusables = Array.from(
+          container.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+          )
+        ).filter((node) => node.offsetParent !== null || getComputedStyle(node).visibility !== "hidden");
+        if (focusables.length === 0) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        if (e.shiftKey) {
+          if (document.activeElement === first || !container.contains(document.activeElement)) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else if (document.activeElement === last || !container.contains(document.activeElement)) {
+          e.preventDefault();
+          first.focus();
+        }
+      };
+
+      window.addEventListener("keydown", onKeyDown);
+      prevMobileNavOpenRef.current = true;
+      return () => window.removeEventListener("keydown", onKeyDown);
+    }
+
+    if (prevMobileNavOpenRef.current) {
+      prevMobileNavOpenRef.current = false;
+      mobileToggleRef.current?.focus();
+    }
+  }, [mobileNavOpen, isMobileViewport]);
 
   const navigateToTab = useCallback(
     (tab: TabId) => {
@@ -255,6 +329,7 @@ export function App() {
       {/* Compact mobile top navigation bar (<= 820px) */}
       <header className="mobile-topbar">
         <button
+          ref={mobileToggleRef}
           id="mobile-nav-toggle-btn"
           type="button"
           className="btn btn-sm mobile-menu-btn"
@@ -282,7 +357,11 @@ export function App() {
             <Sparkles size={14} aria-hidden="true" />
           </button>
         ) : (
-          <span className={`status-dot ${apiHealthy ? "" : "offline"}`} aria-label={apiHealthy ? "API live" : "API unreachable"} />
+          <span
+            role="status"
+            className={`status-dot ${apiHealthy ? "" : "offline"}`}
+            aria-label={apiHealthy ? "API live" : "API unreachable"}
+          />
         )}
       </header>
 
@@ -295,6 +374,7 @@ export function App() {
       )}
 
       <aside
+        ref={sidebarRef}
         id="primary-sidebar"
         className={`sidebar ${mobileNavOpen ? "mobile-open" : ""}`}
         aria-label="Primary navigation"

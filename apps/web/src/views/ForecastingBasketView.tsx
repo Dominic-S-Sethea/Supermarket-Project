@@ -221,7 +221,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
       {feedback && (
         <div className="banner banner-green" style={{ marginBottom: 14 }}>
           <span>{feedback}</span>
-          <button className="btn btn-sm" onClick={() => setFeedback(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setFeedback(null)}>
             Dismiss
           </button>
         </div>
@@ -263,6 +263,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
                 </div>
                 {canManage && (
                   <button
+                    type="button"
                     className="btn btn-sm btn-primary"
                     style={{ width: "100%" }}
                     disabled={busyKey !== null}
@@ -291,7 +292,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
               <p className="panel-desc">Stored in PostgreSQL with full audit trail.</p>
             </div>
           </div>
-          <div className="table-wrap">
+          <div className="table-wrap" role="region" aria-label="Reorder recommendations" tabIndex={0}>
             <table className="data-table">
               <thead>
                 <tr>
@@ -330,6 +331,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
                         {o.status === "approved" && (
                           <div style={{ display: "inline-flex", gap: 6 }}>
                             <button
+                              type="button"
                               className="btn btn-sm btn-primary"
                               disabled={busyKey !== null}
                               onClick={() => void handleStatusChange(o.id, "sent")}
@@ -337,6 +339,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
                               Mark Sent
                             </button>
                             <button
+                              type="button"
                               className="btn btn-sm"
                               disabled={busyKey !== null}
                               onClick={() => void handleStatusChange(o.id, "cancelled")}
@@ -377,7 +380,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
           </select>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="14-day demand forecast table" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -464,7 +467,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
         <div className="panel-header">
           <div>
             <h2 className="panel-title">
-              <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
+              <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
               Market Basket Association Rules (High-Lift Co-Purchase Mining)
             </h2>
             <p className="panel-desc">
@@ -472,12 +475,14 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
             </p>
           </div>
         </div>
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Market basket association rules" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
                 <th>If Customer Buys (Antecedent)</th>
-                <th />
+                <th>
+                  <span className="sr-only">Direction</span>
+                </th>
                 <th>They Frequently Also Buy (Consequent)</th>
                 <th className="text-right">Co-Baskets</th>
                 <th className="text-right">Confidence</th>

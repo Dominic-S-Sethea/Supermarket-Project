@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { formatMoney } from "@supermarket/shared/money";
 import {
   CheckCircle2,
@@ -95,25 +95,30 @@ export function PurchaseOrdersTab({
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const loadOrders = async (signal?: AbortSignal) => {
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  const loadOrders = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     try {
       const res = await apiGet<{ orders: PurchaseOrderRow[] }>("/api/purchasing/orders", signal);
       if (signal?.aborted) return;
       setOrders(res.orders);
-      if (res.orders.length > 0 && !selectedPoId) {
-        setSelectedPoId(res.orders[0].id);
+      if (res.orders.length > 0) {
+        setSelectedPoId((prev) => prev ?? res.orders[0].id);
       }
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        onError(err instanceof Error ? err.message : "Failed loading purchase orders.");
+        onErrorRef.current(
+          err instanceof Error ? err.message : "Failed loading purchase orders."
+        );
       }
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, []);
 
-  const loadDetail = async (poId: string, signal?: AbortSignal) => {
+  const loadDetail = useCallback(async (poId: string, signal?: AbortSignal) => {
     setLoadingDetail(true);
     try {
       const res = await apiGet<PurchaseOrderDetailPayload>(
@@ -124,18 +129,20 @@ export function PurchaseOrdersTab({
       setDetail(res);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        onError(err instanceof Error ? err.message : "Failed loading purchase order detail.");
+        onErrorRef.current(
+          err instanceof Error ? err.message : "Failed loading purchase order detail."
+        );
       }
     } finally {
       if (!signal?.aborted) setLoadingDetail(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadOrders(controller.signal);
     return () => controller.abort();
-  }, []);
+  }, [loadOrders]);
 
   useEffect(() => {
     if (!selectedPoId) {
@@ -145,7 +152,7 @@ export function PurchaseOrdersTab({
     const controller = new AbortController();
     void loadDetail(selectedPoId, controller.signal);
     return () => controller.abort();
-  }, [selectedPoId]);
+  }, [selectedPoId, loadDetail]);
 
   const handleStatusChange = async (
     po: PurchaseOrderRow,
@@ -231,6 +238,7 @@ export function PurchaseOrdersTab({
                 <option value="cancelled">Cancelled</option>
               </select>
               <button
+                type="button"
                 className="btn btn-sm"
                 disabled={loading}
                 onClick={() => void loadOrders()}
@@ -249,7 +257,7 @@ export function PurchaseOrdersTab({
               No purchase orders match the selected filter. Create one from Forecasts &amp; Basket AI or the AI Store Copilot.
             </div>
           ) : (
-            <div className="table-wrap">
+            <div className="table-wrap" role="region" aria-label="Purchase orders list" tabIndex={0}>
               <table className="data-table">
                 <thead>
                   <tr>
@@ -345,6 +353,7 @@ export function PurchaseOrdersTab({
                 </span>
                 {detail.order.status === "draft" && (
                   <button
+                    type="button"
                     className="btn btn-primary btn-sm"
                     disabled={busyId !== null}
                     onClick={() => void handleStatusChange(detail.order, "approved")}
@@ -354,6 +363,7 @@ export function PurchaseOrdersTab({
                 )}
                 {(detail.order.status === "draft" || detail.order.status === "approved") && (
                   <button
+                    type="button"
                     className="btn btn-sm"
                     disabled={busyId !== null}
                     onClick={() => void handleStatusChange(detail.order, "sent")}
@@ -363,6 +373,7 @@ export function PurchaseOrdersTab({
                 )}
                 {!["received", "cancelled"].includes(detail.order.status) && (
                   <button
+                    type="button"
                     className="btn btn-sm"
                     style={{ color: "var(--accent-crimson)" }}
                     disabled={busyId !== null}
@@ -379,7 +390,7 @@ export function PurchaseOrdersTab({
                 </div>
               )}
 
-              <div className="table-wrap">
+              <div className="table-wrap" role="region" aria-label="Purchase order line items" tabIndex={0}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -387,7 +398,9 @@ export function PurchaseOrdersTab({
                       <th className="text-right">Ordered</th>
                       <th className="text-right">Received</th>
                       <th className="text-right">Unit Cost</th>
-                      <th />
+                      <th>
+                        <span className="sr-only">Actions</span>
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
@@ -413,6 +426,7 @@ export function PurchaseOrdersTab({
                           {line.remainingCases > 0 &&
                           !["received", "cancelled"].includes(detail.order.status) ? (
                             <button
+                              type="button"
                               className="btn btn-primary btn-sm"
                               onClick={() =>
                                 onReceiveAgainstPo({
@@ -446,7 +460,7 @@ export function PurchaseOrdersTab({
                   <h3 style={{ fontSize: 13, margin: "4px 0 8px" }}>
                     Linked Goods Receipts ({detail.grns.length})
                   </h3>
-                  <div className="table-wrap">
+                  <div className="table-wrap" role="region" aria-label="Linked goods receipts" tabIndex={0}>
                     <table className="data-table">
                       <thead>
                         <tr>

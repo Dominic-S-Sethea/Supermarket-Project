@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Calendar, CheckCircle2, RefreshCw, Sparkles, Users } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
 
@@ -49,7 +49,10 @@ export function StaffingRosterTab({
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const loadRoster = async (date = planDate, signal?: AbortSignal) => {
+  const onBannerRef = useRef(onBanner);
+  onBannerRef.current = onBanner;
+
+  const loadRoster = useCallback(async (date = planDate, signal?: AbortSignal) => {
     setLoading(true);
     try {
       const res = await apiGet<{
@@ -64,7 +67,7 @@ export function StaffingRosterTab({
       setSummary(res.summary);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        onBanner({
+        onBannerRef.current({
           kind: "red",
           text: err instanceof Error ? err.message : "Failed loading hourly lane staffing roster",
         });
@@ -72,13 +75,13 @@ export function StaffingRosterTab({
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  };
+  }, [planDate]);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadRoster(planDate, controller.signal);
     return () => controller.abort();
-  }, [planDate]);
+  }, [planDate, loadRoster]);
 
   const handleGenerate = async () => {
     if (busyId) return;
@@ -132,7 +135,7 @@ export function StaffingRosterTab({
       <div className="panel-header">
         <div>
           <h2 className="panel-title">
-            <Users size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
+            <Users size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
             Hourly Checkout Lane Staffing Roster ({planDate})
           </h2>
           <p className="panel-desc">
@@ -141,7 +144,8 @@ export function StaffingRosterTab({
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}>
-            <Calendar size={14} />
+            <Calendar size={14} aria-hidden="true" />
+            <span className="sr-only">Roster plan date</span>
             <input
               id="roster-date-input"
               type="date"
@@ -153,20 +157,23 @@ export function StaffingRosterTab({
           </label>
           {canOperate && (
             <button
+              type="button"
               id="generate-roster-btn"
               className="btn btn-primary btn-sm"
               disabled={busyId !== null}
               onClick={() => void handleGenerate()}
             >
-              <Sparkles size={13} /> {busyId === "generate" ? "Generating..." : "Generate Forecast Roster"}
+              <Sparkles size={13} aria-hidden="true" /> {busyId === "generate" ? "Generating..." : "Generate Forecast Roster"}
             </button>
           )}
           <button
+            type="button"
             className="btn btn-sm"
+            aria-label="Refresh staffing roster"
             disabled={loading}
             onClick={() => void loadRoster(planDate)}
           >
-            <RefreshCw size={13} />
+            <RefreshCw size={13} aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -191,14 +198,14 @@ export function StaffingRosterTab({
         </div>
         <div className="kpi-tile">
           <div className="kpi-label">Confirmed Slots</div>
-          <div className="kpi-value" style={{ color: "var(--accent-primary)" }}>
+          <div className="kpi-value" style={{ color: "var(--accent-primary-ink)" }}>
             {summary?.confirmedSlots ?? 0} / {summary?.totalHours ?? 0}
           </div>
           <div className="kpi-meta">Locked &amp; communicated to floor team</div>
         </div>
       </div>
 
-      <div className="table-wrap">
+      <div className="table-wrap" role="region" aria-label="Hourly checkout lane staffing roster" tabIndex={0}>
         <table className="data-table">
           <thead>
             <tr>
@@ -284,6 +291,7 @@ export function StaffingRosterTab({
                     <td className="text-right">
                       {slot.status === "planned" ? (
                         <button
+                          type="button"
                           className="btn btn-primary btn-sm"
                           disabled={busyId !== null}
                           onClick={() => void handlePatchSlot(slot.id, { status: "confirmed" })}
@@ -292,6 +300,7 @@ export function StaffingRosterTab({
                         </button>
                       ) : slot.status === "confirmed" ? (
                         <button
+                          type="button"
                           className="btn btn-sm"
                           disabled={busyId !== null}
                           onClick={() => void handlePatchSlot(slot.id, { status: "completed" })}

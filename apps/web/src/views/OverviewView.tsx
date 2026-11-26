@@ -246,7 +246,7 @@ export function OverviewView({
           <div className="panel-header" style={{ marginBottom: 10 }}>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <Sparkles size={15} color="var(--accent-primary)" aria-hidden="true" />
+                <Sparkles size={15} color="var(--accent-primary-ink)" aria-hidden="true" />
                 <h2 className="panel-title">AI Morning Executive Briefing ({briefing.briefingDate})</h2>
                 <span className="tag tag-green mono">{briefing.model}</span>
               </div>
@@ -445,7 +445,7 @@ export function OverviewView({
               return (
                 <div
                   key={h.hour}
-                  className={`heat-cell ${intensity > 0.58 ? "heat-high" : ""}`}
+                  className="heat-cell"
                   style={{ "--heat": intensity } as CSSProperties}
                   title={`${h.hour}:00 — ${h.receipts} receipts, ${formatMoney(h.salesCents)}`}
                 >
@@ -467,7 +467,7 @@ export function OverviewView({
             </p>
           </div>
         </div>
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Top selling SKUs" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
