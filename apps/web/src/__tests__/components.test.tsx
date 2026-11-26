@@ -5,11 +5,13 @@ import { ModalDialog, SlideDrawer } from "../components/AccessibleDialog";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { LoginScreen } from "../components/LoginScreen";
 import { SalesTrendChart } from "../components/SalesTrendChart";
+import { ThemeSwitcher } from "../components/ThemeSwitcher";
 import {
   clearRecentClientErrors,
   getRecentClientErrors,
   setClientErrorReporter,
 } from "../lib/telemetry";
+import { THEME_STORAGE_KEY, useTheme } from "../lib/theme";
 import { CatalogView } from "../views/CatalogView";
 
 afterEach(() => {
@@ -236,3 +238,38 @@ describe("CatalogView RBAC cost hiding & keyboard inspection (H-15, H-18)", () =
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 });
+
+describe("ThemeSwitcher & useTheme (Blue-Navy, Dark, Light)", () => {
+  function ThemeHarness() {
+    const { theme, setTheme } = useTheme();
+    return <ThemeSwitcher theme={theme} onChange={setTheme} variant="sidebar" />;
+  }
+
+  it("defaults to Blue-Navy and switches cleanly between Dark and Light with persistence", () => {
+    window.localStorage.removeItem(THEME_STORAGE_KEY);
+    delete document.documentElement.dataset.theme;
+
+    render(<ThemeHarness />);
+
+    const navyBtn = screen.getByRole("button", { name: /Navy/i });
+    const darkBtn = screen.getByRole("button", { name: /Dark/i });
+    const lightBtn = screen.getByRole("button", { name: /Light/i });
+
+    expect(navyBtn).toHaveAttribute("aria-pressed", "true");
+    expect(document.documentElement.dataset.theme).toBe("navy");
+
+    fireEvent.click(darkBtn);
+    expect(darkBtn).toHaveAttribute("aria-pressed", "true");
+    expect(navyBtn).toHaveAttribute("aria-pressed", "false");
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
+
+    fireEvent.click(lightBtn);
+    expect(lightBtn).toHaveAttribute("aria-pressed", "true");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
+
+    window.localStorage.removeItem(THEME_STORAGE_KEY);
+  });
+});
+

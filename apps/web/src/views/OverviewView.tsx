@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { type CSSProperties, useEffect, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { formatBp, formatMoney } from "@supermarket/shared/money";
 import { ArrowRight, Download, RefreshCw, Sparkles } from "lucide-react";
@@ -398,7 +398,7 @@ export function OverviewView({
                             p.method === "card"
                               ? "var(--accent-primary)"
                               : p.method === "cash"
-                                ? "hsl(214, 24%, 28%)"
+                                ? "var(--accent-cash-bar)"
                                 : "var(--accent-blue)",
                         }}
                       />
@@ -442,13 +442,11 @@ export function OverviewView({
           <div className="heatmap-row">
             {hourlyTraffic.map((h) => {
               const intensity = h.receipts / maxHourReceipts;
-              const bg = `hsl(158, ${Math.round(28 + intensity * 38)}%, ${Math.round(95 - intensity * 52)}%)`;
-              const fg = intensity > 0.58 ? "#fff" : "var(--ink-primary)";
               return (
                 <div
                   key={h.hour}
-                  className="heat-cell"
-                  style={{ background: bg, color: fg }}
+                  className={`heat-cell ${intensity > 0.58 ? "heat-high" : ""}`}
+                  style={{ "--heat": intensity } as CSSProperties}
                   title={`${h.hour}:00 — ${h.receipts} receipts, ${formatMoney(h.salesCents)}`}
                 >
                   <span className="heat-hour">{String(h.hour).padStart(2, "0")}:00</span>

@@ -269,12 +269,22 @@ export function PurchaseOrdersTab({
                         key={po.id}
                         style={{
                           cursor: "pointer",
-                          background: isSelected ? "rgba(18, 128, 92, 0.08)" : undefined,
+                          background: isSelected ? "var(--accent-primary-soft)" : undefined,
                         }}
                         onClick={() => setSelectedPoId(po.id)}
                       >
                         <td className="mono" style={{ fontWeight: 700 }}>
-                          {po.poNumber}
+                          <button
+                            type="button"
+                            className="table-row-btn mono"
+                            aria-pressed={isSelected}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedPoId(po.id);
+                            }}
+                          >
+                            {po.poNumber}
+                          </button>
                         </td>
                         <td>
                           <div style={{ fontWeight: 600 }}>{po.supplierName}</div>

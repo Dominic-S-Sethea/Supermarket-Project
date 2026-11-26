@@ -70,7 +70,7 @@ export function SalesTrendChart({
         <svg
           viewBox={`0 0 ${chartW} ${chartH}`}
           className="chart-svg"
-          role="img"
+          role="group"
           aria-label={`Daily sales and profit trend across ${dailyTrend.length} days`}
         >
           {[0, 0.25, 0.5, 0.75, 1].map((t) => {
@@ -82,7 +82,7 @@ export function SalesTrendChart({
                   y1={y}
                   x2={chartW - padR}
                   y2={y}
-                  stroke="hsl(36, 14%, 89%)"
+                  stroke="var(--chart-grid)"
                   strokeDasharray={t === 0 ? undefined : "3 3"}
                 />
                 <text
@@ -90,7 +90,7 @@ export function SalesTrendChart({
                   y={y + 4}
                   textAnchor="end"
                   fontSize="10"
-                  fill="hsl(215, 14%, 40%)"
+                  fill="var(--chart-label)"
                   fontFamily="var(--font-mono)"
                 >
                   ${Math.round((maxSales * t) / 100)}
@@ -128,7 +128,7 @@ export function SalesTrendChart({
                   width={barW}
                   height={Math.max(1, h)}
                   rx={2}
-                  fill={isActive ? "hsl(158, 62%, 27%)" : "hsl(158, 30%, 76%)"}
+                  fill={isActive ? "var(--chart-bar-active)" : "var(--chart-bar)"}
                 />
                 {(i === 0 || i === Math.floor(dailyTrend.length / 2) || i === dailyTrend.length - 1) && (
                   <text
@@ -136,7 +136,7 @@ export function SalesTrendChart({
                     y={chartH - 7}
                     textAnchor="middle"
                     fontSize="10"
-                    fill="hsl(215, 14%, 40%)"
+                    fill="var(--chart-label)"
                     fontFamily="var(--font-mono)"
                   >
                     {d.day.slice(5)}
@@ -148,7 +148,7 @@ export function SalesTrendChart({
           {profitPoints && (
             <polyline
               fill="none"
-              stroke="hsl(158, 64%, 24%)"
+              stroke="var(--chart-line)"
               strokeWidth="2.2"
               points={profitPoints}
             />

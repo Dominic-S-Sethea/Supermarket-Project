@@ -2,6 +2,8 @@ import { useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { KeyRound, ShieldCheck } from "lucide-react";
 import { apiPost } from "../api";
+import type { ThemeId } from "../lib/theme";
+import { ThemeSwitcher } from "./ThemeSwitcher";
 
 export interface SessionUser {
   id: string;
@@ -29,11 +31,15 @@ export function LoginScreen({
   sessionNotice,
   apiHealthy = true,
   onRetryConnection,
+  theme = "navy",
+  onThemeChange,
 }: {
   onLoggedIn: (user: SessionUser) => void;
   sessionNotice?: string | null;
   apiHealthy?: boolean;
   onRetryConnection?: () => void;
+  theme?: ThemeId;
+  onThemeChange?: (next: ThemeId) => void;
 }) {
   const [username, setUsername] = useState("");
   const [pin, setPin] = useState("");
@@ -80,6 +86,12 @@ export function LoginScreen({
             </div>
           </div>
         </div>
+
+        {onThemeChange && (
+          <div style={{ marginBottom: 14 }}>
+            <ThemeSwitcher theme={theme} onChange={onThemeChange} variant="surface" />
+          </div>
+        )}
 
         <h1 style={{ fontSize: 20, margin: "0 0 6px" }}>Staff Sign-In</h1>
         <p className="panel-desc" style={{ marginBottom: 16 }}>

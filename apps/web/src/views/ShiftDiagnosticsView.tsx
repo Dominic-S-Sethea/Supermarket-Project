@@ -609,14 +609,14 @@ export function ShiftDiagnosticsView({
                   No hourly footfall telemetry recorded yet.
                 </div>
               ) : (
-                <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="img" aria-label="Hourly footfall funnel">
+                <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="group" aria-label="Hourly footfall funnel">
                   {morningCols > 0 && (
                     <rect
                       x={padL}
                       y={padT}
                       width={morningCols * stepW}
                       height={plotH}
-                      fill="hsla(38, 92%, 50%, 0.08)"
+                      fill="var(--chart-morning-band)"
                     />
                   )}
                   {[0, 0.5, 1].map((t) => {
@@ -628,7 +628,7 @@ export function ShiftDiagnosticsView({
                           y1={y}
                           x2={chartW - padR}
                           y2={y}
-                          stroke="hsl(36, 14%, 89%)"
+                          stroke="var(--chart-grid)"
                           strokeDasharray={t === 0 ? undefined : "3 3"}
                         />
                         <text
@@ -636,8 +636,8 @@ export function ShiftDiagnosticsView({
                           y={y + 4}
                           textAnchor="end"
                           fontSize="10"
-                          fill="hsl(215, 10%, 52%)"
-                          fontFamily="JetBrains Mono, monospace"
+                          fill="var(--chart-label)"
+                          fontFamily="var(--font-mono)"
                         >
                           {Math.round(maxTraffic * t)}
                         </text>
@@ -646,8 +646,8 @@ export function ShiftDiagnosticsView({
                           y={y + 4}
                           textAnchor="start"
                           fontSize="10"
-                          fill="hsl(158, 62%, 27%)"
-                          fontFamily="JetBrains Mono, monospace"
+                          fill="var(--accent-primary-ink)"
+                          fontFamily="var(--font-mono)"
                         >
                           {Math.round(t * 100)}%
                         </text>
@@ -683,7 +683,7 @@ export function ShiftDiagnosticsView({
                           width={barW}
                           height={Math.max(1, hWalk)}
                           rx={2}
-                          fill="hsl(215, 22%, 72%)"
+                          fill="var(--chart-bar-muted)"
                         />
                         <rect
                           x={baseX + 1}
@@ -691,14 +691,14 @@ export function ShiftDiagnosticsView({
                           width={barW}
                           height={Math.max(1, hRcpt)}
                           rx={2}
-                          fill="hsl(158, 52%, 34%)"
+                          fill="var(--chart-bar-secondary)"
                         />
                         <text
                           x={baseX}
                           y={chartH - 8}
                           textAnchor="middle"
                           fontSize="10"
-                          fill={h.hour < 12 ? "hsl(28, 84%, 32%)" : "hsl(215, 14%, 40%)"}
+                          fill={h.hour < 12 ? "var(--accent-amber-ink)" : "var(--chart-label)"}
                           fontWeight={h.hour < 12 ? "700" : "400"}
                           fontFamily="var(--font-mono)"
                         >
@@ -710,7 +710,7 @@ export function ShiftDiagnosticsView({
                   {convPolyline && (
                     <polyline
                       fill="none"
-                      stroke="hsl(28, 88%, 48%)"
+                      stroke="var(--chart-line-amber)"
                       strokeWidth="2.4"
                       points={convPolyline}
                     />

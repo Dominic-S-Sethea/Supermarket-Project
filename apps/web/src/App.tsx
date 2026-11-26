@@ -18,6 +18,8 @@ import {
 import { apiGet, apiPost, setUnauthorizedHandler } from "./api";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { LoginScreen, type SessionUser } from "./components/LoginScreen";
+import { ThemeSwitcher } from "./components/ThemeSwitcher";
+import { useTheme } from "./lib/theme";
 import { readQueryParam, syncQueryParam } from "./lib/urlSync";
 
 const AiCopilotDrawer = lazy(() =>
@@ -96,6 +98,7 @@ function resolveInitialTab(allowed: TabId[]): TabId {
 }
 
 export function App() {
+  const { theme, setTheme } = useTheme();
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [sessionNotice, setSessionNotice] = useState<string | null>(null);
@@ -237,6 +240,8 @@ export function App() {
         sessionNotice={sessionNotice}
         apiHealthy={apiHealthy}
         onRetryConnection={() => void checkSession()}
+        theme={theme}
+        onThemeChange={setTheme}
       />
     );
   }
@@ -455,9 +460,12 @@ export function App() {
         )}
 
         <div className="sidebar-footer">
+          <ThemeSwitcher theme={theme} onChange={setTheme} variant="sidebar" />
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
             <div>
-              <div style={{ color: "#fff", fontWeight: 600, fontSize: 12.5 }}>{user.fullName}</div>
+              <div style={{ color: "var(--ink-inverse)", fontWeight: 600, fontSize: 12.5 }}>
+                {user.fullName}
+              </div>
               <div className="mono" style={{ fontSize: 10.5, textTransform: "uppercase" }}>
                 {user.role}
               </div>

@@ -229,15 +229,17 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
                   const cell = cellMap.get(seg);
                   const tint =
                     abc === "A" && xyz === "X"
-                      ? "hsl(156, 44%, 95%)"
+                      ? "var(--abc-ax-bg)"
                       : abc === "C" && xyz === "Z"
-                        ? "hsl(4, 58%, 96%)"
+                        ? "var(--abc-cz-bg)"
                         : abc === "A"
-                          ? "hsl(156, 26%, 97%)"
+                          ? "var(--abc-mid-bg)"
                           : "var(--bg-surface)";
                   return (
                     <button
                       key={seg}
+                      type="button"
+                      aria-pressed={selectedSegment === seg}
                       className={`abc-cell ${selectedSegment === seg ? "selected" : ""}`}
                       style={{ background: tint }}
                       onClick={() => setSelectedSegment(selectedSegment === seg ? "" : seg)}
