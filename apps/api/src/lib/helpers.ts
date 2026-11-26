@@ -55,7 +55,17 @@ export function parseCsvRows(csvText: string): string[][] {
  * Strip ZPL command prefixes (^, ~) and control characters to prevent ZPL label command injection.
  */
 export function sanitizeZpl(text: string): string {
-  return text.replace(/[\^~\r\n\x00-\x1f]/g, " ").trim();
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const ch = text[i];
+    if (code < 0x20 || ch === "^" || ch === "~") {
+      out += " ";
+    } else {
+      out += ch;
+    }
+  }
+  return out.trim();
 }
 
 /**

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from "react";
-import type { UserRole } from "@supermarket/shared";
+import type { UserRole } from "@supermarket/shared/dtos";
 import {
   BarChart3,
   Boxes,

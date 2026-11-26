@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { formatBp, formatMoney } from "@supermarket/shared";
-import { desc, eq, lte, sql } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import {
   aiBriefings,
   analyticsDemandForecasts,

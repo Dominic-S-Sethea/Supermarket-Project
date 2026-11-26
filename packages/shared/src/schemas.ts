@@ -1,15 +1,15 @@
 import { z } from "zod";
+import type { StockMovementReason, UserRole } from "./dtos.js";
 
-export const UserRoleSchema = z.enum([
+export const UserRoleSchema: z.ZodType<UserRole> = z.enum([
   "owner",
   "manager",
   "stock_clerk",
   "cashier",
   "accountant",
 ]);
-export type UserRole = z.infer<typeof UserRoleSchema>;
 
-export const StockMovementReasonSchema = z.enum([
+export const StockMovementReasonSchema: z.ZodType<StockMovementReason> = z.enum([
   "sale",
   "refund",
   "void",
@@ -21,7 +21,6 @@ export const StockMovementReasonSchema = z.enum([
   "clearance",
   "opening_stock",
 ]);
-export type StockMovementReason = z.infer<typeof StockMovementReasonSchema>;
 
 export const CreateProductSchema = z.object({
   sku: z.string().min(2).max(64),
@@ -156,7 +155,7 @@ export const CreatePromotionSchema = z
     endsAt: z.string().datetime().optional(),
     daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
     daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
-    rulesJson: z.record(z.unknown()),
+    rulesJson: z.record(z.string(), z.unknown()),
   })
   .refine(
     (d) =>
@@ -242,7 +241,7 @@ export const ParseInvoiceSchema = z
 export const AiTriageRequestSchema = z.object({
   targetType: z.enum(["cashier_anomaly", "invoice_discrepancy", "expiry_batch"]),
   subjectId: z.string().optional(),
-  metrics: z.record(z.unknown()),
+  metrics: z.record(z.string(), z.unknown()),
 });
 
 export const ApplyDynamicMarkdownSchema = z.object({

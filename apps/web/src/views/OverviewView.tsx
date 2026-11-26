@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { formatBp, formatMoney, type UserRole } from "@supermarket/shared";
+import type { UserRole } from "@supermarket/shared/dtos";
+import { formatBp, formatMoney } from "@supermarket/shared/money";
 import { ArrowRight, Download, RefreshCw, Sparkles } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 

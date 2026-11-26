@@ -43,8 +43,8 @@ import {
 } from "./index.js";
 
 // Deterministic fast PRNG (Mulberry32) so seed output is reproducible
-function createRng(seed = 20261125) {
-  let a = seed;
+function createRng(seedVal = 20261125) {
+  let a = seedVal;
   return () => {
     a |= 0;
     a = (a + 0x6d2b79f5) | 0;
@@ -1576,7 +1576,7 @@ async function seedRetailExpansionData(rng: () => number) {
         const isPartialLast = sIdx === 0 && cycle === 1;
 
         const chosen = items.slice(cycle * 2, cycle * 2 + 2);
-        const totalCases = chosen.reduce((acc, it) => acc + (isPartialLast ? 10 : 8), 0);
+        const totalCases = chosen.reduce((acc, _it) => acc + (isPartialLast ? 10 : 8), 0);
         const estCost = chosen.reduce(
           (acc, it) => acc + (isPartialLast ? 10 : 8) * it.caseCostCents,
           0

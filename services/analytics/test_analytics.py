@@ -497,3 +497,82 @@ def test_supplier_otif_handles_partial_and_cost_savings_deliveries():
     assert res["grade"] in ("C", "D")
 
 
+def test_analytics_http_worker_auth_and_recompute_lock():
+    import threading
+    import urllib.error
+    import urllib.request
+    from run_all import create_worker_server
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_pipeline():
+        calls.append(1)
+        started.set()
+        release.wait(timeout=2.0)
+        return {"ok": True, "status": "ok", "dq_passed": True, "elapsed_s": 0.01}
+
+    server, auth_required = create_worker_server(
+        host="127.0.0.1",
+        port=0,
+        worker_token="test-secret-token",
+        pipeline_fn=fake_pipeline,
+    )
+    assert auth_required is True
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode("utf-8"))
+            assert body == {"status": "ok", "busy": False}
+
+        # Unauthorized recompute -> 401
+        req_unauth = urllib.request.Request(f"http://127.0.0.1:{port}/recompute", method="POST", data=b"")
+        try:
+            urllib.request.urlopen(req_unauth)
+            assert False, "Expected 401 for missing bearer token"
+        except urllib.error.HTTPError as err:
+            assert err.code == 401
+
+        # Authorized recompute in flight + concurrent second recompute -> 409
+        first_result: dict[str, object] = {}
+
+        def invoke_first():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/recompute",
+                method="POST",
+                data=b"",
+                headers={"Authorization": "Bearer test-secret-token"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                first_result["status"] = resp.status
+                first_result["body"] = json.loads(resp.read().decode("utf-8"))
+
+        t1 = threading.Thread(target=invoke_first)
+        t1.start()
+        assert started.wait(timeout=2.0)
+
+        req_conflict = urllib.request.Request(
+            f"http://127.0.0.1:{port}/recompute",
+            method="POST",
+            data=b"",
+            headers={"Authorization": "Bearer test-secret-token"},
+        )
+        try:
+            urllib.request.urlopen(req_conflict)
+            assert False, "Expected 409 while recompute lock is held"
+        except urllib.error.HTTPError as err:
+            assert err.code == 409
+
+        release.set()
+        t1.join(timeout=2.0)
+        assert first_result["status"] == 200
+        assert first_result["body"]["ok"] is True
+        assert len(calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)

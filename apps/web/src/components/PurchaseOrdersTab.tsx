@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { formatMoney } from "@supermarket/shared";
+import { formatMoney } from "@supermarket/shared/money";
 import {
   CheckCircle2,
   ClipboardCheck,

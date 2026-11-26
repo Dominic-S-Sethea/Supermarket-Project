@@ -2724,7 +2724,7 @@ def validate_pipeline_data_quality(conn: psycopg.Connection) -> tuple[bool, list
     return dq_passed, checks
 
 
-def main() -> None:
+def run_pipeline() -> dict[str, object]:
     started_at = datetime.now(timezone.utc)
     t_total = time.perf_counter()
     stages: list[dict[str, object]] = []
@@ -2785,7 +2785,102 @@ def main() -> None:
         dq_passed=dq_passed,
         elapsed_s=elapsed_total,
     )
-    if not dq_passed:
+    return {
+        "ok": dq_passed,
+        "status": "ok" if dq_passed else "dq_failed",
+        "dq_passed": dq_passed,
+        "elapsed_s": elapsed_total,
+        "stages": stages,
+        "finished_at": finished_at.isoformat(),
+    }
+
+
+def create_worker_server(
+    host: str | None = None,
+    port: int | None = None,
+    worker_token: str | None = None,
+    pipeline_fn=None,
+):
+    """Create a stdlib ThreadingHTTPServer for HTTP-triggered analytics recomputes (H-02)."""
+    import hmac
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    bind_host = host if host is not None else os.environ.get("ANALYTICS_WORKER_HOST", "0.0.0.0")
+    bind_port = port if port is not None else int(os.environ.get("ANALYTICS_WORKER_PORT", "8090"))
+    token = (
+        worker_token if worker_token is not None else os.environ.get("ANALYTICS_WORKER_TOKEN", "")
+    ).strip()
+    execute_pipeline = pipeline_fn or run_pipeline
+    run_lock = threading.Lock()
+
+    class AnalyticsWorkerHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            log_event("worker_http", message=fmt % args)
+
+        def _send_json(self, status_code: int, payload: dict[str, object]) -> None:
+            body = safe_json_dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self) -> bool:
+            if not token:
+                return True
+            auth = self.headers.get("Authorization", "")
+            expected = f"Bearer {token}"
+            return hmac.compare_digest(auth, expected)
+
+        def do_GET(self) -> None:
+            if self.path in ("/health", "/health/live"):
+                self._send_json(200, {"status": "ok", "busy": run_lock.locked()})
+                return
+            self._send_json(404, {"error": "Not found"})
+
+        def do_POST(self) -> None:
+            if self.path != "/recompute":
+                self._send_json(404, {"error": "Not found"})
+                return
+            if not self._authorized():
+                self._send_json(401, {"error": "Unauthorized analytics worker request."})
+                return
+            if not run_lock.acquire(blocking=False):
+                self._send_json(409, {"error": "An analytics recompute is already in progress."})
+                return
+            try:
+                summary = execute_pipeline()
+                status = 200 if summary.get("ok") else 500
+                self._send_json(status, summary)
+            except Exception as exc:  # noqa: BLE001
+                log_event("worker_recompute_error", error=str(exc))
+                self._send_json(500, {"ok": False, "error": "Analytics pipeline failed."})
+            finally:
+                run_lock.release()
+
+    return ThreadingHTTPServer((bind_host, bind_port), AnalyticsWorkerHandler), bool(token)
+
+
+def serve_worker(host: str | None = None, port: int | None = None) -> None:
+    """Run a lightweight stdlib HTTP worker so the Node API can trigger recomputes over HTTP (H-02)."""
+    server, auth_required = create_worker_server(host=host, port=port)
+    bind_host, bind_port = server.server_address[:2]
+    log_event("worker_listen", host=bind_host, port=bind_port, auth_required=auth_required)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main() -> None:
+    if "--serve" in sys.argv[1:]:
+        serve_worker()
+        return
+    summary = run_pipeline()
+    if not summary.get("dq_passed"):
         sys.exit(1)
 
 

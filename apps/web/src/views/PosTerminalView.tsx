@@ -1,13 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  evaluateCart,
-  formatBp,
-  formatMoney,
-  generateUuidV7,
-  type CartInputLine,
-  type PromotionRule,
-  type UserRole,
-} from "@supermarket/shared";
+import type { UserRole } from "@supermarket/shared/dtos";
+import { formatBp, formatMoney, generateUuidV7 } from "@supermarket/shared/money";
+import { evaluateCart, type CartInputLine, type PromotionRule } from "@supermarket/shared/pricing";
 import {
   AlertTriangle,
   CheckCircle2,

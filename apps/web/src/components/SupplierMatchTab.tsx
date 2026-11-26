@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { formatMoney } from "@supermarket/shared";
+import { formatMoney } from "@supermarket/shared/money";
 import { Award, CheckCircle2, FileWarning, RefreshCw, Scale } from "lucide-react";
 import { apiGet, apiPatch } from "../api";
 

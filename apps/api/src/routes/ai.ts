@@ -68,7 +68,7 @@ const ExecuteCreatePromoPayloadSchema = z
     minMarginGuardBp: z.number().int().min(0).max(9500).nullable().optional().default(1000),
     daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
     daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
-    rulesJson: z.record(z.unknown()).default({}),
+    rulesJson: z.record(z.string(), z.unknown()).default({}),
   })
   .refine(
     (d) =>

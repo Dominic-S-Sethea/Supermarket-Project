@@ -1,10 +1,6 @@
 import { useEffect, useState } from "react";
-import {
-  computeEffectiveUnitCostCents,
-  formatBp,
-  formatMoney,
-  type UserRole,
-} from "@supermarket/shared";
+import type { UserRole } from "@supermarket/shared/dtos";
+import { computeEffectiveUnitCostCents, formatBp, formatMoney } from "@supermarket/shared/money";
 import { AlertTriangle, Award, Check, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import { FloorTasksTab } from "../components/FloorTasksTab";

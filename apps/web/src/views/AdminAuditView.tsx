@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { formatMoney, type UserRole } from "@supermarket/shared";
+import type { UserRole } from "@supermarket/shared/dtos";
+import { formatMoney } from "@supermarket/shared/money";
 import {
   Activity,
   Download,

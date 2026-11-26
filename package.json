@@ -6,7 +6,9 @@
     "dev:api": "pnpm --filter @supermarket/api dev",
     "dev:web": "pnpm --filter @supermarket/web dev",
     "build": "pnpm --filter @supermarket/shared build && pnpm -r --if-present build",
+    "lint": "oxlint --deny-warnings -c .oxlintrc.json packages/shared/src apps/api/src apps/web/src",
     "test": "pnpm --filter @supermarket/shared build && pnpm -r --if-present test",
+    "test:coverage": "pnpm --filter @supermarket/shared build && pnpm -r --if-present test:coverage",
     "test:e2e": "playwright test",
     "test:stress": "node scripts/stress-test.mjs",
     "typecheck": "pnpm --filter @supermarket/shared build && pnpm -r --if-present typecheck",
@@ -22,7 +24,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.65.1",
-    "turbo": "^2.4.0",
+    "oxlint": "^1.95.0",
     "typescript": "^5.8.2"
   }
 }

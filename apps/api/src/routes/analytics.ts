@@ -26,6 +26,7 @@ import {
   shiftExperiments,
   storeFootfall,
 } from "../db/index.js";
+import { env } from "../config/env.js";
 import { buildCsvDocument } from "../lib/helpers.js";
 import { evaluateShiftExperiment } from "../lib/shiftDid.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
@@ -597,13 +598,70 @@ export async function analyticsRoutes(app: FastifyInstance) {
     }
   );
 
-  // Recompute Python Shift Diagnostics & ML Worker on Demand
+  // Recompute Python Shift Diagnostics & ML Worker on Demand (decoupled HTTP worker or local dev fallback - H-02)
   app.post(
     "/api/analytics/shift-diagnostics/recompute",
     { preHandler: [requireRole(["owner", "manager"])] },
     async (req, reply) => {
+      const workerBaseUrl = (process.env.ANALYTICS_WORKER_URL?.trim() || env.analyticsWorkerUrl)?.replace(
+        /\/+$/,
+        ""
+      );
+      if (workerBaseUrl) {
+        try {
+          const workerToken =
+            process.env.ANALYTICS_WORKER_TOKEN?.trim() || env.analyticsWorkerToken;
+          const headers: Record<string, string> = { "Content-Type": "application/json" };
+          if (workerToken) headers.Authorization = `Bearer ${workerToken}`;
+          const res = await fetch(`${workerBaseUrl}/recompute`, {
+            method: "POST",
+            headers,
+            signal: AbortSignal.timeout(95_000),
+          });
+          if (res.status === 409) {
+            return reply.status(409).send({
+              error: "An analytics recompute is already running on the worker.",
+            });
+          }
+          if (!res.ok) {
+            req.log.error({ status: res.status }, "Analytics HTTP worker returned error");
+            return reply.status(502).send({
+              error: "Analytics worker failed to recompute diagnostics.",
+            });
+          }
+          const payload = (await res.json()) as {
+            ok?: boolean;
+            elapsed_s?: number;
+            finished_at?: string;
+          };
+          const [diag] = await db
+            .select()
+            .from(analyticsShiftDiagnostics)
+            .where(eq(analyticsShiftDiagnostics.id, "latest_60d"))
+            .limit(1);
+          return {
+            ok: Boolean(payload.ok ?? true),
+            mode: "http_worker",
+            log: `Worker recomputed in ${payload.elapsed_s ?? 0}s`,
+            computedAt: diag?.computedAt ?? payload.finished_at ?? null,
+          };
+        } catch (err) {
+          req.log.error({ err, workerBaseUrl }, "Analytics HTTP worker unreachable");
+          return reply.status(503).send({
+            error: "Analytics worker service is temporarily unavailable.",
+          });
+        }
+      }
+
+      // Local monorepo development fallback when ANALYTICS_WORKER_URL is not configured
       const repoRoot = path.resolve(process.cwd(), "../..");
       const scriptPath = path.join(repoRoot, "services", "analytics", "run_all.py");
+      if (!fs.existsSync(scriptPath)) {
+        return reply.status(503).send({
+          error:
+            "Analytics recompute service is not configured. Set ANALYTICS_WORKER_URL in production.",
+        });
+      }
       const winPy = path.join(repoRoot, "services", "analytics", ".venv", "Scripts", "python.exe");
       const posixPy = path.join(repoRoot, "services", "analytics", ".venv", "bin", "python");
       const pyBin = fs.existsSync(winPy)
@@ -622,7 +680,12 @@ export async function analyticsRoutes(app: FastifyInstance) {
           .from(analyticsShiftDiagnostics)
           .where(eq(analyticsShiftDiagnostics.id, "latest_60d"))
           .limit(1);
-        return { ok: true, log: stdout.trim(), computedAt: diag?.computedAt ?? null };
+        return {
+          ok: true,
+          mode: "local_dev_subprocess",
+          log: stdout.trim(),
+          computedAt: diag?.computedAt ?? null,
+        };
       } catch (err) {
         req.log.error({ err }, "Python analytics recompute failed");
         return reply.status(500).send({

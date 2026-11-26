@@ -1,11 +1,7 @@
 import { useEffect, useState } from "react";
-import {
-  buildValidEan13,
-  computeNetMarginBp,
-  formatBp,
-  formatMoney,
-  type UserRole,
-} from "@supermarket/shared";
+import { buildValidEan13 } from "@supermarket/shared/barcodes";
+import type { UserRole } from "@supermarket/shared/dtos";
+import { computeNetMarginBp, formatBp, formatMoney } from "@supermarket/shared/money";
 import { Barcode, Plus, Printer, Search, Sparkles, Upload, X } from "lucide-react";
 import { apiDelete, apiGet, apiPost } from "../api";
 

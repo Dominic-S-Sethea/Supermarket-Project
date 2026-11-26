@@ -1,4 +1,4 @@
-import type { PromotionRule } from "@supermarket/shared";
+import type { PromotionRule } from "@supermarket/shared/pricing";
 import { ApiError } from "../api.ts";
 
 const DB_NAME = "supermarket_os_pos_cache";

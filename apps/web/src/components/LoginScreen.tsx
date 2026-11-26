@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { UserRole } from "@supermarket/shared";
+import type { UserRole } from "@supermarket/shared/dtos";
 import { KeyRound, ShieldCheck } from "lucide-react";
 import { apiPost } from "../api";
 

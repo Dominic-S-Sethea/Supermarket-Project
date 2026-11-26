@@ -54,21 +54,38 @@ pub fn sanitize_escpos_text(input: &str) -> String {
         .to_string()
 }
 
-/// Validate that a target LAN printer socket address is strictly loopback or RFC1918 / IPv6 ULA
-/// private LAN with a non-zero port. Blocks public IPs and link-local cloud metadata (169.254/16).
-pub fn validate_lan_printer_addr(addr: &str) -> Result<SocketAddr, String> {
+/// Standard raw/LPD/IPP thermal receipt printer TCP ports (Epson, Star, Xprinter, Bixolon).
+pub const ALLOWED_PRINTER_PORTS: &[u16] = &[9100, 9101, 9102, 9103, 515, 631];
+
+/// Validate that a target LAN printer socket address is strictly an RFC1918 / IPv6 ULA private
+/// LAN address on an allowed printer port (9100-9103, 515, 631). Loopback is blocked by default
+/// to prevent SSRF/local-service pivoting unless `allow_loopback` is explicitly enabled.
+pub fn validate_lan_printer_addr_with_options(
+    addr: &str,
+    allow_loopback: bool,
+) -> Result<SocketAddr, String> {
     let socket: SocketAddr = addr
         .trim()
         .parse()
         .map_err(|e| format!("Invalid printer addr: {e}"))?;
-    if socket.port() == 0 {
-        return Err("Printer port must be non-zero (typically 9100).".to_string());
+    if !ALLOWED_PRINTER_PORTS.contains(&socket.port()) {
+        return Err(format!(
+            "Printer port {} is not permitted (allowed thermal printer ports: 9100-9103, 515, 631).",
+            socket.port()
+        ));
+    }
+    let is_loopback = socket.ip().is_loopback();
+    if is_loopback && !allow_loopback {
+        return Err(format!(
+            "Refusing to connect to loopback printer address {} unless explicitly enabled.",
+            socket.ip()
+        ));
     }
     let allowed = match socket.ip() {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        IpAddr::V4(v4) => v4.is_private() || (allow_loopback && v4.is_loopback()),
         IpAddr::V6(v6) => {
             let seg0 = v6.segments()[0];
-            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00
+            (seg0 & 0xfe00) == 0xfc00 || (allow_loopback && v6.is_loopback())
         }
     };
     if !allowed {
@@ -78,6 +95,15 @@ pub fn validate_lan_printer_addr(addr: &str) -> Result<SocketAddr, String> {
         ));
     }
     Ok(socket)
+}
+
+/// Validate a LAN printer socket address with strict production defaults (RFC1918/ULA + printer ports only).
+/// Set `SMOS_ALLOW_LOOPBACK_PRINTER=1` only for local printer simulator development.
+pub fn validate_lan_printer_addr(addr: &str) -> Result<SocketAddr, String> {
+    let allow_loopback = std::env::var("SMOS_ALLOW_LOOPBACK_PRINTER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    validate_lan_printer_addr_with_options(addr, allow_loopback)
 }
 
 /// Build an 80mm (48-char width) ESC/POS byte buffer ready to stream to TCP:9100 or USB.
@@ -200,20 +226,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_lan_printer_allows_rfc1918_and_loopback() {
-        assert!(validate_lan_printer_addr("192.168.1.50:9100").is_ok());
-        assert!(validate_lan_printer_addr("10.0.4.12:9100").is_ok());
-        assert!(validate_lan_printer_addr("172.16.8.20:9100").is_ok());
-        assert!(validate_lan_printer_addr("127.0.0.1:9100").is_ok());
-        assert!(validate_lan_printer_addr("[::1]:9100").is_ok());
+    fn validate_lan_printer_allows_rfc1918_printer_ports_and_blocks_loopback_by_default() {
+        assert!(validate_lan_printer_addr_with_options("192.168.1.50:9100", false).is_ok());
+        assert!(validate_lan_printer_addr_with_options("10.0.4.12:9101", false).is_ok());
+        assert!(validate_lan_printer_addr_with_options("172.16.8.20:631", false).is_ok());
+        assert!(validate_lan_printer_addr_with_options("192.168.1.50:515", false).is_ok());
+        // Loopback blocked by default to prevent SSRF / local-service pivoting
+        assert!(validate_lan_printer_addr_with_options("127.0.0.1:9100", false).is_err());
+        assert!(validate_lan_printer_addr_with_options("[::1]:9100", false).is_err());
+        // Explicit opt-in permits loopback on standard printer ports only
+        assert!(validate_lan_printer_addr_with_options("127.0.0.1:9100", true).is_ok());
+        assert!(validate_lan_printer_addr_with_options("[::1]:9100", true).is_ok());
+        assert!(validate_lan_printer_addr_with_options("127.0.0.1:5432", true).is_err());
     }
 
     #[test]
-    fn validate_lan_printer_blocks_public_metadata_and_zero_port() {
-        assert!(validate_lan_printer_addr("169.254.169.254:80").is_err());
-        assert!(validate_lan_printer_addr("8.8.8.8:9100").is_err());
-        assert!(validate_lan_printer_addr("192.168.1.50:0").is_err());
-        assert!(validate_lan_printer_addr("not-an-ip").is_err());
+    fn validate_lan_printer_blocks_public_metadata_non_printer_ports_and_zero_port() {
+        assert!(validate_lan_printer_addr_with_options("169.254.169.254:80", false).is_err());
+        assert!(validate_lan_printer_addr_with_options("8.8.8.8:9100", false).is_err());
+        assert!(validate_lan_printer_addr_with_options("192.168.1.50:0", false).is_err());
+        assert!(validate_lan_printer_addr_with_options("192.168.1.50:22", false).is_err());
+        assert!(validate_lan_printer_addr_with_options("192.168.1.50:5432", false).is_err());
+        assert!(validate_lan_printer_addr_with_options("not-an-ip", false).is_err());
     }
 
     #[test]
