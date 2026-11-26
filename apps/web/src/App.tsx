@@ -219,12 +219,16 @@ export function App() {
     }
 
     if (mobileNavOpen) {
-      const container = sidebarRef.current;
+      const container = sidebarRef.current as (HTMLElement & { inert?: boolean }) | null;
+      let focusRaf = 0;
       if (container) {
-        const firstFocusable = container.querySelector<HTMLElement>(
-          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
-        );
-        firstFocusable?.focus();
+        container.inert = false;
+        focusRaf = window.requestAnimationFrame(() => {
+          const firstFocusable = container.querySelector<HTMLElement>(
+            'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+          );
+          firstFocusable?.focus();
+        });
       }
 
       const onKeyDown = (e: KeyboardEvent) => {
@@ -255,7 +259,10 @@ export function App() {
 
       window.addEventListener("keydown", onKeyDown);
       prevMobileNavOpenRef.current = true;
-      return () => window.removeEventListener("keydown", onKeyDown);
+      return () => {
+        window.cancelAnimationFrame(focusRaf);
+        window.removeEventListener("keydown", onKeyDown);
+      };
     }
 
     if (prevMobileNavOpenRef.current) {

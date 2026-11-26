@@ -1284,11 +1284,12 @@ body,
     z-index: 55;
     transform: translateX(-105%);
     visibility: hidden;
-    transition: transform 0.2s ease, visibility 0.2s ease;
+    transition: transform 0.2s ease, visibility 0s linear 0.2s;
   }
   .sidebar.mobile-open {
     transform: translateX(0);
     visibility: visible;
+    transition: transform 0.2s ease, visibility 0s linear 0s;
   }
   .main-content {
     padding: 16px;
