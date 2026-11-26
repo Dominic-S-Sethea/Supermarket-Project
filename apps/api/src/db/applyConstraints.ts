@@ -46,6 +46,29 @@ export async function applyDatabaseConstraintsAndViews() {
       ON targeted_coupons (upper(code));
   `);
 
+  // Drop redundant indexes superseded by column-level UNIQUE constraints (M-09)
+  await db.execute(sql`DROP INDEX IF EXISTS uq_stock_baselines_product;`);
+  await db.execute(sql`DROP INDEX IF EXISTS idx_store_footfall_bucket;`);
+
+  // PostgreSQL pg_trgm GIN indexes for fast wildcard ILIKE catalog/barcode search (M-06)
+  await db.execute(sql`CREATE EXTENSION IF NOT EXISTS pg_trgm;`);
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS idx_products_name_trgm
+      ON products USING gin (name gin_trgm_ops);
+  `);
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS idx_products_sku_trgm
+      ON products USING gin (sku gin_trgm_ops);
+  `);
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS idx_products_brand_trgm
+      ON products USING gin (brand gin_trgm_ops);
+  `);
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS idx_product_barcodes_barcode_trgm
+      ON product_barcodes USING gin (barcode gin_trgm_ops);
+  `);
+
   // Idempotent CHECK constraint helper statements
   await db.execute(sql`
     DO $$
@@ -61,7 +84,14 @@ export async function applyDatabaseConstraintsAndViews() {
         SELECT 1 FROM pg_constraint WHERE conname = 'chk_sales_totals_nonneg'
       ) THEN
         ALTER TABLE sales
-          ADD CONSTRAINT chk_sales_totals_nonneg CHECK (subtotal_cents >= 0 AND total_cents >= 0);
+          ADD CONSTRAINT chk_sales_totals_nonneg CHECK (subtotal_cents >= 0 AND total_cents >= 0 AND discount_cents >= 0 AND tax_cents >= 0);
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_sales_kind_valid'
+      ) THEN
+        ALTER TABLE sales
+          ADD CONSTRAINT chk_sales_kind_valid CHECK (kind IN ('sale', 'refund', 'void'));
       END IF;
 
       IF NOT EXISTS (
@@ -79,6 +109,13 @@ export async function applyDatabaseConstraintsAndViews() {
       END IF;
 
       IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_products_costs_valid'
+      ) THEN
+        ALTER TABLE products
+          ADD CONSTRAINT chk_products_costs_valid CHECK (avg_cost_cents >= 0 AND min_margin_bp BETWEEN 0 AND 9500);
+      END IF;
+
+      IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'chk_sale_payments_amount_nonneg'
       ) THEN
         ALTER TABLE sale_payments
@@ -90,6 +127,68 @@ export async function applyDatabaseConstraintsAndViews() {
       ) THEN
         ALTER TABLE purchase_order_lines
           ADD CONSTRAINT chk_po_lines_cases_valid CHECK (ordered_cases >= 1 AND received_cases >= 0);
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_purchase_orders_status_valid'
+      ) THEN
+        ALTER TABLE purchase_orders
+          ADD CONSTRAINT chk_purchase_orders_status_valid CHECK (
+            status IN ('draft', 'approved', 'sent', 'partially_received', 'received', 'cancelled')
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_grn_lines_valid'
+      ) THEN
+        ALTER TABLE grn_lines
+          ADD CONSTRAINT chk_grn_lines_valid CHECK (
+            case_qty >= 1 AND paid_cases >= 0 AND free_bonus_cases >= 0
+            AND base_units_received >= 1 AND invoice_line_total_cents >= 0
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_targeted_coupons_valid'
+      ) THEN
+        ALTER TABLE targeted_coupons
+          ADD CONSTRAINT chk_targeted_coupons_valid CHECK (
+            discount_cents >= 1 AND min_basket_cents >= 0 AND valid_until >= valid_from
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_pos_shifts_float_nonneg'
+      ) THEN
+        ALTER TABLE pos_shifts
+          ADD CONSTRAINT chk_pos_shifts_float_nonneg CHECK (
+            opening_float_cents >= 0 AND cash_drops_cents >= 0
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_store_footfall_nonneg'
+      ) THEN
+        ALTER TABLE store_footfall
+          ADD CONSTRAINT chk_store_footfall_nonneg CHECK (
+            entries >= 0 AND exits >= 0 AND open_lanes >= 1
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_users_role_valid'
+      ) THEN
+        ALTER TABLE users
+          ADD CONSTRAINT chk_users_role_valid CHECK (
+            role IN ('owner', 'manager', 'stock_clerk', 'cashier', 'accountant')
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_promotions_window'
+      ) THEN
+        ALTER TABLE promotions
+          ADD CONSTRAINT chk_promotions_window CHECK (ends_at >= starts_at);
       END IF;
 
       IF NOT EXISTS (

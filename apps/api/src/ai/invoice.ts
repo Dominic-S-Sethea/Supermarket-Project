@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { computeEffectiveUnitCostCents } from "@supermarket/shared";
-import { eq, ilike, or } from "drizzle-orm";
+import { eq, ilike, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db, productBarcodes, products, suppliers } from "../db/index.js";
 import { isGeminiConfigured } from "./copilot.js";
@@ -304,8 +304,47 @@ export async function parseSupplierInvoice(
     ? await db.select().from(suppliers).where(ilike(suppliers.name, `%${supHint.split(" ")[0]}%`)).limit(1)
     : await db.select().from(suppliers).limit(1);
 
+  // Batch-resolve all barcode hints and SKU hints up-front (eliminates 2N per-line DB queries - H-06)
+  const rawLines = raw.lines ?? [];
+  const allBcHints = Array.from(
+    new Set(rawLines.map((l) => (l.barcodeHint ?? "").trim()).filter(Boolean))
+  );
+  const allSkuHints = Array.from(
+    new Set(rawLines.map((l) => (l.skuHint ?? "").trim().toUpperCase()).filter(Boolean))
+  );
+
+  const [bcMatches, skuMatches] = await Promise.all([
+    allBcHints.length > 0
+      ? db
+          .select({
+            barcode: productBarcodes.barcode,
+            id: products.id,
+            sku: products.sku,
+            name: products.name,
+            avgCostCents: products.avgCostCents,
+          })
+          .from(productBarcodes)
+          .innerJoin(products, eq(productBarcodes.productId, products.id))
+          .where(inArray(productBarcodes.barcode, allBcHints))
+      : Promise.resolve([]),
+    allSkuHints.length > 0
+      ? db
+          .select({
+            id: products.id,
+            sku: products.sku,
+            name: products.name,
+            avgCostCents: products.avgCostCents,
+          })
+          .from(products)
+          .where(sql`upper(${products.sku}) IN (${sql.join(allSkuHints.map((s) => sql`${s}`), sql`, `)})`)
+      : Promise.resolve([]),
+  ]);
+
+  const bcMatchMap = new Map(bcMatches.map((r) => [r.barcode.toLowerCase(), r]));
+  const skuMatchMap = new Map(skuMatches.map((r) => [r.sku.toUpperCase(), r]));
+
   const enrichedLines: ExtractedInvoiceLine[] = [];
-  for (const l of raw.lines ?? []) {
+  for (const l of rawLines) {
     const desc = (l.description ?? "").trim() || "Unknown Packaged Item";
     const skuHint = (l.skuHint ?? "").trim();
     const bcHint = (l.barcodeHint ?? "").trim();
@@ -332,31 +371,20 @@ export async function parseSupplierInvoice(
     } | null = null;
 
     if (bcHint) {
-      const [bcRow] = await db
-        .select({
-          id: products.id,
-          sku: products.sku,
-          name: products.name,
-          avgCostCents: products.avgCostCents,
-        })
-        .from(productBarcodes)
-        .innerJoin(products, eq(productBarcodes.productId, products.id))
-        .where(ilike(productBarcodes.barcode, bcHint))
-        .limit(1);
-      if (bcRow) matched = { ...bcRow, confidence: 0.99 };
+      const bcRow = bcMatchMap.get(bcHint.toLowerCase());
+      if (bcRow) {
+        matched = {
+          id: bcRow.id,
+          sku: bcRow.sku,
+          name: bcRow.name,
+          avgCostCents: bcRow.avgCostCents,
+          confidence: 0.99,
+        };
+      }
     }
 
     if (!matched && skuHint) {
-      const [skuRow] = await db
-        .select({
-          id: products.id,
-          sku: products.sku,
-          name: products.name,
-          avgCostCents: products.avgCostCents,
-        })
-        .from(products)
-        .where(or(ilike(products.sku, skuHint), ilike(products.name, `%${desc}%`)))
-        .limit(1);
+      const skuRow = skuMatchMap.get(skuHint.toUpperCase());
       if (skuRow) matched = { ...skuRow, confidence: 0.96 };
     }
 

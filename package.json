@@ -12,6 +12,8 @@
     "typecheck": "pnpm --filter @supermarket/shared build && pnpm -r --if-present typecheck",
     "db:up": "docker compose -f infra/docker-compose.yml up -d postgres",
     "db:down": "docker compose -f infra/docker-compose.yml down",
+    "db:generate": "pnpm --filter @supermarket/api db:generate",
+    "db:migrate": "pnpm --filter @supermarket/api db:migrate",
     "db:push": "pnpm --filter @supermarket/api db:push",
     "db:seed": "pnpm --filter @supermarket/shared build && pnpm --filter @supermarket/api db:seed",
     "db:backup-verify": "bash scripts/db-backup-verify.sh",

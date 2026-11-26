@@ -79,21 +79,43 @@ export function embedTextLocal(text: string): number[] {
   return out;
 }
 
-function cosineSim(a: number[], b: number[]): number {
+function cosineSim(a: ArrayLike<number>, b: ArrayLike<number>): number {
   const len = Math.min(a.length, b.length);
   let dot = 0;
   for (let i = 0; i < len; i++) dot += a[i] * b[i];
   return dot;
 }
 
+function toNormalizedFloat64(raw: number[]): Float64Array {
+  const vec = new Float64Array(raw.length);
+  let normSq = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const v = Number.isFinite(raw[i]) ? raw[i] : 0;
+    vec[i] = v;
+    normSq += v * v;
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm > 0 && Math.abs(norm - 1) > 1e-4) {
+    for (let i = 0; i < vec.length; i++) vec[i] /= norm;
+  }
+  return vec;
+}
+
 interface CachedEmbedEntry {
   productId: string;
   descriptor: string;
   model: string;
-  vector: number[];
+  vector: Float64Array;
 }
 
+const EMBEDDING_CACHE_TTL_MS = 10 * 60_000;
 let memoryIndex: Map<string, CachedEmbedEntry> | null = null;
+let memoryIndexLoadedAt = 0;
+
+export function invalidateEmbeddingCache(): void {
+  memoryIndex = null;
+  memoryIndexLoadedAt = 0;
+}
 
 function buildProductDescriptor(p: {
   sku: string;
@@ -144,7 +166,7 @@ export async function syncProductEmbeddings(force = false): Promise<{
         productId: r.productId,
         descriptor,
         model: prev.embeddingModel,
-        vector: prev.vectorJson as number[],
+        vector: toNormalizedFloat64(prev.vectorJson as number[]),
       });
     } else {
       toEmbed.push({ productId: r.productId, descriptor, textHash });
@@ -181,7 +203,7 @@ export async function syncProductEmbeddings(force = false): Promise<{
             productId: item.productId,
             descriptor: item.descriptor,
             model: "gemini-embedding-001",
-            vector: unitVec,
+            vector: toNormalizedFloat64(unitVec),
           });
         }
       }
@@ -205,7 +227,7 @@ export async function syncProductEmbeddings(force = false): Promise<{
         productId: item.productId,
         descriptor: item.descriptor,
         model: "local-semantic-256d",
-        vector: unitVec,
+        vector: toNormalizedFloat64(unitVec),
       });
     }
   }
@@ -229,11 +251,18 @@ export async function syncProductEmbeddings(force = false): Promise<{
   }
 
   memoryIndex = nextCache;
+  memoryIndexLoadedAt = Date.now();
   return { indexedCount: nextCache.size, model: actualModel };
 }
 
 async function ensureMemoryIndex(): Promise<Map<string, CachedEmbedEntry>> {
-  if (memoryIndex && memoryIndex.size > 0) return memoryIndex;
+  if (
+    memoryIndex &&
+    memoryIndex.size > 0 &&
+    Date.now() - memoryIndexLoadedAt < EMBEDDING_CACHE_TTL_MS
+  ) {
+    return memoryIndex;
+  }
 
   const [embRows, prodRows] = await Promise.all([
     db.select().from(productEmbeddings),
@@ -261,14 +290,16 @@ async function ensureMemoryIndex(): Promise<Map<string, CachedEmbedEntry>> {
   const descMap = new Map(prodRows.map((p) => [p.productId, buildProductDescriptor(p)]));
   const loaded = new Map<string, CachedEmbedEntry>();
   for (const e of embRows) {
+    if (!descMap.has(e.productId)) continue;
     loaded.set(e.productId, {
       productId: e.productId,
       descriptor: descMap.get(e.productId) ?? "",
       model: e.embeddingModel,
-      vector: e.vectorJson as number[],
+      vector: toNormalizedFloat64(e.vectorJson as number[]),
     });
   }
   memoryIndex = loaded;
+  memoryIndexLoadedAt = Date.now();
   return loaded;
 }
 

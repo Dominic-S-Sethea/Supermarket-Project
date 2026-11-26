@@ -25,6 +25,8 @@ import {
   taxRates,
   users,
 } from "../db/index.js";
+import { invalidateEmbeddingCache } from "../ai/semantic.js";
+import { getPgErrorCode } from "../app.js";
 import { env } from "../config/env.js";
 import { buildZplBarcodeCommand, parseCsvRows, sanitizeZpl } from "../lib/helpers.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
@@ -37,6 +39,11 @@ export async function catalogRoutes(app: FastifyInstance) {
     keyPrefix: "csv_import",
     windowMs: 60_000,
     max: env.isTest ? 200 : 12,
+  });
+  const lookupLimiter = createRateLimiter({
+    keyPrefix: "barcode_lookup",
+    windowMs: 60_000,
+    max: env.isTest ? 200 : 30,
   });
   // Metadata bootstrap for dropdowns, promos, and filters
   app.get("/api/meta", { preHandler: [requireAuth] }, async (req) => {
@@ -172,9 +179,11 @@ export async function catalogRoutes(app: FastifyInstance) {
     }
     const rawPage = Number(q.page);
     const rawPageSize = Number(q.pageSize);
-    const page = Number.isFinite(rawPage) ? Math.max(1, Math.trunc(rawPage)) : 1;
+    const page = Number.isFinite(rawPage)
+      ? Math.min(10_000, Math.max(1, Math.trunc(rawPage)))
+      : 1;
     const pageSize = Number.isFinite(rawPageSize)
-      ? Math.min(100, Math.max(10, Math.trunc(rawPageSize)))
+      ? Math.min(100, Math.max(1, Math.trunc(rawPageSize)))
       : 50;
     const offset = (page - 1) * pageSize;
 
@@ -465,6 +474,7 @@ export async function catalogRoutes(app: FastifyInstance) {
         await tx.insert(stockBaselines).values({ productId, quantity: 0 });
       });
 
+      invalidateEmbeddingCache();
       return reply.status(201).send({ id: productId });
     }
   );
@@ -594,34 +604,48 @@ export async function catalogRoutes(app: FastifyInstance) {
       if (!UuidSchema.safeParse(id).success || !UuidSchema.safeParse(barcodeId).success) {
         return reply.status(400).send({ error: "Invalid product or barcode ID format." });
       }
-      const allForProduct = await db
-        .select()
-        .from(productBarcodes)
-        .where(eq(productBarcodes.productId, id));
 
-      const target = allForProduct.find((b) => b.id === barcodeId);
-      if (!target) {
-        return reply.status(404).send({ error: "Barcode not found" });
-      }
-      if (allForProduct.length <= 1) {
-        return reply.status(409).send({
-          error: "Cannot delete the last remaining barcode on a product.",
-        });
-      }
-      if (target.isPrimary) {
-        return reply.status(409).send({
-          error: "Cannot delete the primary barcode directly. Assign another primary barcode first.",
-        });
-      }
+      // Lock all barcodes for this product inside a transaction so concurrent DELETEs cannot orphan the product (M-10)
+      const outcome = await db.transaction(async (tx) => {
+        const allForProduct = await tx
+          .select()
+          .from(productBarcodes)
+          .where(eq(productBarcodes.productId, id))
+          .orderBy(asc(productBarcodes.id))
+          .for("update");
 
-      await db
-        .delete(productBarcodes)
-        .where(and(eq(productBarcodes.id, barcodeId), eq(productBarcodes.productId, id)));
+        const target = allForProduct.find((b) => b.id === barcodeId);
+        if (!target) {
+          return { errorStatus: 404 as const, error: "Barcode not found" };
+        }
+        if (allForProduct.length <= 1) {
+          return {
+            errorStatus: 409 as const,
+            error: "Cannot delete the last remaining barcode on a product.",
+          };
+        }
+        if (target.isPrimary) {
+          return {
+            errorStatus: 409 as const,
+            error:
+              "Cannot delete the primary barcode directly. Assign another primary barcode first.",
+          };
+        }
+
+        await tx
+          .delete(productBarcodes)
+          .where(and(eq(productBarcodes.id, barcodeId), eq(productBarcodes.productId, id)));
+        return { errorStatus: null };
+      });
+
+      if (outcome.errorStatus) {
+        return reply.status(outcome.errorStatus).send({ error: outcome.error });
+      }
       return { deleted: true, barcodeId };
     }
   );
 
-  // Bulk CSV Onboarding Preview & Validation (RFC-4180 parser + GS1 check digits + net margin)
+  // Bulk CSV Onboarding Preview & Validation (RFC-4180 parser + GS1 check digits + DB tax_rates net margin)
   app.post(
     "/api/import/preview",
     { preHandler: [requireRole(["owner", "manager"]), importLimiter] },
@@ -650,12 +674,19 @@ export async function catalogRoutes(app: FastifyInstance) {
       const iCost = idx(["unit_cost", "cost", "cost_usd"]);
       const iPrice = idx(["sell_price", "price", "retail_price"]);
       const iCat = idx(["category"]);
+      const iTaxCode = idx(["tax_code", "tax"]);
 
-      const existingBarcodes = new Set(
-        (await db.select({ barcode: productBarcodes.barcode }).from(productBarcodes)).map(
-          (b) => b.barcode
-        )
-      );
+      const [existingBarcodeRows, allTaxRates] = await Promise.all([
+        db.select({ barcode: productBarcodes.barcode }).from(productBarcodes),
+        db.select().from(taxRates),
+      ]);
+      const existingBarcodes = new Set(existingBarcodeRows.map((b) => b.barcode));
+      const taxByCode = new Map(allTaxRates.map((t) => [t.code.toUpperCase(), t]));
+      const defaultTax = taxByCode.get("STD") ?? allTaxRates[0] ?? {
+        rateBp: 0,
+        isInclusive: true,
+        code: "STD",
+      };
 
       const MAX_PREVIEW_ROWS = 2000;
       const dataSlice = parsedRows.slice(1, 1 + MAX_PREVIEW_ROWS);
@@ -678,6 +709,8 @@ export async function catalogRoutes(app: FastifyInstance) {
         const unitCostCents = Math.round((Number(iCost >= 0 ? cols[iCost] : 0) || 0) * 100);
         const sellPriceCents = Math.round((Number(iPrice >= 0 ? cols[iPrice] : 0) || 0) * 100);
         const categoryName = iCat >= 0 && cols[iCat] ? cols[iCat] : "Cola & Sparkling Soda";
+        const taxCodeHint = iTaxCode >= 0 && cols[iTaxCode] ? cols[iTaxCode].trim().toUpperCase() : "";
+        const matchedTax = (taxCodeHint ? taxByCode.get(taxCodeHint) : undefined) ?? defaultTax;
 
         const issues: string[] = [];
         if (!name) issues.push("Missing product name");
@@ -704,8 +737,14 @@ export async function catalogRoutes(app: FastifyInstance) {
           packLabel,
           unitCostCents,
           sellPriceCents,
-          marginBp: computeNetMarginBp(sellPriceCents, unitCostCents * packQty, 1000, true),
+          marginBp: computeNetMarginBp(
+            sellPriceCents,
+            unitCostCents * packQty,
+            matchedTax.rateBp,
+            matchedTax.isInclusive
+          ),
           categoryName,
+          taxCode: matchedTax.code,
           status: issues.length > 0 ? "error" : existsInDb ? "duplicate" : "ready",
           issues,
         };
@@ -722,25 +761,37 @@ export async function catalogRoutes(app: FastifyInstance) {
     }
   );
 
-  // Commit validated CSV import rows into PostgreSQL (re-validates GS1 + margin server-side)
+  function sanitizeImportDbError(err: unknown): string {
+    const code = getPgErrorCode(err);
+    if (code === "23505") return "Duplicate SKU or barcode already exists in catalog.";
+    if (code === "23503") return "Invalid category or tax rate reference.";
+    if (code === "23514") return "Row violates catalog price or quantity constraints.";
+    if (code === "22P02") return "Invalid data format in import row.";
+    return "Could not import row due to a database conflict.";
+  }
+
+  // Commit validated CSV import rows into PostgreSQL (batched inserts + sanitized errors - H-06, H-11)
   app.post(
     "/api/import/commit",
     { preHandler: [requireRole(["owner", "manager"]), importLimiter] },
     async (req, reply) => {
       const schema = z.object({
-        rows: z.array(
-          z.object({
-            sku: z.string().min(1),
-            name: z.string().min(1),
-            brand: z.string().min(1),
-            barcode: z.string().min(4),
-            packQty: z.number().int().min(1),
-            packLabel: z.string().min(1),
-            unitCostCents: z.number().int().min(0),
-            sellPriceCents: z.number().int().min(1),
-            categoryName: z.string().optional(),
-          })
-        ),
+        rows: z
+          .array(
+            z.object({
+              sku: z.string().trim().min(1).max(64),
+              name: z.string().trim().min(1).max(200),
+              brand: z.string().trim().min(1).max(120),
+              barcode: z.string().trim().min(4).max(32),
+              packQty: z.number().int().min(1),
+              packLabel: z.string().trim().min(1).max(64),
+              unitCostCents: z.number().int().min(0),
+              sellPriceCents: z.number().int().min(1),
+              categoryName: z.string().optional(),
+              taxCode: z.string().optional(),
+            })
+          )
+          .max(2000),
       });
       const parsed = schema.safeParse(req.body);
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
@@ -750,11 +801,30 @@ export async function catalogRoutes(app: FastifyInstance) {
         db.select().from(taxRates),
       ]);
       const defaultCat = allCats[0];
-      const defaultTax = allTaxes.find((t) => t.code === "STD") ?? allTaxes[0];
+      const catByLower = new Map(allCats.map((c) => [c.name.toLowerCase(), c]));
+      const taxByCode = new Map(allTaxes.map((t) => [t.code.toUpperCase(), t]));
+      const defaultTax = taxByCode.get("STD") ?? allTaxes[0];
+
+      // Pre-validate all rows and batch-check existing SKUs & barcodes in 2 queries (eliminates N+1)
+      const normalizedCandidates: {
+        productId: string;
+        sku: string;
+        name: string;
+        brand: string;
+        barcode: string;
+        packQty: number;
+        packLabel: string;
+        unitCostCents: number;
+        sellPriceCents: number;
+        categoryId: string;
+        taxRateId: string;
+      }[] = [];
 
       let imported = 0;
       let skipped = 0;
       const errors: { sku: string; reason: string }[] = [];
+      const seenSkus = new Set<string>();
+      const seenBarcodes = new Set<string>();
 
       for (const r of parsed.data.rows) {
         const bcCheck = validateBarcode(r.barcode);
@@ -768,41 +838,135 @@ export async function catalogRoutes(app: FastifyInstance) {
           errors.push({ sku: r.sku, reason: "Negative margin (cost >= sell price)" });
           continue;
         }
+        if (seenSkus.has(r.sku)) {
+          skipped++;
+          errors.push({ sku: r.sku, reason: "Duplicate SKU within import batch." });
+          continue;
+        }
+        if (seenBarcodes.has(bcCheck.normalized)) {
+          skipped++;
+          errors.push({ sku: r.sku, reason: "Duplicate barcode within import batch." });
+          continue;
+        }
+        seenSkus.add(r.sku);
+        seenBarcodes.add(bcCheck.normalized);
 
         const cat =
-          allCats.find((c) => c.name.toLowerCase() === (r.categoryName ?? "").toLowerCase()) ??
-          defaultCat;
-        const productId = generateUuidV7();
-        try {
-          await db.transaction(async (tx) => {
-            await tx.insert(products).values({
-              id: productId,
-              sku: r.sku,
-              name: r.name,
-              brand: r.brand,
-              categoryId: cat.id,
-              taxRateId: defaultTax.id,
-              avgCostCents: r.unitCostCents,
-              baseUnitLabel: "unit",
-            });
-            await tx.insert(productBarcodes).values({
-              productId,
-              barcode: bcCheck.normalized,
-              packQty: r.packQty,
-              packLabel: r.packLabel,
-              sellPriceCents: r.sellPriceCents,
-              isPrimary: true,
-            });
-            await tx.insert(stockBaselines).values({ productId, quantity: 0 });
-          });
-          imported++;
-        } catch (err) {
-          skipped++;
-          errors.push({
-            sku: r.sku,
-            reason: err instanceof Error ? err.message : "Database conflict",
-          });
+          catByLower.get((r.categoryName ?? "").trim().toLowerCase()) ?? defaultCat;
+        const tax =
+          taxByCode.get((r.taxCode ?? "").trim().toUpperCase()) ?? defaultTax;
+        normalizedCandidates.push({
+          productId: generateUuidV7(),
+          sku: r.sku,
+          name: r.name,
+          brand: r.brand,
+          barcode: bcCheck.normalized,
+          packQty: r.packQty,
+          packLabel: r.packLabel,
+          unitCostCents: r.unitCostCents,
+          sellPriceCents: r.sellPriceCents,
+          categoryId: cat.id,
+          taxRateId: tax.id,
+        });
+      }
+
+      if (normalizedCandidates.length > 0) {
+        const candidateSkus = normalizedCandidates.map((c) => c.sku);
+        const candidateBarcodes = normalizedCandidates.map((c) => c.barcode);
+        const [existingSkuRows, existingBcRows] = await Promise.all([
+          db.select({ sku: products.sku }).from(products).where(inArray(products.sku, candidateSkus)),
+          db
+            .select({ barcode: productBarcodes.barcode })
+            .from(productBarcodes)
+            .where(inArray(productBarcodes.barcode, candidateBarcodes)),
+        ]);
+        const existingSkuSet = new Set(existingSkuRows.map((x) => x.sku));
+        const existingBcSet = new Set(existingBcRows.map((x) => x.barcode));
+
+        const readyToInsert = [];
+        for (const c of normalizedCandidates) {
+          if (existingSkuSet.has(c.sku)) {
+            skipped++;
+            errors.push({ sku: c.sku, reason: "Duplicate SKU already exists in catalog." });
+            continue;
+          }
+          if (existingBcSet.has(c.barcode)) {
+            skipped++;
+            errors.push({ sku: c.sku, reason: "Duplicate barcode already exists in catalog." });
+            continue;
+          }
+          readyToInsert.push(c);
         }
+
+        const CHUNK_SIZE = 100;
+        for (let i = 0; i < readyToInsert.length; i += CHUNK_SIZE) {
+          const chunk = readyToInsert.slice(i, i + CHUNK_SIZE);
+          try {
+            await db.transaction(async (tx) => {
+              await tx.insert(products).values(
+                chunk.map((c) => ({
+                  id: c.productId,
+                  sku: c.sku,
+                  name: c.name,
+                  brand: c.brand,
+                  categoryId: c.categoryId,
+                  taxRateId: c.taxRateId,
+                  avgCostCents: c.unitCostCents,
+                  baseUnitLabel: "unit",
+                }))
+              );
+              await tx.insert(productBarcodes).values(
+                chunk.map((c) => ({
+                  productId: c.productId,
+                  barcode: c.barcode,
+                  packQty: c.packQty,
+                  packLabel: c.packLabel,
+                  sellPriceCents: c.sellPriceCents,
+                  isPrimary: true,
+                }))
+              );
+              await tx.insert(stockBaselines).values(
+                chunk.map((c) => ({ productId: c.productId, quantity: 0 }))
+              );
+            });
+            imported += chunk.length;
+          } catch {
+            // Fall back to row-level savepoints only if a concurrent conflict hit this chunk
+            for (const c of chunk) {
+              try {
+                await db.transaction(async (tx) => {
+                  await tx.insert(products).values({
+                    id: c.productId,
+                    sku: c.sku,
+                    name: c.name,
+                    brand: c.brand,
+                    categoryId: c.categoryId,
+                    taxRateId: c.taxRateId,
+                    avgCostCents: c.unitCostCents,
+                    baseUnitLabel: "unit",
+                  });
+                  await tx.insert(productBarcodes).values({
+                    productId: c.productId,
+                    barcode: c.barcode,
+                    packQty: c.packQty,
+                    packLabel: c.packLabel,
+                    sellPriceCents: c.sellPriceCents,
+                    isPrimary: true,
+                  });
+                  await tx.insert(stockBaselines).values({ productId: c.productId, quantity: 0 });
+                });
+                imported++;
+              } catch (rowErr) {
+                skipped++;
+                errors.push({ sku: c.sku, reason: sanitizeImportDbError(rowErr) });
+              }
+            }
+          }
+        }
+      }
+
+      if (imported > 0) {
+        invalidateEmbeddingCache();
       }
 
       await db.insert(auditLogs).values({
@@ -816,10 +980,10 @@ export async function catalogRoutes(app: FastifyInstance) {
     }
   );
 
-  // Open Food Facts Barcode Auto-Enrichment Helper
+  // Open Food Facts Barcode Auto-Enrichment Helper (strictly validated & rate-limited - M-12)
   app.get(
     "/api/lookup/barcode/:barcode",
-    { preHandler: [requireRole(["owner", "manager", "stock_clerk"])] },
+    { preHandler: [requireRole(["owner", "manager", "stock_clerk"]), lookupLimiter] },
     async (req, reply) => {
       const { barcode } = req.params as { barcode: string };
       const clean = barcode.trim();

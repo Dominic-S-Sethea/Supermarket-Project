@@ -24,6 +24,7 @@ import { posRoutes } from "./routes/pos.js";
 declare module "fastify" {
   interface FastifyInstance {
     allowedOrigins: Set<string>;
+    registeredRoutes: { method: string; url: string }[];
   }
 }
 
@@ -60,6 +61,21 @@ export async function buildApp(logger = true) {
         }
       : false,
     bodyLimit: 12 * 1024 * 1024,
+  });
+
+  const registeredRoutes: { method: string; url: string }[] = [];
+  app.decorate("registeredRoutes", registeredRoutes);
+  app.addHook("onRoute", (routeOptions) => {
+    const methods = Array.isArray(routeOptions.method)
+      ? routeOptions.method
+      : [routeOptions.method];
+    for (const m of methods) {
+      const upper = String(m).toUpperCase();
+      if (upper === "HEAD" || upper === "OPTIONS") continue;
+      if (routeOptions.url.startsWith("/api/")) {
+        registeredRoutes.push({ method: upper, url: routeOptions.url });
+      }
+    }
   });
 
   const allowedOrigins = new Set(

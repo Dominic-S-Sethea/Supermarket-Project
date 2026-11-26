@@ -146,62 +146,67 @@ export async function loyaltyRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: "Invalid coupon status filter." });
       }
 
-      const rows = await db
-        .select({
-          id: targetedCoupons.id,
-          code: targetedCoupons.code,
-          customerId: targetedCoupons.customerId,
-          customerName: customers.fullName,
-          customerPhone: customers.phone,
-          rfmSegment: targetedCoupons.rfmSegment,
-          discountCents: targetedCoupons.discountCents,
-          minBasketCents: targetedCoupons.minBasketCents,
-          validFrom: targetedCoupons.validFrom,
-          validUntil: targetedCoupons.validUntil,
-          redeemedSaleId: targetedCoupons.redeemedSaleId,
-          redeemedAt: targetedCoupons.redeemedAt,
-          createdAt: targetedCoupons.createdAt,
-        })
-        .from(targetedCoupons)
-        .leftJoin(customers, eq(targetedCoupons.customerId, customers.id))
-        .orderBy(desc(targetedCoupons.createdAt))
-        .limit(150);
+      const now = new Date();
+      let statusCondition;
+      if (q.status === "redeemed") {
+        statusCondition = sql`${targetedCoupons.redeemedSaleId} IS NOT NULL`;
+      } else if (q.status === "expired") {
+        statusCondition = sql`${targetedCoupons.redeemedSaleId} IS NULL AND ${targetedCoupons.validUntil} < ${now}`;
+      } else if (q.status === "active") {
+        statusCondition = sql`${targetedCoupons.redeemedSaleId} IS NULL AND ${targetedCoupons.validUntil} >= ${now}`;
+      }
 
-      const nowMs = Date.now();
-      let activeCount = 0;
-      let redeemedCount = 0;
-      let expiredCount = 0;
-      let totalActiveValueCents = 0;
+      const [rows, summaryRes] = await Promise.all([
+        db
+          .select({
+            id: targetedCoupons.id,
+            code: targetedCoupons.code,
+            customerId: targetedCoupons.customerId,
+            customerName: customers.fullName,
+            customerPhone: customers.phone,
+            rfmSegment: targetedCoupons.rfmSegment,
+            discountCents: targetedCoupons.discountCents,
+            minBasketCents: targetedCoupons.minBasketCents,
+            validFrom: targetedCoupons.validFrom,
+            validUntil: targetedCoupons.validUntil,
+            redeemedSaleId: targetedCoupons.redeemedSaleId,
+            redeemedAt: targetedCoupons.redeemedAt,
+            createdAt: targetedCoupons.createdAt,
+          })
+          .from(targetedCoupons)
+          .leftJoin(customers, eq(targetedCoupons.customerId, customers.id))
+          .where(statusCondition)
+          .orderBy(desc(targetedCoupons.createdAt))
+          .limit(150),
+        db.execute(sql`
+          SELECT
+            COUNT(*) FILTER (WHERE redeemed_sale_id IS NOT NULL)::int AS redeemed_count,
+            COUNT(*) FILTER (WHERE redeemed_sale_id IS NULL AND valid_until < ${now})::int AS expired_count,
+            COUNT(*) FILTER (WHERE redeemed_sale_id IS NULL AND valid_until >= ${now})::int AS active_count,
+            COALESCE(SUM(discount_cents) FILTER (WHERE redeemed_sale_id IS NULL AND valid_until >= ${now}), 0)::bigint AS active_value_cents
+          FROM targeted_coupons
+        `),
+      ]);
 
-      const enriched = rows.map((r) => {
-        let status: "active" | "redeemed" | "expired" = "active";
-        if (r.redeemedSaleId) {
-          status = "redeemed";
-          redeemedCount++;
-        } else if (new Date(r.validUntil).getTime() < nowMs) {
-          status = "expired";
-          expiredCount++;
-        } else {
-          status = "active";
-          activeCount++;
-          totalActiveValueCents += r.discountCents;
-        }
+      const nowMs = now.getTime();
+      const coupons = rows.map((r) => {
+        const status: "active" | "redeemed" | "expired" = r.redeemedSaleId
+          ? "redeemed"
+          : new Date(r.validUntil).getTime() < nowMs
+            ? "expired"
+            : "active";
         return { ...r, status };
       });
 
-      const filtered =
-        q.status && q.status !== "all"
-          ? enriched.filter((c) => c.status === q.status)
-          : enriched;
-
+      const agg = (summaryRes.rows[0] ?? {}) as Record<string, unknown>;
       return {
         summary: {
-          activeCount,
-          redeemedCount,
-          expiredCount,
-          totalActiveValueCents,
+          activeCount: Number(agg.active_count ?? 0),
+          redeemedCount: Number(agg.redeemed_count ?? 0),
+          expiredCount: Number(agg.expired_count ?? 0),
+          totalActiveValueCents: Number(agg.active_value_cents ?? 0),
         },
-        coupons: filtered,
+        coupons,
       };
     }
   );
@@ -267,7 +272,7 @@ export async function loyaltyRoutes(app: FastifyInstance) {
     }
   );
 
-  // Live POS coupon lookup & eligibility validation
+  // Live POS coupon lookup & eligibility validation (enforces customerId + rfmSegment)
   app.get(
     "/api/loyalty/coupons/validate/:code",
     { preHandler: [requireRole(["owner", "manager", "cashier"])] },
@@ -304,6 +309,25 @@ export async function loyaltyRoutes(app: FastifyInstance) {
           return {
             valid: false,
             reason: `Coupon "${coupon.code}" is restricted to a specific loyalty customer.`,
+          };
+        }
+      }
+      if (coupon.rfmSegment) {
+        if (!q.customerId || !UuidSchema.safeParse(q.customerId).success) {
+          return {
+            valid: false,
+            reason: `Coupon "${coupon.code}" requires a loyalty member in segment "${coupon.rfmSegment}".`,
+          };
+        }
+        const [cust] = await db
+          .select({ rfmSegment: customers.rfmSegment })
+          .from(customers)
+          .where(eq(customers.id, q.customerId))
+          .limit(1);
+        if (!cust || cust.rfmSegment !== coupon.rfmSegment) {
+          return {
+            valid: false,
+            reason: `Coupon "${coupon.code}" is restricted to loyalty segment "${coupon.rfmSegment}".`,
           };
         }
       }

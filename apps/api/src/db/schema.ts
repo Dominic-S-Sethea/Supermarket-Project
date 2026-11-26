@@ -1,4 +1,5 @@
 import {
+  type AnyPgColumn,
   bigint,
   boolean,
   date,
@@ -44,6 +45,7 @@ export const taxRates = pgTable("tax_rates", {
   name: text("name").notNull(),
   rateBp: integer("rate_bp").notNull(), // e.g., 1000 = 10.00%
   isInclusive: boolean("is_inclusive").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const products = pgTable(
@@ -73,6 +75,7 @@ export const products = pgTable(
   },
   (t) => [
     index("idx_products_category").on(t.categoryId),
+    index("idx_products_tax_rate").on(t.taxRateId),
     index("idx_products_brand").on(t.brand),
     index("idx_products_name").on(t.name),
     index("idx_products_active").on(t.active),
@@ -101,19 +104,15 @@ export const productBarcodes = pgTable(
 // 2. IMMUTABLE INVENTORY LEDGER & FEFO BEST-BEFORE BATCHES
 // ============================================================================
 
-export const stockBaselines = pgTable(
-  "stock_baselines",
-  {
-    id: uuid("id").defaultRandom().primaryKey(),
-    productId: uuid("product_id")
-      .notNull()
-      .unique()
-      .references(() => products.id, { onDelete: "cascade" }),
-    quantity: integer("quantity").notNull().default(0),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-  },
-  (t) => [uniqueIndex("uq_stock_baselines_product").on(t.productId)]
-);
+export const stockBaselines = pgTable("stock_baselines", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  productId: uuid("product_id")
+    .notNull()
+    .unique()
+    .references(() => products.id, { onDelete: "cascade" }),
+  quantity: integer("quantity").notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
 
 export const inventoryBatches = pgTable(
   "inventory_batches",
@@ -155,6 +154,8 @@ export const stockMovements = pgTable(
   },
   (t) => [
     index("idx_stock_movements_product_folded").on(t.productId, t.folded),
+    index("idx_stock_movements_batch").on(t.batchId),
+    index("idx_stock_movements_ref").on(t.refId),
     index("idx_stock_movements_created").on(t.createdAt),
     index("idx_stock_movements_reason").on(t.reason),
   ]
@@ -227,7 +228,7 @@ export const purchaseOrderLines = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     poId: uuid("po_id")
       .notNull()
-      .references(() => purchaseOrders.id, { onDelete: "cascade" }),
+      .references(() => purchaseOrders.id, { onDelete: "restrict" }),
     productId: uuid("product_id")
       .notNull()
       .references(() => products.id, { onDelete: "restrict" }),
@@ -237,7 +238,10 @@ export const purchaseOrderLines = pgTable(
     unitCostCents: bigint("unit_cost_cents", { mode: "number" }).notNull(),
     lineTotalCents: bigint("line_total_cents", { mode: "number" }).notNull(),
   },
-  (t) => [index("idx_po_lines_po").on(t.poId)]
+  (t) => [
+    index("idx_po_lines_po").on(t.poId),
+    index("idx_po_lines_product").on(t.productId),
+  ]
 );
 
 export const goodsReceipts = pgTable(
@@ -255,6 +259,7 @@ export const goodsReceipts = pgTable(
     receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [
+    uniqueIndex("uq_goods_receipts_supplier_invoice").on(t.supplierId, t.invoiceNumber),
     index("idx_goods_receipts_supplier_received").on(t.supplierId, t.receivedAt),
     index("idx_goods_receipts_po").on(t.poId),
   ]
@@ -266,7 +271,7 @@ export const grnLines = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     grnId: uuid("grn_id")
       .notNull()
-      .references(() => goodsReceipts.id, { onDelete: "cascade" }),
+      .references(() => goodsReceipts.id, { onDelete: "restrict" }),
     productId: uuid("product_id")
       .notNull()
       .references(() => products.id, { onDelete: "restrict" }),
@@ -278,7 +283,10 @@ export const grnLines = pgTable(
     effectiveUnitCostCents: bigint("effective_unit_cost_cents", { mode: "number" }).notNull(),
     bestBeforeDate: date("best_before_date"),
   },
-  (t) => [index("idx_grn_lines_grn").on(t.grnId)]
+  (t) => [
+    index("idx_grn_lines_grn").on(t.grnId),
+    index("idx_grn_lines_product").on(t.productId),
+  ]
 );
 
 export const marginAlerts = pgTable(
@@ -301,6 +309,7 @@ export const marginAlerts = pgTable(
   (t) => [
     index("idx_margin_alerts_resolved").on(t.resolved),
     index("idx_margin_alerts_product_resolved").on(t.productId, t.resolved),
+    index("idx_margin_alerts_grn").on(t.grnId),
   ]
 );
 
@@ -367,6 +376,7 @@ export const promotions = pgTable(
     startsAt: timestamp("starts_at", { withTimezone: true }).notNull(),
     endsAt: timestamp("ends_at", { withTimezone: true }).notNull(),
     active: boolean("active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [index("idx_promotions_active_window").on(t.active, t.startsAt, t.endsAt)]
 );
@@ -401,7 +411,9 @@ export const sales = pgTable(
     customerId: uuid("customer_id").references(() => customers.id, { onDelete: "set null" }),
     receiptNo: text("receipt_no").notNull().unique(),
     kind: text("kind").notNull().default("sale"), // sale | refund | void
-    originalSaleId: uuid("original_sale_id"),
+    originalSaleId: uuid("original_sale_id").references((): AnyPgColumn => sales.id, {
+      onDelete: "restrict",
+    }),
     cashierName: text("cashier_name").notNull(),
     subtotalCents: bigint("subtotal_cents", { mode: "number" }).notNull(),
     discountCents: bigint("discount_cents", { mode: "number" }).notNull().default(0),
@@ -418,6 +430,7 @@ export const sales = pgTable(
     index("idx_sales_kind").on(t.kind),
     index("idx_sales_sold_at_kind").on(t.soldAt, t.kind),
     index("idx_sales_register_sold").on(t.registerCode, t.soldAt),
+    index("idx_sales_shift").on(t.shiftId),
     index("idx_sales_customer").on(t.customerId),
   ]
 );
@@ -428,7 +441,7 @@ export const saleLines = pgTable(
     id: uuid("id").primaryKey(),
     saleId: uuid("sale_id")
       .notNull()
-      .references(() => sales.id, { onDelete: "cascade" }),
+      .references(() => sales.id, { onDelete: "restrict" }),
     productId: uuid("product_id")
       .notNull()
       .references(() => products.id, { onDelete: "restrict" }),
@@ -456,7 +469,7 @@ export const salePayments = pgTable(
     id: uuid("id").primaryKey(),
     saleId: uuid("sale_id")
       .notNull()
-      .references(() => sales.id, { onDelete: "cascade" }),
+      .references(() => sales.id, { onDelete: "restrict" }),
     method: text("method").notNull(), // cash | card | mobile_pay | voucher
     amountCents: bigint("amount_cents", { mode: "number" }).notNull(),
     tenderedCents: bigint("tendered_cents", { mode: "number" }),
@@ -554,23 +567,21 @@ export const analyticsBasketRules = pgTable(
   (t) => [
     index("idx_basket_rules_shift").on(t.shiftBucket),
     index("idx_basket_rules_shift_lift").on(t.shiftBucket, t.lift),
+    index("idx_basket_rules_antecedent").on(t.antecedentProductId),
+    index("idx_basket_rules_consequent").on(t.consequentProductId),
   ]
 );
 
-export const storeFootfall = pgTable(
-  "store_footfall",
-  {
-    id: uuid("id").defaultRandom().primaryKey(),
-    bucketStart: timestamp("bucket_start", { withTimezone: true }).notNull().unique(),
-    entries: integer("entries").notNull(),
-    exits: integer("exits").notNull(),
-    avgDwellSec: integer("avg_dwell_sec").notNull().default(360),
-    openLanes: integer("open_lanes").notNull().default(1),
-    weatherRain: boolean("weather_rain").notNull().default(false),
-    source: text("source").notNull().default("door_sensor"),
-  },
-  (t) => [index("idx_store_footfall_bucket").on(t.bucketStart)]
-);
+export const storeFootfall = pgTable("store_footfall", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  bucketStart: timestamp("bucket_start", { withTimezone: true }).notNull().unique(),
+  entries: integer("entries").notNull(),
+  exits: integer("exits").notNull(),
+  avgDwellSec: integer("avg_dwell_sec").notNull().default(360),
+  openLanes: integer("open_lanes").notNull().default(1),
+  weatherRain: boolean("weather_rain").notNull().default(false),
+  source: text("source").notNull().default("door_sensor"),
+});
 
 export const hourlyStockSnapshots = pgTable(
   "hourly_stock_snapshots",
@@ -588,6 +599,7 @@ export const hourlyStockSnapshots = pgTable(
   (t) => [
     uniqueIndex("uq_hourly_stock_snap").on(t.snapshotDate, t.snapshotHour, t.productId),
     index("idx_hourly_stock_oos").on(t.snapshotDate, t.snapshotHour, t.isOos),
+    index("idx_hourly_stock_product").on(t.productId),
   ]
 );
 
@@ -629,18 +641,22 @@ export const shiftExperiments = pgTable("shift_experiments", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
-export const analyticsLpAnomalies = pgTable("analytics_lp_anomalies", {
-  id: uuid("id").defaultRandom().primaryKey(),
-  cashierName: text("cashier_name").notNull(),
-  totalSalesCount: integer("total_sales_count").notNull(),
-  voidCount: integer("void_count").notNull(),
-  refundCount: integer("refund_count").notNull(),
-  noSaleDrawerCount: integer("no_sale_drawer_count").notNull(),
-  voidRatePct: doublePrecision("void_rate_pct").notNull(),
-  zScore: doublePrecision("z_score").notNull(),
-  riskLevel: text("risk_level").notNull(), // normal | elevated | high
-  computedAt: timestamp("computed_at", { withTimezone: true }).defaultNow().notNull(),
-});
+export const analyticsLpAnomalies = pgTable(
+  "analytics_lp_anomalies",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    cashierName: text("cashier_name").notNull(),
+    totalSalesCount: integer("total_sales_count").notNull(),
+    voidCount: integer("void_count").notNull(),
+    refundCount: integer("refund_count").notNull(),
+    noSaleDrawerCount: integer("no_sale_drawer_count").notNull(),
+    voidRatePct: doublePrecision("void_rate_pct").notNull(),
+    zScore: doublePrecision("z_score").notNull(),
+    riskLevel: text("risk_level").notNull(), // normal | elevated | high
+    computedAt: timestamp("computed_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index("idx_lp_anomalies_risk").on(t.riskLevel)]
+);
 
 // ============================================================================
 // 6. EMBEDDED AI COPILOT CONVERSATIONS & HUMAN-IN-THE-LOOP ACTION QUEUE
@@ -700,6 +716,7 @@ export const aiProposedActions = pgTable(
   (t) => [
     index("idx_ai_actions_conv").on(t.conversationId),
     index("idx_ai_actions_status").on(t.status),
+    index("idx_ai_actions_message").on(t.messageId),
   ]
 );
 
@@ -809,7 +826,7 @@ export const grnVariances = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     grnId: uuid("grn_id")
       .notNull()
-      .references(() => goodsReceipts.id, { onDelete: "cascade" }),
+      .references(() => goodsReceipts.id, { onDelete: "restrict" }),
     poId: uuid("po_id").references(() => purchaseOrders.id, { onDelete: "set null" }),
     supplierId: uuid("supplier_id")
       .notNull()
@@ -832,6 +849,8 @@ export const grnVariances = pgTable(
     index("idx_grn_variances_status_created").on(t.status, t.createdAt),
     index("idx_grn_variances_supplier").on(t.supplierId),
     index("idx_grn_variances_grn").on(t.grnId),
+    index("idx_grn_variances_po").on(t.poId),
+    index("idx_grn_variances_product").on(t.productId),
   ]
 );
 
@@ -862,13 +881,16 @@ export const loyaltyLedger = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     customerId: uuid("customer_id")
       .notNull()
-      .references(() => customers.id, { onDelete: "cascade" }),
+      .references(() => customers.id, { onDelete: "restrict" }),
     saleId: uuid("sale_id").references(() => sales.id, { onDelete: "set null" }),
     pointsDelta: integer("points_delta").notNull(),
     reason: text("reason").notNull(), // earn | redeem | bonus | refund_clawback
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
-  (t) => [index("idx_loyalty_ledger_customer").on(t.customerId, t.createdAt)]
+  (t) => [
+    index("idx_loyalty_ledger_customer").on(t.customerId, t.createdAt),
+    index("idx_loyalty_ledger_sale").on(t.saleId),
+  ]
 );
 
 export const targetedCoupons = pgTable(
@@ -876,7 +898,7 @@ export const targetedCoupons = pgTable(
   {
     id: uuid("id").defaultRandom().primaryKey(),
     code: text("code").notNull().unique(),
-    customerId: uuid("customer_id").references(() => customers.id, { onDelete: "cascade" }),
+    customerId: uuid("customer_id").references(() => customers.id, { onDelete: "set null" }),
     rfmSegment: text("rfm_segment"),
     discountCents: bigint("discount_cents", { mode: "number" }).notNull(),
     minBasketCents: bigint("min_basket_cents", { mode: "number" }).notNull().default(0),
@@ -889,6 +911,7 @@ export const targetedCoupons = pgTable(
   (t) => [
     index("idx_targeted_coupons_customer").on(t.customerId),
     index("idx_targeted_coupons_rfm").on(t.rfmSegment),
+    index("idx_targeted_coupons_redeemed_sale").on(t.redeemedSaleId),
   ]
 );
 
@@ -909,7 +932,10 @@ export const shiftRosters = pgTable(
     status: text("status").notNull().default("planned"), // planned | confirmed | completed
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
-  (t) => [uniqueIndex("uq_shift_roster_slot").on(t.planDate, t.hour)]
+  (t) => [
+    uniqueIndex("uq_shift_roster_slot").on(t.planDate, t.hour),
+    index("idx_shift_rosters_staff").on(t.assignedStaffId),
+  ]
 );
 
 export const storeTasks = pgTable(
@@ -933,6 +959,7 @@ export const storeTasks = pgTable(
   (t) => [
     index("idx_store_tasks_date_status").on(t.taskDate, t.status),
     index("idx_store_tasks_type").on(t.taskType),
+    index("idx_store_tasks_product").on(t.productId),
   ]
 );
 

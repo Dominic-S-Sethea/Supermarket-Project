@@ -432,30 +432,36 @@ export async function analyticsRoutes(app: FastifyInstance) {
       }
       const buckets = parsed.data.buckets;
 
+      // Deduplicate buckets by normalized timestamp so single multi-row ON CONFLICT succeeds
+      const dedupByTs = new Map<string, (typeof buckets)[number]>();
+      for (const b of buckets) {
+        dedupByTs.set(new Date(b.bucketStart).toISOString(), b);
+      }
+      const upsertValues = Array.from(dedupByTs.entries()).map(([iso, b]) => ({
+        id: generateUuidV7(),
+        bucketStart: new Date(iso),
+        entries: b.entries,
+        exits: b.exits ?? b.entries,
+        avgDwellSec: b.avgDwellSec,
+        openLanes: b.openLanes,
+        weatherRain: b.weatherRain,
+        source: b.source,
+      }));
+
       await db.transaction(async (tx) => {
-        for (const b of buckets) {
-          const ts = new Date(b.bucketStart);
+        if (upsertValues.length > 0) {
           await tx
             .insert(storeFootfall)
-            .values({
-              id: generateUuidV7(),
-              bucketStart: ts,
-              entries: b.entries,
-              exits: b.exits ?? b.entries,
-              avgDwellSec: b.avgDwellSec,
-              openLanes: b.openLanes,
-              weatherRain: b.weatherRain,
-              source: b.source,
-            })
+            .values(upsertValues)
             .onConflictDoUpdate({
               target: storeFootfall.bucketStart,
               set: {
-                entries: b.entries,
-                exits: b.exits ?? b.entries,
-                avgDwellSec: b.avgDwellSec,
-                openLanes: b.openLanes,
-                weatherRain: b.weatherRain,
-                source: b.source,
+                entries: sql`EXCLUDED.entries`,
+                exits: sql`EXCLUDED.exits`,
+                avgDwellSec: sql`EXCLUDED.avg_dwell_sec`,
+                openLanes: sql`EXCLUDED.open_lanes`,
+                weatherRain: sql`EXCLUDED.weather_rain`,
+                source: sql`EXCLUDED.source`,
               },
             });
         }
@@ -463,11 +469,11 @@ export async function analyticsRoutes(app: FastifyInstance) {
           actor: req.authUser!.fullName,
           action: "footfall_ingest",
           entityType: "store_footfall",
-          detailsJson: { bucketCount: buckets.length },
+          detailsJson: { bucketCount: upsertValues.length },
         });
       });
 
-      return reply.status(201).send({ ingestedCount: buckets.length });
+      return reply.status(201).send({ ingestedCount: upsertValues.length });
     }
   );
 
@@ -515,22 +521,20 @@ export async function analyticsRoutes(app: FastifyInstance) {
 
       if (rows.length > 0) {
         await db.transaction(async (tx) => {
-          for (const row of rows) {
-            await tx
-              .insert(hourlyStockSnapshots)
-              .values(row)
-              .onConflictDoUpdate({
-                target: [
-                  hourlyStockSnapshots.snapshotDate,
-                  hourlyStockSnapshots.snapshotHour,
-                  hourlyStockSnapshots.productId,
-                ],
-                set: {
-                  onHandUnits: row.onHandUnits,
-                  isOos: row.isOos,
-                },
-              });
-          }
+          await tx
+            .insert(hourlyStockSnapshots)
+            .values(rows)
+            .onConflictDoUpdate({
+              target: [
+                hourlyStockSnapshots.snapshotDate,
+                hourlyStockSnapshots.snapshotHour,
+                hourlyStockSnapshots.productId,
+              ],
+              set: {
+                onHandUnits: sql`EXCLUDED.on_hand_units`,
+                isOos: sql`EXCLUDED.is_oos`,
+              },
+            });
           await tx.insert(auditLogs).values({
             actor: req.authUser!.fullName,
             action: "stock_snapshot_capture",

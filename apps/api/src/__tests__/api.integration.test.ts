@@ -13,6 +13,7 @@ import {
   customers,
   db,
   goodsReceipts,
+  grnLines,
   grnVariances,
   hourlyStockSnapshots,
   inventoryBatches,
@@ -25,10 +26,13 @@ import {
   promotions,
   purchaseOrderLines,
   purchaseOrders,
+  saleLines,
+  salePayments,
   sales,
   shelfTagQueue,
   shiftExperiments,
   shiftRosters,
+  stockBaselines,
   stockMovements,
   storeFootfall,
   storeTasks,
@@ -37,6 +41,29 @@ import {
   users,
 } from "../db/index.js";
 import { SESSION_COOKIE_NAME } from "../plugins/auth.js";
+
+async function cleanupSales(ids: string[]) {
+  if (ids.length === 0) return;
+  await db.delete(stockMovements).where(inArray(stockMovements.refId, ids));
+  await db.delete(saleLines).where(inArray(saleLines.saleId, ids));
+  await db.delete(salePayments).where(inArray(salePayments.saleId, ids));
+  // Delete reversal rows (with originalSaleId) before original rows to satisfy self-FK RESTRICT
+  await db.delete(sales).where(and(inArray(sales.id, ids), inArray(sales.kind, ["void", "refund"])));
+  await db.delete(sales).where(inArray(sales.id, ids));
+}
+
+async function cleanupGrn(grnId: string) {
+  await db.delete(marginAlerts).where(eq(marginAlerts.grnId, grnId));
+  await db.delete(stockMovements).where(eq(stockMovements.refId, grnId));
+  await db.delete(grnVariances).where(eq(grnVariances.grnId, grnId));
+  await db.delete(grnLines).where(eq(grnLines.grnId, grnId));
+  await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnId));
+}
+
+async function cleanupPo(poId: string) {
+  await db.delete(purchaseOrderLines).where(eq(purchaseOrderLines.poId, poId));
+  await db.delete(purchaseOrders).where(eq(purchaseOrders.id, poId));
+}
 
 let app: Awaited<ReturnType<typeof buildApp>>;
 let ownerToken = "";
@@ -511,8 +538,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(refund2.statusCode).toBe(409);
 
     const cleanupSaleIds = [saleId, concAId, concBId, void1Id, void2Id, refund1Id];
-    await db.delete(stockMovements).where(inArray(stockMovements.refId, cleanupSaleIds));
-    await db.delete(sales).where(inArray(sales.id, cleanupSaleIds));
+    await cleanupSales(cleanupSaleIds);
   });
 
   it("handles GRN bonus cases, partial->full PO receipt tracking, tax-aware margin alerts, multi-pack scaling, and persistent POs", async () => {
@@ -644,11 +670,9 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(applyRes.json().updatedPackTiers).toBeGreaterThanOrEqual(1);
 
     // Clean up test GRN, PO, alerts, movements, batches, shelf tags & restore original prices/cost
-    await db.delete(marginAlerts).where(eq(marginAlerts.grnId, grnBody.grnId));
-    await db.delete(stockMovements).where(eq(stockMovements.refId, grnBody.grnId));
+    await cleanupGrn(grnBody.grnId);
     await db.delete(inventoryBatches).where(eq(inventoryBatches.lotCode, `GRN-${inv1}`));
-    await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnBody.grnId));
-    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, po.id));
+    await cleanupPo(po.id);
     await db
       .delete(shelfTagQueue)
       .where(and(eq(shelfTagQueue.productId, prod.id), eq(shelfTagQueue.reason, "cost_change")));
@@ -801,7 +825,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(emptySearchTool.error).toBeTruthy();
 
     // Clean up AI test conversation, PO, proposed actions & audit log
-    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, createdPoId));
+    await cleanupPo(createdPoId);
     await db.delete(aiProposedActions).where(eq(aiProposedActions.conversationId, chatData.conversationId));
     await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
     await db.delete(auditLogs).where(eq(auditLogs.entityId, createdPoId));
@@ -1222,11 +1246,8 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(resolveRes.json().variance.resolvedAt).toBeTruthy();
 
     // Cleanup test rows and restore avgCostCents
-    await db.delete(marginAlerts).where(eq(marginAlerts.grnId, grnBody.grnId));
-    await db.delete(stockMovements).where(eq(stockMovements.refId, grnBody.grnId));
-    await db.delete(grnVariances).where(eq(grnVariances.grnId, grnBody.grnId));
-    await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnBody.grnId));
-    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, po.id));
+    await cleanupGrn(grnBody.grnId);
+    await cleanupPo(po.id);
     await db.update(products).set({ avgCostCents: origAvgCost }).where(eq(products.id, prod.id));
   });
 
@@ -1606,10 +1627,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     await db.delete(promotions).where(eq(promotions.id, createdPromoId));
     await db.delete(loyaltyLedger).where(eq(loyaltyLedger.customerId, customer.id));
     await db.delete(targetedCoupons).where(eq(targetedCoupons.id, issuedCoupon.id));
-    await db
-      .delete(stockMovements)
-      .where(inArray(stockMovements.refId, [winnerPayload.id, voidId]));
-    await db.delete(sales).where(inArray(sales.id, [voidId, winnerPayload.id]));
+    await cleanupSales([winnerPayload.id, voidId]);
     await db.delete(customers).where(eq(customers.id, customer.id));
   });
 
@@ -1996,5 +2014,523 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(pipeRes.json().latest).toBeTruthy();
     expect(pipeRes.json().latest.dqPassed).toBe(true);
     expect(pipeRes.json().latest.dqChecksJson.length).toBe(12);
+  });
+
+  it("Wave 2B: enforces duplicate GRN invoice 409, PO state machine & multi-drop variance closure, FEFO batch & coupon restore on void, RFM coupon guard, ETag 304, OpenAPI completeness, and import/cycle-count/grns/fold-ledger routes", async () => {
+    // 1. ETag conditional caching on GET /api/pos/bootstrap -> 304 Not Modified (M-12)
+    const boot1 = await app.inject({
+      method: "GET",
+      url: "/api/pos/bootstrap",
+      headers: authHeaders(),
+    });
+    expect(boot1.statusCode).toBe(200);
+    const etag = boot1.headers["etag"];
+    expect(etag).toBeTruthy();
+    const boot304 = await app.inject({
+      method: "GET",
+      url: "/api/pos/bootstrap",
+      headers: { ...authHeaders(), "if-none-match": String(etag) },
+    });
+    expect(boot304.statusCode).toBe(304);
+
+    // 2. OpenAPI spec auto-documents 100% of registered routes (M-11)
+    const specRes = await app.inject({
+      method: "GET",
+      url: "/api/openapi.json",
+      headers: authHeaders(),
+    });
+    expect(specRes.statusCode).toBe(200);
+    const specPaths = specRes.json().paths as Record<string, Record<string, unknown>>;
+    expect(specPaths["/pos/shifts/active"]?.get).toBeTruthy();
+    expect(specPaths["/pos/fold-ledger"]?.post).toBeTruthy();
+    expect(specPaths["/purchasing/grns"]?.get).toBeTruthy();
+    expect(specPaths["/ai/chat/stream"]?.post).toBeTruthy();
+    expect(specPaths["/inventory/cycle-count"]?.post).toBeTruthy();
+    expect(specPaths["/import/commit"]?.post).toBeTruthy();
+
+    // 3. PO state-transition machine + multi-drop GRN cumulative variance closure + duplicate supplier invoice 409 (H-05, H-09)
+    const metaRes = await app.inject({
+      method: "GET",
+      url: "/api/meta",
+      headers: authHeaders(),
+    });
+    const supplierId = (metaRes.json().suppliers as { id: string }[])[0].id;
+    const prodRes = await app.inject({
+      method: "GET",
+      url: "/api/products?page=1&pageSize=1",
+      headers: authHeaders(),
+    });
+    expect(prodRes.json().items.length).toBe(1);
+    const prod = prodRes.json().items[0] as {
+      id: string;
+      avgCostCents: number;
+      taxRateBp: number;
+      taxInclusive: boolean;
+      barcodes: { barcode: string; packQty: number; packLabel: string; sellPriceCents: number }[];
+    };
+    const origAvgCost = prod.avgCostCents;
+    const poUnitCost = Math.max(100, origAvgCost);
+
+    const draftPoRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/orders",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        status: "draft",
+        notes: "Wave 2B state machine test",
+        lines: [{ productId: prod.id, caseQty: 10, orderedCases: 4, unitCostCents: poUnitCost }],
+      },
+    });
+    expect(draftPoRes.statusCode).toBe(201);
+    const poId = (draftPoRes.json() as { id: string }).id;
+    const grnIdsToClean: string[] = [];
+
+    try {
+      // Cannot jump directly from draft -> received (409)
+      const badJump = await app.inject({
+        method: "PATCH",
+        url: `/api/purchasing/orders/${poId}/status`,
+        headers: authHeaders(),
+        payload: { status: "received" },
+      });
+      expect(badJump.statusCode).toBe(409);
+
+      // Cannot post GRN against draft PO (409)
+      const draftGrn = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: `INV-W2B-DRAFT-${Date.now()}`,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(draftGrn.statusCode).toBe(409);
+
+      // Approve PO (draft -> approved)
+      const approveRes = await app.inject({
+        method: "PATCH",
+        url: `/api/purchasing/orders/${poId}/status`,
+        headers: authHeaders(),
+        payload: { status: "approved" },
+      });
+      expect(approveRes.statusCode).toBe(200);
+
+      // Drop 1: receive 2 of 4 cases -> creates 1 open short_delivery variance
+      const invDrop1 = `INV-W2B-D1-${Date.now()}`;
+      const drop1 = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: invDrop1,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(drop1.statusCode).toBe(201);
+      grnIdsToClean.push(drop1.json().grnId);
+      expect(drop1.json().variancesCreated).toBe(1);
+
+      // Duplicate supplier invoice must fail with 409 Conflict (H-05)
+      const dupInv = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: invDrop1,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(dupInv.statusCode).toBe(409);
+
+      // Drop 2: receive remaining 2 cases -> PO becomes received & prior short_delivery auto-resolves!
+      const invDrop2 = `INV-W2B-D2-${Date.now()}`;
+      const drop2 = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: invDrop2,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(drop2.statusCode).toBe(201);
+      grnIdsToClean.push(drop2.json().grnId);
+
+      const [poFinal] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, poId));
+      expect(poFinal.status).toBe("received");
+      const openVarsAfterFull = await db
+        .select()
+        .from(grnVariances)
+        .where(and(eq(grnVariances.poId, poId), eq(grnVariances.status, "open")));
+      expect(openVarsAfterFull.length).toBe(0);
+
+      // Terminal received PO cannot be cancelled (409)
+      const cancelReceived = await app.inject({
+        method: "PATCH",
+        url: `/api/purchasing/orders/${poId}/status`,
+        headers: authHeaders(),
+        payload: { status: "cancelled" },
+      });
+      expect(cancelReceived.statusCode).toBe(409);
+
+      // GET /api/purchasing/grns returns recent receipts (H-25)
+      const grnsList = await app.inject({
+        method: "GET",
+        url: "/api/purchasing/grns",
+        headers: authHeaders(),
+      });
+      expect(grnsList.statusCode).toBe(200);
+      expect((grnsList.json().grns as { id: string }[]).some((g) => g.id === drop2.json().grnId)).toBe(true);
+    } finally {
+      for (const gid of grnIdsToClean) {
+        await cleanupGrn(gid);
+      }
+      await cleanupPo(poId);
+      await db.update(products).set({ avgCostCents: origAvgCost }).where(eq(products.id, prod.id));
+    }
+
+    // 4. RFM-segment coupon validation + FEFO batch restore & coupon un-redeem on void (H-10)
+    const testBatchId = generateUuidV7();
+    await db.insert(inventoryBatches).values({
+      id: testBatchId,
+      productId: prod.id,
+      lotCode: `LOT-W2B-${Date.now()}`,
+      bestBeforeDate: "2020-01-01", // earliest expiry so FEFO picks this batch first
+      unitCostCents: origAvgCost,
+      qtyReceived: 5,
+      qtyRemaining: 5,
+      status: "active",
+    });
+
+    const custPhone = `555-${Date.now().toString().slice(-7)}`;
+    const custCreate = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(),
+      payload: { phone: custPhone, fullName: "Wave 2B RFM Tester" },
+    });
+    expect(custCreate.statusCode).toBe(201);
+    const testCustomer = custCreate.json().customer as { id: string };
+
+    const segCouponCode = `VIPW2B-${Date.now().toString().slice(-5)}`;
+    const segCpnRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(),
+      payload: {
+        code: segCouponCode,
+        rfmSegment: "Champions",
+        discountCents: 100,
+        minBasketCents: 100,
+        validDays: 7,
+      },
+    });
+    expect(segCpnRes.statusCode).toBe(201);
+    const segCouponId = segCpnRes.json().coupon.id as string;
+
+    const newCpnCode = `NEWW2B-${Date.now().toString().slice(-5)}`;
+    const newCpnRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(),
+      payload: {
+        code: newCpnCode,
+        rfmSegment: "New",
+        discountCents: 100,
+        minBasketCents: 100,
+        validDays: 7,
+      },
+    });
+    expect(newCpnRes.statusCode).toBe(201);
+    const newCouponId = newCpnRes.json().coupon.id as string;
+
+    const saleIdsToClean: string[] = [];
+    try {
+      // Customer is "New", so "Champions" coupon MUST fail validation
+      const wrongSegVal = await app.inject({
+        method: "GET",
+        url: `/api/loyalty/coupons/validate/${segCouponCode}?basketCents=1000&customerId=${testCustomer.id}`,
+        headers: authHeaders(cashierToken),
+      });
+      expect(wrongSegVal.statusCode).toBe(200);
+      expect(wrongSegVal.json().valid).toBe(false);
+
+      // "New" coupon passes validation for this customer
+      const okSegVal = await app.inject({
+        method: "GET",
+        url: `/api/loyalty/coupons/validate/${newCpnCode}?basketCents=1000&customerId=${testCustomer.id}`,
+        headers: authHeaders(cashierToken),
+      });
+      expect(okSegVal.statusCode).toBe(200);
+      expect(okSegVal.json().valid).toBe(true);
+
+      // Post sale depleting testBatch (5 -> 3) & redeeming newCpnCode
+      const bc = prod.barcodes[0];
+      const qtyPacks = Math.max(1, Math.ceil(200 / Math.max(1, bc.sellPriceCents)));
+      const baseUnits = bc.packQty * qtyPacks;
+      const lineSub = bc.sellPriceCents * qtyPacks;
+      const disc = Math.min(100, lineSub - 1);
+      const afterDisc = lineSub - disc;
+      const lineTax = prod.taxInclusive
+        ? Math.round((afterDisc * prod.taxRateBp) / (10000 + prod.taxRateBp))
+        : Math.round((afterDisc * prod.taxRateBp) / 10000);
+      const lineTotal = prod.taxInclusive ? afterDisc : afterDisc + lineTax;
+
+      const origSaleId = generateUuidV7();
+      const voidSaleId = generateUuidV7();
+      saleIdsToClean.push(origSaleId, voidSaleId);
+
+      const postSale = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(),
+        payload: {
+          id: origSaleId,
+          registerCode: "REG-W2B",
+          receiptNo: `W2B-SALE-${origSaleId.slice(-6)}`,
+          kind: "sale",
+          soldAt: new Date().toISOString(),
+          ageVerified: true,
+          customerId: testCustomer.id,
+          couponCode: newCpnCode,
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: prod.id,
+              scannedBarcode: bc.barcode,
+              packLabel: bc.packLabel,
+              packQty: bc.packQty,
+              qtyPacks,
+              unitPriceCents: bc.sellPriceCents,
+              discountCents: disc,
+              taxRateBp: prod.taxRateBp,
+              taxCents: lineTax,
+              lineTotalCents: lineTotal,
+            },
+          ],
+          payments: [
+            {
+              id: generateUuidV7(),
+              method: "card",
+              amountCents: lineTotal,
+            },
+          ],
+        },
+      });
+      expect(postSale.statusCode).toBe(201);
+
+      const [batchAfterSale] = await db
+        .select()
+        .from(inventoryBatches)
+        .where(eq(inventoryBatches.id, testBatchId));
+      expect(batchAfterSale.qtyRemaining).toBe(Math.max(0, 5 - baseUnits));
+
+      // Void sale -> FEFO batch MUST restore back to 5 AND coupon MUST become un-redeemed!
+      const postVoid = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(),
+        payload: {
+          id: voidSaleId,
+          registerCode: "REG-W2B",
+          receiptNo: `W2B-VOID-${voidSaleId.slice(-6)}`,
+          kind: "void",
+          originalSaleId: origSaleId,
+          soldAt: new Date().toISOString(),
+          ageVerified: true,
+          customerId: testCustomer.id,
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: prod.id,
+              scannedBarcode: bc.barcode,
+              packLabel: bc.packLabel,
+              packQty: bc.packQty,
+              qtyPacks,
+              unitPriceCents: bc.sellPriceCents,
+              discountCents: disc,
+              taxRateBp: prod.taxRateBp,
+              taxCents: lineTax,
+              lineTotalCents: lineTotal,
+            },
+          ],
+          payments: [
+            {
+              id: generateUuidV7(),
+              method: "card",
+              amountCents: lineTotal,
+            },
+          ],
+        },
+      });
+      expect(postVoid.statusCode).toBe(201);
+
+      const [batchAfterVoid] = await db
+        .select()
+        .from(inventoryBatches)
+        .where(eq(inventoryBatches.id, testBatchId));
+      expect(batchAfterVoid.qtyRemaining).toBe(5);
+      expect(batchAfterVoid.status).toBe("active");
+
+      const [couponAfterVoid] = await db
+        .select()
+        .from(targetedCoupons)
+        .where(eq(targetedCoupons.id, newCouponId));
+      expect(couponAfterVoid.redeemedSaleId).toBeNull();
+    } finally {
+      await db.delete(loyaltyLedger).where(eq(loyaltyLedger.customerId, testCustomer.id));
+      await db.delete(targetedCoupons).where(inArray(targetedCoupons.id, [segCouponId, newCouponId]));
+      await cleanupSales(saleIdsToClean);
+      await db.delete(inventoryBatches).where(eq(inventoryBatches.id, testBatchId));
+      await db.delete(customers).where(eq(customers.id, testCustomer.id));
+    }
+
+    // 5. Untested routes (H-25) & sanitized CSV commit (H-11): import/commit, cycle-count, fold-ledger, shifts/active
+    const impSku = `IMP-W2B-${Date.now().toString().slice(-6)}`;
+    const impBarcode = buildValidEan13("889", Number(Date.now().toString().slice(-6)));
+    const commitRes = await app.inject({
+      method: "POST",
+      url: "/api/import/commit",
+      headers: authHeaders(),
+      payload: {
+        rows: [
+          {
+            sku: impSku,
+            name: "Wave 2B Imported Sparkling Water 500ml",
+            brand: "Wave2B",
+            barcode: impBarcode,
+            packQty: 1,
+            packLabel: "Single",
+            unitCostCents: 60,
+            sellPriceCents: 199,
+          },
+          // Duplicate within batch -> cleanly skipped without leaking raw SQL error
+          {
+            sku: impSku,
+            name: "Duplicate Row",
+            brand: "Wave2B",
+            barcode: impBarcode,
+            packQty: 1,
+            packLabel: "Single",
+            unitCostCents: 60,
+            sellPriceCents: 199,
+          },
+        ],
+      },
+    });
+    expect(commitRes.statusCode).toBe(200);
+    expect(commitRes.json().imported).toBe(1);
+    expect(commitRes.json().skipped).toBe(1);
+    expect(String(commitRes.json().errors[0].reason)).not.toContain("insert into");
+
+    const [impProd] = await db.select().from(products).where(eq(products.sku, impSku));
+    expect(impProd).toBeDefined();
+
+    try {
+      // Cycle count sets stock to 12 units -> posts count_adj movement
+      const ccRes = await app.inject({
+        method: "POST",
+        url: "/api/inventory/cycle-count",
+        headers: authHeaders(),
+        payload: { productId: impProd.id, countedBaseUnits: 12 },
+      });
+      expect(ccRes.statusCode).toBe(200);
+      expect(ccRes.json().varianceUnits).toBe(12);
+
+      // Fold ledger rolls unfolded stock_movements into stock_baselines atomically
+      const foldRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/fold-ledger",
+        headers: authHeaders(),
+      });
+      expect(foldRes.statusCode).toBe(200);
+      expect(Number(foldRes.json().movements_folded)).toBeGreaterThanOrEqual(1);
+
+      const [foldedBaseline] = await db
+        .select()
+        .from(stockBaselines)
+        .where(eq(stockBaselines.productId, impProd.id));
+      expect(foldedBaseline.quantity).toBe(12);
+    } finally {
+      await db.delete(stockMovements).where(eq(stockMovements.productId, impProd.id));
+      await db.delete(stockBaselines).where(eq(stockBaselines.productId, impProd.id));
+      await db.delete(productBarcodes).where(eq(productBarcodes.productId, impProd.id));
+      await db.delete(products).where(eq(products.id, impProd.id));
+    }
+
+    // Active shift lookup & shift_id-scoped cash closeout (M-08)
+    const testReg = `REG-W2B-${Date.now().toString().slice(-4)}`;
+    const openRes = await app.inject({
+      method: "POST",
+      url: "/api/pos/shifts/open",
+      headers: authHeaders(),
+      payload: { registerCode: testReg, openingFloatCents: 25000 },
+    });
+    expect(openRes.statusCode).toBe(201);
+    const openedShift = openRes.json() as { id: string; openingFloatCents: number };
+    try {
+      const activeRes = await app.inject({
+        method: "GET",
+        url: `/api/pos/shifts/active?registerCode=${testReg}`,
+        headers: authHeaders(),
+      });
+      expect(activeRes.statusCode).toBe(200);
+      expect(activeRes.json().shift.id).toBe(openedShift.id);
+      expect(activeRes.json().shift.openingFloatCents).toBe(25000);
+
+      const closeRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/shifts/close",
+        headers: authHeaders(),
+        payload: { registerCode: testReg, blindCountedCashCents: 25000, cashDropsCents: 0 },
+      });
+      expect(closeRes.statusCode).toBe(200);
+      expect(closeRes.json().expectedCashCents).toBe(25000);
+      expect(closeRes.json().varianceCents).toBe(0);
+    } finally {
+      await db.delete(posShifts).where(eq(posShifts.id, openedShift.id));
+    }
   });
 });

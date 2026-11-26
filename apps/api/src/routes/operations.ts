@@ -347,6 +347,18 @@ export async function operationsRoutes(app: FastifyInstance) {
           return { errorStatus: 400 as const, error: "Batch has 0 remaining units." };
         }
 
+        const [lockedMd] = await tx
+          .select()
+          .from(analyticsDynamicMarkdowns)
+          .where(eq(analyticsDynamicMarkdowns.batchId, batchId))
+          .for("update");
+        if (lockedMd && lockedMd.status === "applied") {
+          return {
+            errorStatus: 409 as const,
+            error: "Dynamic markdown has already been applied to this batch.",
+          };
+        }
+
         const [prod] = await tx
           .select({
             id: products.id,
@@ -398,6 +410,14 @@ export async function operationsRoutes(app: FastifyInstance) {
             promoPriceCents = Math.min(basePriceCents, guardPrice);
           }
         }
+        // Synchronize effective promotion discountBp with the clamped shelf price so POS matches shelf tag
+        const effectiveDiscountBp = Math.max(
+          0,
+          Math.min(
+            parsed.data.discountBp,
+            Math.round(((basePriceCents - promoPriceCents) * 10000) / Math.max(1, basePriceCents))
+          )
+        );
 
         await tx
           .update(inventoryBatches)
@@ -411,7 +431,7 @@ export async function operationsRoutes(app: FastifyInstance) {
             new Date(lockedBatch.bestBeforeDate).getTime() + 86400_000
           )
         );
-        const discountPctLabel = Math.round(parsed.data.discountBp / 100);
+        const discountPctLabel = Math.round(effectiveDiscountBp / 100);
         const [promo] = await tx
           .insert(promotions)
           .values({
@@ -425,7 +445,7 @@ export async function operationsRoutes(app: FastifyInstance) {
             active: true,
             rulesJson: {
               productIds: [lockedBatch.productId],
-              discountBp: parsed.data.discountBp,
+              discountBp: effectiveDiscountBp,
             },
           })
           .returning();
@@ -458,7 +478,8 @@ export async function operationsRoutes(app: FastifyInstance) {
           entityId: batchId,
           detailsJson: {
             sku: prod.sku,
-            discountBp: parsed.data.discountBp,
+            requestedDiscountBp: parsed.data.discountBp,
+            discountBp: effectiveDiscountBp,
             promoPriceCents,
             promotionId: promo.id,
             shelfTagId,
@@ -470,7 +491,7 @@ export async function operationsRoutes(app: FastifyInstance) {
           batchId,
           promotionId: promo.id,
           shelfTagId,
-          discountBp: parsed.data.discountBp,
+          discountBp: effectiveDiscountBp,
           promoPriceCents,
           status: "applied" as const,
         };
@@ -921,7 +942,13 @@ ${buildZplBarcodeCommand(r.barcode)}
           .from(storeTasks)
           .where(eq(storeTasks.id, id))
           .for("update");
-        if (!task) return null;
+        if (!task) return { errorStatus: 404 as const, error: "Floor task not found." };
+        if (task.status === "completed") {
+          return {
+            errorStatus: 409 as const,
+            error: "Floor task has already been completed.",
+          };
+        }
 
         let stockVarianceUnits: number | null = null;
         if (
@@ -997,11 +1024,13 @@ ${buildZplBarcodeCommand(r.barcode)}
           },
         });
 
-        return { task: updated, stockVarianceUnits };
+        return { errorStatus: null, task: updated, stockVarianceUnits };
       });
 
-      if (!result) return reply.status(404).send({ error: "Floor task not found." });
-      return result;
+      if (result.errorStatus) {
+        return reply.status(result.errorStatus).send({ error: result.error });
+      }
+      return { task: result.task, stockVarianceUnits: result.stockVarianceUnits };
     }
   );
 }

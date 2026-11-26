@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import {
   computeTaxCents,
@@ -32,12 +33,38 @@ import { getPgErrorCode } from "../app.js";
 import { requireRole } from "../plugins/auth.js";
 
 export async function posRoutes(app: FastifyInstance) {
-  // Lightweight offline-first bootstrap payload (includes basket upsell rules)
+  // Lightweight offline-first bootstrap payload (includes basket upsell rules & ETag conditional caching)
   app.get(
     "/api/pos/bootstrap",
     { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req) => {
+    async (req, reply) => {
       const canSeeCost = req.authUser?.role === "owner" || req.authUser?.role === "manager";
+      const verRes = await db.execute(sql`
+        SELECT
+          (SELECT count(*)::text || ':' || coalesce(max(updated_at)::text, '') FROM products WHERE active = true) AS p_ver,
+          (SELECT count(*)::text || ':' || coalesce(sum(sell_price_cents)::text, '0') FROM product_barcodes) AS b_ver,
+          (SELECT count(*)::text || ':' || coalesce(max(starts_at)::text, '') || ':' || coalesce(max(ends_at)::text, '') FROM promotions WHERE active = true) AS pr_ver,
+          (SELECT count(*)::text FROM tax_rates) AS t_ver,
+          (SELECT count(*)::text FROM categories) AS c_ver,
+          (SELECT coalesce(max(computed_at)::text, '') FROM analytics_basket_rules) AS r_ver
+      `);
+      const vRow = (verRes.rows[0] ?? {}) as Record<string, string>;
+      const etagHash = crypto
+        .createHash("sha256")
+        .update(
+          `${canSeeCost ? "mgr" : "cash"}|${vRow.p_ver}|${vRow.b_ver}|${vRow.pr_ver}|${vRow.t_ver}|${vRow.c_ver}|${vRow.r_ver}`
+        )
+        .digest("hex")
+        .slice(0, 24);
+      const etag = `"pos-boot-${etagHash}"`;
+
+      reply.header("ETag", etag);
+      reply.header("Cache-Control", "private, max-age=30, must-revalidate");
+      reply.header("Vary", "Cookie, Authorization");
+      if (req.headers["if-none-match"] === etag) {
+        return reply.status(304).send();
+      }
+
       const [prods, bcs, promos, taxes, cats, rules] = await Promise.all([
         db
           .select({
@@ -598,6 +625,17 @@ export async function posRoutes(app: FastifyInstance) {
               .where(eq(targetedCoupons.id, lockedCouponId));
           }
 
+          // Release single-use loyalty coupon if the original sale is fully voided (H-10)
+          if (payload.kind === "void" && payload.originalSaleId) {
+            await tx
+              .update(targetedCoupons)
+              .set({
+                redeemedSaleId: null,
+                redeemedAt: null,
+              })
+              .where(eq(targetedCoupons.redeemedSaleId, payload.originalSaleId));
+          }
+
           await tx.insert(saleLines).values(
             normalizedLines.map((l) => ({
               id: l.id,
@@ -628,12 +666,95 @@ export async function posRoutes(app: FastifyInstance) {
             }))
           );
 
-          // Append immutable inventory ledger rows + locked FEFO batch depletion on sales
+          // Append immutable inventory ledger rows + locked FEFO batch depletion/restoration
           // Sort lines by productId for deterministic row-lock ordering across concurrent checkouts
           const orderedLines = [...normalizedLines].sort((a, b) =>
             a.productId.localeCompare(b.productId)
           );
           const movementRows: (typeof stockMovements.$inferInsert)[] = [];
+
+          // For voids/refunds, compute restorable batch capacity from the original sale's FEFO movements (H-10)
+          const restorableBatchesByProduct = new Map<
+            string,
+            { batchId: string; remainingRestore: number }[]
+          >();
+          if (sign === 1 && payload.originalSaleId) {
+            const origMovements = await tx
+              .select({
+                productId: stockMovements.productId,
+                batchId: stockMovements.batchId,
+                qtyDelta: stockMovements.qtyDelta,
+              })
+              .from(stockMovements)
+              .where(
+                and(
+                  eq(stockMovements.refId, payload.originalSaleId),
+                  sql`${stockMovements.batchId} IS NOT NULL`,
+                  sql`${stockMovements.qtyDelta} < 0`
+                )
+              );
+
+            if (origMovements.length > 0) {
+              const priorRevSales = await tx
+                .select({ id: sales.id })
+                .from(sales)
+                .where(
+                  and(
+                    eq(sales.originalSaleId, payload.originalSaleId),
+                    sql`${sales.id} <> ${payload.id}`
+                  )
+                );
+              const priorRevIds = priorRevSales.map((r) => r.id);
+              const alreadyRestoredByBatch = new Map<string, number>();
+              if (priorRevIds.length > 0) {
+                const priorRestores = await tx
+                  .select({
+                    productId: stockMovements.productId,
+                    batchId: stockMovements.batchId,
+                    qtyDelta: stockMovements.qtyDelta,
+                  })
+                  .from(stockMovements)
+                  .where(
+                    and(
+                      inArray(stockMovements.refId, priorRevIds),
+                      sql`${stockMovements.batchId} IS NOT NULL`,
+                      sql`${stockMovements.qtyDelta} > 0`
+                    )
+                  );
+                for (const pr of priorRestores) {
+                  if (!pr.batchId) continue;
+                  const k = `${pr.productId}::${pr.batchId}`;
+                  alreadyRestoredByBatch.set(k, (alreadyRestoredByBatch.get(k) ?? 0) + pr.qtyDelta);
+                }
+              }
+
+              const origByKey = new Map<string, { productId: string; batchId: string; depleted: number }>();
+              for (const om of origMovements) {
+                if (!om.batchId) continue;
+                const k = `${om.productId}::${om.batchId}`;
+                const prev = origByKey.get(k);
+                if (prev) {
+                  prev.depleted += Math.abs(om.qtyDelta);
+                } else {
+                  origByKey.set(k, {
+                    productId: om.productId,
+                    batchId: om.batchId,
+                    depleted: Math.abs(om.qtyDelta),
+                  });
+                }
+              }
+
+              for (const [k, entry] of origByKey.entries()) {
+                const restorable = entry.depleted - (alreadyRestoredByBatch.get(k) ?? 0);
+                if (restorable > 0) {
+                  const list = restorableBatchesByProduct.get(entry.productId) ?? [];
+                  list.push({ batchId: entry.batchId, remainingRestore: restorable });
+                  restorableBatchesByProduct.set(entry.productId, list);
+                }
+              }
+            }
+          }
+
           for (const l of orderedLines) {
             const baseUnits = l.packQty * l.qtyPacks;
             if (sign === -1) {
@@ -691,17 +812,64 @@ export async function posRoutes(app: FastifyInstance) {
                 });
               }
             } else {
-              movementRows.push({
-                id: generateUuidV7(),
-                productId: l.productId,
-                batchId: null,
-                qtyDelta: baseUnits,
-                unitCostCents: l.unitCostCents,
-                reason: payload.kind,
-                refId: payload.id,
-                folded: false,
-                createdAt: new Date(payload.soldAt),
-              });
+              let remainingToRestore = baseUnits;
+              const batchSlots = restorableBatchesByProduct.get(l.productId) ?? [];
+              const batchIds = batchSlots
+                .filter((s) => s.remainingRestore > 0)
+                .map((s) => s.batchId)
+                .sort();
+              if (batchIds.length > 0) {
+                const lockedBatches = await tx
+                  .select()
+                  .from(inventoryBatches)
+                  .where(inArray(inventoryBatches.id, batchIds))
+                  .orderBy(asc(inventoryBatches.id))
+                  .for("update");
+                const batchById = new Map(lockedBatches.map((b) => [b.id, b]));
+
+                for (const slot of batchSlots) {
+                  if (remainingToRestore <= 0 || slot.remainingRestore <= 0) continue;
+                  const batch = batchById.get(slot.batchId);
+                  if (!batch) continue;
+                  const restoreQty = Math.min(remainingToRestore, slot.remainingRestore);
+                  const nextQty = batch.qtyRemaining + restoreQty;
+                  const nextStatus = batch.status === "depleted" ? "active" : batch.status;
+                  await tx
+                    .update(inventoryBatches)
+                    .set({ qtyRemaining: nextQty, status: nextStatus })
+                    .where(eq(inventoryBatches.id, batch.id));
+                  batch.qtyRemaining = nextQty;
+                  batch.status = nextStatus;
+                  slot.remainingRestore -= restoreQty;
+                  remainingToRestore -= restoreQty;
+
+                  movementRows.push({
+                    id: generateUuidV7(),
+                    productId: l.productId,
+                    batchId: batch.id,
+                    qtyDelta: restoreQty,
+                    unitCostCents: l.unitCostCents,
+                    reason: payload.kind,
+                    refId: payload.id,
+                    folded: false,
+                    createdAt: new Date(payload.soldAt),
+                  });
+                }
+              }
+
+              if (remainingToRestore > 0) {
+                movementRows.push({
+                  id: generateUuidV7(),
+                  productId: l.productId,
+                  batchId: null,
+                  qtyDelta: remainingToRestore,
+                  unitCostCents: l.unitCostCents,
+                  reason: payload.kind,
+                  refId: payload.id,
+                  folded: false,
+                  createdAt: new Date(payload.soldAt),
+                });
+              }
             }
           }
 
@@ -908,7 +1076,7 @@ export async function posRoutes(app: FastifyInstance) {
     }
   );
 
-  // Shift listing, opening & blind cash closeout
+  // Shift listing, active shift lookup, opening & blind cash closeout
   app.get(
     "/api/pos/shifts",
     { preHandler: [requireRole(["owner", "manager", "cashier"])] },
@@ -919,6 +1087,22 @@ export async function posRoutes(app: FastifyInstance) {
         .orderBy(desc(posShifts.openedAt))
         .limit(20);
       return { shifts: rows };
+    }
+  );
+
+  app.get(
+    "/api/pos/shifts/active",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req) => {
+      const q = req.query as { registerCode?: string };
+      const registerCode = (q.registerCode ?? "REG-01").trim() || "REG-01";
+      const [activeShift] = await db
+        .select()
+        .from(posShifts)
+        .where(and(eq(posShifts.registerCode, registerCode), isNull(posShifts.closedAt)))
+        .orderBy(desc(posShifts.openedAt))
+        .limit(1);
+      return { shift: activeShift ?? null };
     }
   );
 
@@ -1005,16 +1189,22 @@ export async function posRoutes(app: FastifyInstance) {
         const effectiveOpeningFloat =
           openShift?.openingFloatCents ?? parsed.data.openingFloatCents;
 
-        // Net cash drawer movement = cash sales minus cash refunds/voids since shift opened
+        // Reconcile net cash drawer movement strictly by shift_id when shift exists,
+        // plus legacy/offline sales on this register without shift_id within the shift window (M-08)
+        const cashScope = openShift
+          ? sql`${salePayments.method} = 'cash' AND (
+              ${sales.shiftId} = ${openShift.id}
+              OR (${sales.shiftId} IS NULL AND ${sales.registerCode} = ${parsed.data.registerCode} AND ${sales.soldAt} >= ${windowStart})
+            )`
+          : sql`${salePayments.method} = 'cash' AND ${sales.shiftId} IS NULL AND ${sales.registerCode} = ${parsed.data.registerCode} AND ${sales.soldAt} >= ${windowStart}`;
+
         const [cashAgg] = await tx
           .select({
             cashNet: sql<number>`coalesce(sum(CASE WHEN ${sales.kind} = 'sale' THEN ${salePayments.amountCents} ELSE -${salePayments.amountCents} END), 0)::bigint`,
           })
           .from(salePayments)
           .innerJoin(sales, eq(salePayments.saleId, sales.id))
-          .where(
-            sql`${salePayments.method} = 'cash' AND ${sales.registerCode} = ${parsed.data.registerCode} AND ${sales.soldAt} >= ${windowStart}`
-          );
+          .where(cashScope);
 
         const expectedCash =
           effectiveOpeningFloat +

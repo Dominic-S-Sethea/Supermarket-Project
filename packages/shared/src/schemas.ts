@@ -99,6 +99,7 @@ export const CreateGrnSchema = z.object({
   invoiceNumber: z.string().min(1).max(80),
   receivedBy: z.string().min(1).max(120).default("Store Manager"),
   notes: z.string().max(500).optional(),
+  partialDelivery: z.boolean().optional().default(false),
   lines: z
     .array(
       z

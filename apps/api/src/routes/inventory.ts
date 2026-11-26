@@ -35,6 +35,7 @@ import {
   suppliers,
   taxRates,
 } from "../db/index.js";
+import { getPgErrorCode } from "../app.js";
 import { requireRole } from "../plugins/auth.js";
 
 const UuidSchema = z.string().uuid();
@@ -603,6 +604,15 @@ export async function inventoryRoutes(app: FastifyInstance) {
     }
   );
 
+  const ALLOWED_PO_TRANSITIONS: Record<string, Set<string>> = {
+    draft: new Set(["approved", "cancelled"]),
+    approved: new Set(["sent", "partially_received", "received", "cancelled"]),
+    sent: new Set(["partially_received", "received", "cancelled"]),
+    partially_received: new Set(["received"]),
+    received: new Set([]),
+    cancelled: new Set([]),
+  };
+
   app.patch(
     "/api/purchasing/orders/:id/status",
     { preHandler: [requireRole(["owner", "manager"])] },
@@ -615,31 +625,59 @@ export async function inventoryRoutes(app: FastifyInstance) {
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
 
       const actorName = req.authUser!.fullName;
-      const updatePatch: Partial<typeof purchaseOrders.$inferInsert> = {
-        status: parsed.data.status,
-      };
-      if (parsed.data.status === "approved") {
-        updatePatch.approvedBy = actorName;
-        updatePatch.approvedAt = new Date();
-      }
+      const outcome = await db.transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(purchaseOrders)
+          .where(eq(purchaseOrders.id, id))
+          .for("update");
+        if (!existing) return { errorStatus: 404 as const, error: "Purchase order not found" };
 
-      const [updated] = await db
-        .update(purchaseOrders)
-        .set(updatePatch)
-        .where(eq(purchaseOrders.id, id))
-        .returning();
+        if (existing.status === parsed.data.status) {
+          return { errorStatus: null, updated: existing };
+        }
 
-      if (!updated) return reply.status(404).send({ error: "Purchase order not found" });
+        const allowed = ALLOWED_PO_TRANSITIONS[existing.status] ?? new Set<string>();
+        if (!allowed.has(parsed.data.status)) {
+          return {
+            errorStatus: 409 as const,
+            error: `Invalid PO status transition from "${existing.status}" to "${parsed.data.status}".`,
+          };
+        }
 
-      await db.insert(auditLogs).values({
-        actor: actorName,
-        action: "po_status_update",
-        entityType: "purchase_order",
-        entityId: id,
-        detailsJson: { poNumber: updated.poNumber, status: parsed.data.status },
+        const updatePatch: Partial<typeof purchaseOrders.$inferInsert> = {
+          status: parsed.data.status,
+        };
+        if (parsed.data.status === "approved") {
+          updatePatch.approvedBy = actorName;
+          updatePatch.approvedAt = new Date();
+        }
+
+        const [updated] = await tx
+          .update(purchaseOrders)
+          .set(updatePatch)
+          .where(eq(purchaseOrders.id, id))
+          .returning();
+
+        await tx.insert(auditLogs).values({
+          actor: actorName,
+          action: "po_status_update",
+          entityType: "purchase_order",
+          entityId: id,
+          detailsJson: {
+            poNumber: updated.poNumber,
+            previousStatus: existing.status,
+            status: parsed.data.status,
+          },
+        });
+
+        return { errorStatus: null, updated };
       });
 
-      return updated;
+      if (outcome.errorStatus) {
+        return reply.status(outcome.errorStatus).send({ error: outcome.error });
+      }
+      return outcome.updated;
     }
   );
 
@@ -653,7 +691,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
       const data = parsed.data;
       const actorName = req.authUser!.fullName;
 
-      // Verify supplier, referenced products, and optional PO before opening GRN transaction
+      // Verify supplier and referenced products before opening GRN transaction
       const [sup] = await db
         .select({ id: suppliers.id })
         .from(suppliers)
@@ -661,7 +699,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
         .limit(1);
       if (!sup) return reply.status(404).send({ error: "Supplier not found." });
 
-      const uniquePids = Array.from(new Set(data.lines.map((l) => l.productId)));
+      const uniquePids = Array.from(new Set(data.lines.map((l) => l.productId))).sort();
       const foundProds = await db
         .select({ id: products.id })
         .from(products)
@@ -670,71 +708,72 @@ export async function inventoryRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: "One or more GRN line productId values do not exist." });
       }
 
-      if (data.poId) {
-        const [po] = await db
-          .select({ id: purchaseOrders.id, status: purchaseOrders.status })
-          .from(purchaseOrders)
-          .where(eq(purchaseOrders.id, data.poId))
-          .limit(1);
-        if (!po) return reply.status(404).send({ error: "Referenced purchase order not found." });
-        if (po.status === "cancelled") {
-          return reply.status(409).send({ error: "Cannot receive goods against a cancelled purchase order." });
-        }
-      }
-
       const totalInvoiceCents = data.lines.reduce(
         (s, l) => s + l.invoiceLineTotalCents,
         0
       );
       const createdAlerts: { productId: string; resultingMarginBp: number }[] = [];
 
-      const grnOutcome = await db.transaction(async (tx) => {
-        const [grn] = await tx
-          .insert(goodsReceipts)
-          .values({
-            supplierId: data.supplierId,
-            poId: data.poId ?? null,
-            invoiceNumber: data.invoiceNumber,
-            receivedBy: actorName,
-            totalInvoiceCents,
-            notes: data.notes ?? null,
-          })
-          .returning();
+      let grnOutcome:
+        | { errorStatus: 404 | 409; error: string }
+        | { errorStatus: null; grnId: string; variancesCreated: number };
 
-        // Sort lines by productId for deterministic FOR UPDATE lock ordering
-        const orderedLines = [...data.lines].sort((a, b) =>
-          a.productId.localeCompare(b.productId)
-        );
-        const receivedSummaryByProduct = new Map<
-          string,
-          { cases: number; totalUnits: number; invoiceCents: number }
-        >();
+      try {
+        grnOutcome = await db.transaction(async (tx) => {
+          // Lock referenced PO row inside transaction so concurrent cancel/receive cannot race (H-09)
+          if (data.poId) {
+            const [lockedPo] = await tx
+              .select({
+                id: purchaseOrders.id,
+                supplierId: purchaseOrders.supplierId,
+                status: purchaseOrders.status,
+              })
+              .from(purchaseOrders)
+              .where(eq(purchaseOrders.id, data.poId))
+              .for("update");
+            if (!lockedPo) {
+              return { errorStatus: 404 as const, error: "Referenced purchase order not found." };
+            }
+            if (lockedPo.status === "cancelled") {
+              return {
+                errorStatus: 409 as const,
+                error: "Cannot receive goods against a cancelled purchase order.",
+              };
+            }
+            if (lockedPo.status === "received") {
+              return {
+                errorStatus: 409 as const,
+                error: "Purchase order has already been fully received.",
+              };
+            }
+            if (lockedPo.status === "draft") {
+              return {
+                errorStatus: 409 as const,
+                error: "Purchase order must be approved before receiving goods.",
+              };
+            }
+            if (lockedPo.supplierId !== data.supplierId) {
+              return {
+                errorStatus: 409 as const,
+                error: "GRN supplierId does not match the referenced purchase order supplier.",
+              };
+            }
+          }
 
-        for (const line of orderedLines) {
-          const paidUnits = line.paidCases * line.caseQty;
-          const freeUnits = line.freeBonusCases * line.caseQty;
-          const totalUnits = paidUnits + freeUnits;
-          if (totalUnits <= 0) continue;
+          const [grn] = await tx
+            .insert(goodsReceipts)
+            .values({
+              supplierId: data.supplierId,
+              poId: data.poId ?? null,
+              invoiceNumber: data.invoiceNumber.trim(),
+              receivedBy: actorName,
+              totalInvoiceCents,
+              notes: data.notes ?? null,
+            })
+            .returning();
 
-          const prevSum = receivedSummaryByProduct.get(line.productId) ?? {
-            cases: 0,
-            totalUnits: 0,
-            invoiceCents: 0,
-          };
-          receivedSummaryByProduct.set(line.productId, {
-            cases: prevSum.cases + line.paidCases + line.freeBonusCases,
-            totalUnits: prevSum.totalUnits + totalUnits,
-            invoiceCents: prevSum.invoiceCents + line.invoiceLineTotalCents,
-          });
-
-          const effectiveUnitCost = computeEffectiveUnitCostCents(
-            line.invoiceLineTotalCents,
-            paidUnits,
-            freeUnits
-          );
-
-          // Lock product row to serialize Moving Weighted Average Cost updates
-          const [lockedProd] = await tx
+          // Batch-lock all involved products in deterministic UUID order (eliminates N+1 queries - H-06)
+          const lockedProds = await tx
             .select({
               id: products.id,
               avgCostCents: products.avgCostCents,
@@ -742,236 +781,379 @@ export async function inventoryRoutes(app: FastifyInstance) {
               taxRateId: products.taxRateId,
             })
             .from(products)
-            .where(eq(products.id, line.productId))
+            .where(inArray(products.id, uniquePids))
+            .orderBy(asc(products.id))
             .for("update");
-          if (!lockedProd) continue;
 
-          const [tax] = await tx
-            .select({
-              taxRateBp: taxRates.rateBp,
-              taxInclusive: taxRates.isInclusive,
-            })
-            .from(taxRates)
-            .where(eq(taxRates.id, lockedProd.taxRateId))
-            .limit(1);
-
-          const [baseline] = await tx
-            .select({ quantity: stockBaselines.quantity })
+          const taxIds = Array.from(new Set(lockedProds.map((p) => p.taxRateId)));
+          const taxRows =
+            taxIds.length > 0
+              ? await tx
+                  .select({
+                    id: taxRates.id,
+                    taxRateBp: taxRates.rateBp,
+                    taxInclusive: taxRates.isInclusive,
+                  })
+                  .from(taxRates)
+                  .where(inArray(taxRates.id, taxIds))
+              : [];
+          const baselineRows = await tx
+            .select({ productId: stockBaselines.productId, quantity: stockBaselines.quantity })
             .from(stockBaselines)
-            .where(eq(stockBaselines.productId, lockedProd.id))
-            .limit(1);
-          const [unfolded] = await tx
+            .where(inArray(stockBaselines.productId, uniquePids));
+          const unfoldedRows = await tx
             .select({
+              productId: stockMovements.productId,
               delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
             })
             .from(stockMovements)
-            .where(
-              and(eq(stockMovements.productId, lockedProd.id), eq(stockMovements.folded, false))
-            );
-          const currentStock = Number(baseline?.quantity ?? 0) + Number(unfolded?.delta ?? 0);
-
-          const newAvgCost = computeMovingWeightedAvgCostCents(
-            currentStock,
-            lockedProd.avgCostCents,
-            totalUnits,
-            effectiveUnitCost
-          );
-
-          await tx.insert(grnLines).values({
-            grnId: grn.id,
-            productId: lockedProd.id,
-            caseQty: line.caseQty,
-            paidCases: line.paidCases,
-            freeBonusCases: line.freeBonusCases,
-            baseUnitsReceived: totalUnits,
-            invoiceLineTotalCents: line.invoiceLineTotalCents,
-            effectiveUnitCostCents: effectiveUnitCost,
-            bestBeforeDate: line.bestBeforeDate ?? null,
-          });
-
-          let batchId: string | null = null;
-          if (line.bestBeforeDate) {
-            const [batch] = await tx
-              .insert(inventoryBatches)
-              .values({
-                productId: lockedProd.id,
-                lotCode: line.lotCode ?? `GRN-${data.invoiceNumber}`,
-                bestBeforeDate: line.bestBeforeDate,
-                unitCostCents: effectiveUnitCost,
-                qtyReceived: totalUnits,
-                qtyRemaining: totalUnits,
-                status: "active",
-              })
-              .returning();
-            batchId = batch.id;
-          }
-
-          // Both paid and free-bonus units carry the diluted effectiveUnitCost so ledger valuation matches totalInvoiceCents
-          if (paidUnits > 0) {
-            await tx.insert(stockMovements).values({
-              id: generateUuidV7(),
-              productId: lockedProd.id,
-              batchId,
-              qtyDelta: paidUnits,
-              unitCostCents: effectiveUnitCost,
-              reason: "grn",
-              refId: grn.id,
-              folded: false,
-            });
-          }
-          if (freeUnits > 0) {
-            await tx.insert(stockMovements).values({
-              id: generateUuidV7(),
-              productId: lockedProd.id,
-              batchId,
-              qtyDelta: freeUnits,
-              unitCostCents: effectiveUnitCost,
-              reason: "bonus_grn",
-              refId: grn.id,
-              folded: false,
-            });
-          }
-
-          await tx
-            .update(products)
-            .set({ avgCostCents: newAvgCost, updatedAt: new Date() })
-            .where(eq(products.id, lockedProd.id));
-
-          // Tax-aware net margin erosion check
-          const [primaryBc] = await tx
+            .where(and(inArray(stockMovements.productId, uniquePids), eq(stockMovements.folded, false)))
+            .groupBy(stockMovements.productId);
+          const primaryBcRows = await tx
             .select()
             .from(productBarcodes)
             .where(
-              and(
-                eq(productBarcodes.productId, lockedProd.id),
-                eq(productBarcodes.isPrimary, true)
-              )
+              and(inArray(productBarcodes.productId, uniquePids), eq(productBarcodes.isPrimary, true))
             );
-          if (primaryBc) {
-            const taxRateBp = tax?.taxRateBp ?? 0;
-            const taxInclusive = tax?.taxInclusive ?? true;
-            const resultingMargin = computeNetMarginBp(
-              primaryBc.sellPriceCents,
-              effectiveUnitCost * primaryBc.packQty,
-              taxRateBp,
-              taxInclusive
+
+          const prodStateMap = new Map(
+            lockedProds.map((p) => [
+              p.id,
+              {
+                ...p,
+                currentAvgCostCents: p.avgCostCents,
+                currentStock: 0,
+              },
+            ])
+          );
+          for (const b of baselineRows) {
+            const st = prodStateMap.get(b.productId);
+            if (st) st.currentStock += Number(b.quantity ?? 0);
+          }
+          for (const u of unfoldedRows) {
+            const st = prodStateMap.get(u.productId);
+            if (st) st.currentStock += Number(u.delta ?? 0);
+          }
+          const taxMap = new Map(taxRows.map((t) => [t.id, t]));
+          const primaryBcMap = new Map(primaryBcRows.map((b) => [b.productId, b]));
+
+          const orderedLines = [...data.lines].sort((a, b) =>
+            a.productId.localeCompare(b.productId)
+          );
+          const receivedSummaryByProduct = new Map<
+            string,
+            { cases: number; totalUnits: number; invoiceCents: number }
+          >();
+
+          const grnLineInserts: (typeof grnLines.$inferInsert)[] = [];
+          const movementInserts: (typeof stockMovements.$inferInsert)[] = [];
+          const alertInserts: (typeof marginAlerts.$inferInsert)[] = [];
+          const touchedProdIds = new Set<string>();
+
+          for (const line of orderedLines) {
+            const paidUnits = line.paidCases * line.caseQty;
+            const freeUnits = line.freeBonusCases * line.caseQty;
+            const totalUnits = paidUnits + freeUnits;
+            if (totalUnits <= 0) continue;
+
+            const prodState = prodStateMap.get(line.productId);
+            if (!prodState) continue;
+
+            const prevSum = receivedSummaryByProduct.get(line.productId) ?? {
+              cases: 0,
+              totalUnits: 0,
+              invoiceCents: 0,
+            };
+            receivedSummaryByProduct.set(line.productId, {
+              cases: prevSum.cases + line.paidCases + line.freeBonusCases,
+              totalUnits: prevSum.totalUnits + totalUnits,
+              invoiceCents: prevSum.invoiceCents + line.invoiceLineTotalCents,
+            });
+
+            const effectiveUnitCost = computeEffectiveUnitCostCents(
+              line.invoiceLineTotalCents,
+              paidUnits,
+              freeUnits
             );
-            if (resultingMargin < lockedProd.minMarginBp) {
-              const suggested = computeSuggestedSellPriceCents(
-                effectiveUnitCost * primaryBc.packQty,
-                lockedProd.minMarginBp,
-                taxRateBp,
-                taxInclusive,
-                5
-              );
-              await tx.insert(marginAlerts).values({
-                productId: lockedProd.id,
-                grnId: grn.id,
-                previousCostCents: lockedProd.avgCostCents,
-                newCostCents: effectiveUnitCost,
-                currentSellPriceCents: primaryBc.sellPriceCents,
-                resultingMarginBp: resultingMargin,
-                minMarginBp: lockedProd.minMarginBp,
-                suggestedSellPriceCents: suggested,
-                resolved: false,
+            const prevAvgCost = prodState.currentAvgCostCents;
+            const newAvgCost = computeMovingWeightedAvgCostCents(
+              prodState.currentStock,
+              prevAvgCost,
+              totalUnits,
+              effectiveUnitCost
+            );
+
+            // Advance in-memory state so multiple lines for the same SKU accumulate MWAC accurately
+            prodState.currentStock += totalUnits;
+            prodState.currentAvgCostCents = newAvgCost;
+            touchedProdIds.add(prodState.id);
+
+            grnLineInserts.push({
+              grnId: grn.id,
+              productId: prodState.id,
+              caseQty: line.caseQty,
+              paidCases: line.paidCases,
+              freeBonusCases: line.freeBonusCases,
+              baseUnitsReceived: totalUnits,
+              invoiceLineTotalCents: line.invoiceLineTotalCents,
+              effectiveUnitCostCents: effectiveUnitCost,
+              bestBeforeDate: line.bestBeforeDate ?? null,
+            });
+
+            let batchId: string | null = null;
+            if (line.bestBeforeDate) {
+              const [batch] = await tx
+                .insert(inventoryBatches)
+                .values({
+                  productId: prodState.id,
+                  lotCode: line.lotCode ?? `GRN-${data.invoiceNumber}`,
+                  bestBeforeDate: line.bestBeforeDate,
+                  unitCostCents: effectiveUnitCost,
+                  qtyReceived: totalUnits,
+                  qtyRemaining: totalUnits,
+                  status: "active",
+                })
+                .returning();
+              batchId = batch.id;
+            }
+
+            if (paidUnits > 0) {
+              movementInserts.push({
+                id: generateUuidV7(),
+                productId: prodState.id,
+                batchId,
+                qtyDelta: paidUnits,
+                unitCostCents: effectiveUnitCost,
+                reason: "grn",
+                refId: grn.id,
+                folded: false,
               });
-              createdAlerts.push({ productId: lockedProd.id, resultingMarginBp: resultingMargin });
             }
-          }
-        }
-
-        let variancesCreated = 0;
-        if (data.poId) {
-          const poLines = await tx
-            .select()
-            .from(purchaseOrderLines)
-            .where(eq(purchaseOrderLines.poId, data.poId))
-            .for("update");
-
-          let allReceived = poLines.length > 0;
-          for (const pl of poLines) {
-            const summary = receivedSummaryByProduct.get(pl.productId);
-            const added = summary?.cases ?? 0;
-            const nextReceived = pl.receivedCases + added;
-            if (added > 0) {
-              await tx
-                .update(purchaseOrderLines)
-                .set({ receivedCases: nextReceived })
-                .where(eq(purchaseOrderLines.id, pl.id));
-
-              const orderedUnits = pl.orderedCases * pl.caseQty;
-              const receivedUnitsTotal = nextReceived * pl.caseQty;
-              const invUnitCost =
-                summary && summary.totalUnits > 0
-                  ? Math.round(summary.invoiceCents / summary.totalUnits)
-                  : pl.unitCostCents;
-
-              if (nextReceived !== pl.orderedCases) {
-                const isShort = nextReceived < pl.orderedCases;
-                const unitDiff = Math.abs(orderedUnits - receivedUnitsTotal);
-                await tx.insert(grnVariances).values({
-                  grnId: grn.id,
-                  poId: data.poId,
-                  supplierId: data.supplierId,
-                  productId: pl.productId,
-                  varianceType: isShort ? "short_delivery" : "over_delivery",
-                  orderedQtyUnits: orderedUnits,
-                  receivedQtyUnits: receivedUnitsTotal,
-                  poUnitCostCents: pl.unitCostCents,
-                  invoiceUnitCostCents: invUnitCost,
-                  financialImpactCents: unitDiff * (isShort ? pl.unitCostCents : invUnitCost),
-                  status: "open",
-                });
-                variancesCreated++;
-              }
-
-              const costDiff = invUnitCost - pl.unitCostCents;
-              if (
-                pl.unitCostCents > 0 &&
-                Math.abs(costDiff) > Math.max(2, Math.round(pl.unitCostCents * 0.01))
-              ) {
-                await tx.insert(grnVariances).values({
-                  grnId: grn.id,
-                  poId: data.poId,
-                  supplierId: data.supplierId,
-                  productId: pl.productId,
-                  varianceType: costDiff > 0 ? "cost_overcharge" : "cost_savings",
-                  orderedQtyUnits: orderedUnits,
-                  receivedQtyUnits: summary?.totalUnits ?? added * pl.caseQty,
-                  poUnitCostCents: pl.unitCostCents,
-                  invoiceUnitCostCents: invUnitCost,
-                  financialImpactCents: Math.abs(costDiff) * (summary?.totalUnits ?? added * pl.caseQty),
-                  status: "open",
-                });
-                variancesCreated++;
-              }
+            if (freeUnits > 0) {
+              movementInserts.push({
+                id: generateUuidV7(),
+                productId: prodState.id,
+                batchId,
+                qtyDelta: freeUnits,
+                unitCostCents: effectiveUnitCost,
+                reason: "bonus_grn",
+                refId: grn.id,
+                folded: false,
+              });
             }
-            if (nextReceived < pl.orderedCases) {
-              allReceived = false;
+
+            const primaryBc = primaryBcMap.get(prodState.id);
+            if (primaryBc) {
+              const tax = taxMap.get(prodState.taxRateId);
+              const taxRateBp = tax?.taxRateBp ?? 0;
+              const taxInclusive = tax?.taxInclusive ?? true;
+              const resultingMargin = computeNetMarginBp(
+                primaryBc.sellPriceCents,
+                effectiveUnitCost * primaryBc.packQty,
+                taxRateBp,
+                taxInclusive
+              );
+              if (resultingMargin < prodState.minMarginBp) {
+                const suggested = computeSuggestedSellPriceCents(
+                  effectiveUnitCost * primaryBc.packQty,
+                  prodState.minMarginBp,
+                  taxRateBp,
+                  taxInclusive,
+                  5
+                );
+                alertInserts.push({
+                  productId: prodState.id,
+                  grnId: grn.id,
+                  previousCostCents: prevAvgCost,
+                  newCostCents: effectiveUnitCost,
+                  currentSellPriceCents: primaryBc.sellPriceCents,
+                  resultingMarginBp: resultingMargin,
+                  minMarginBp: prodState.minMarginBp,
+                  suggestedSellPriceCents: suggested,
+                  resolved: false,
+                });
+                createdAlerts.push({ productId: prodState.id, resultingMarginBp: resultingMargin });
+              }
             }
           }
 
-          await tx
-            .update(purchaseOrders)
-            .set({ status: allReceived ? "received" : "partially_received" })
-            .where(eq(purchaseOrders.id, data.poId));
-        }
+          if (grnLineInserts.length > 0) {
+            await tx.insert(grnLines).values(grnLineInserts);
+          }
+          if (movementInserts.length > 0) {
+            await tx.insert(stockMovements).values(movementInserts);
+          }
+          if (alertInserts.length > 0) {
+            await tx.insert(marginAlerts).values(alertInserts);
+          }
+          const now = new Date();
+          for (const pid of touchedProdIds) {
+            const st = prodStateMap.get(pid)!;
+            await tx
+              .update(products)
+              .set({ avgCostCents: st.currentAvgCostCents, updatedAt: now })
+              .where(eq(products.id, pid));
+          }
 
-        await tx.insert(auditLogs).values({
-          actor: actorName,
-          action: "grn_post",
-          entityType: "goods_receipt",
-          entityId: grn.id,
-          detailsJson: {
-            invoiceNumber: data.invoiceNumber,
-            totalInvoiceCents,
-            marginAlertsTriggered: createdAlerts.length,
-            variancesCreated,
-          },
+          let variancesCreated = 0;
+          if (data.poId) {
+            const poLines = await tx
+              .select()
+              .from(purchaseOrderLines)
+              .where(eq(purchaseOrderLines.poId, data.poId))
+              .for("update");
+
+            const openShortVars = await tx
+              .select()
+              .from(grnVariances)
+              .where(
+                and(
+                  eq(grnVariances.poId, data.poId),
+                  eq(grnVariances.varianceType, "short_delivery"),
+                  eq(grnVariances.status, "open")
+                )
+              )
+              .for("update");
+            const openShortByProduct = new Map(openShortVars.map((v) => [v.productId, v]));
+
+            let allReceived = poLines.length > 0;
+            for (const pl of poLines) {
+              const summary = receivedSummaryByProduct.get(pl.productId);
+              const added = summary?.cases ?? 0;
+              const nextReceived = pl.receivedCases + added;
+              if (added > 0) {
+                await tx
+                  .update(purchaseOrderLines)
+                  .set({ receivedCases: nextReceived })
+                  .where(eq(purchaseOrderLines.id, pl.id));
+
+                const orderedUnits = pl.orderedCases * pl.caseQty;
+                const receivedUnitsTotal = nextReceived * pl.caseQty;
+                const invUnitCost =
+                  summary && summary.totalUnits > 0
+                    ? Math.round(summary.invoiceCents / summary.totalUnits)
+                    : pl.unitCostCents;
+                const priorOpenShort = openShortByProduct.get(pl.productId);
+
+                if (nextReceived < pl.orderedCases) {
+                  const unitDiff = orderedUnits - receivedUnitsTotal;
+                  if (priorOpenShort) {
+                    // Reconcile existing open short-delivery variance cumulatively across partial drops
+                    await tx
+                      .update(grnVariances)
+                      .set({
+                        receivedQtyUnits: receivedUnitsTotal,
+                        financialImpactCents: unitDiff * pl.unitCostCents,
+                      })
+                      .where(eq(grnVariances.id, priorOpenShort.id));
+                  } else if (!data.partialDelivery) {
+                    await tx.insert(grnVariances).values({
+                      grnId: grn.id,
+                      poId: data.poId,
+                      supplierId: data.supplierId,
+                      productId: pl.productId,
+                      varianceType: "short_delivery",
+                      orderedQtyUnits: orderedUnits,
+                      receivedQtyUnits: receivedUnitsTotal,
+                      poUnitCostCents: pl.unitCostCents,
+                      invoiceUnitCostCents: invUnitCost,
+                      financialImpactCents: unitDiff * pl.unitCostCents,
+                      status: "open",
+                    });
+                    variancesCreated++;
+                  }
+                } else {
+                  // Cumulative delivery met or exceeded PO quantity -> close prior open short variance
+                  if (priorOpenShort) {
+                    await tx
+                      .update(grnVariances)
+                      .set({
+                        receivedQtyUnits: receivedUnitsTotal,
+                        financialImpactCents: 0,
+                        status: "resolved_credit_note",
+                        resolutionNote: `Fulfilled cumulatively by GRN ${data.invoiceNumber}`,
+                        resolvedAt: now,
+                      })
+                      .where(eq(grnVariances.id, priorOpenShort.id));
+                  }
+                  if (nextReceived > pl.orderedCases) {
+                    const overUnits = receivedUnitsTotal - orderedUnits;
+                    await tx.insert(grnVariances).values({
+                      grnId: grn.id,
+                      poId: data.poId,
+                      supplierId: data.supplierId,
+                      productId: pl.productId,
+                      varianceType: "over_delivery",
+                      orderedQtyUnits: orderedUnits,
+                      receivedQtyUnits: receivedUnitsTotal,
+                      poUnitCostCents: pl.unitCostCents,
+                      invoiceUnitCostCents: invUnitCost,
+                      financialImpactCents: overUnits * invUnitCost,
+                      status: "open",
+                    });
+                    variancesCreated++;
+                  }
+                }
+
+                const costDiff = invUnitCost - pl.unitCostCents;
+                if (
+                  pl.unitCostCents > 0 &&
+                  Math.abs(costDiff) > Math.max(2, Math.round(pl.unitCostCents * 0.01))
+                ) {
+                  await tx.insert(grnVariances).values({
+                    grnId: grn.id,
+                    poId: data.poId,
+                    supplierId: data.supplierId,
+                    productId: pl.productId,
+                    varianceType: costDiff > 0 ? "cost_overcharge" : "cost_savings",
+                    orderedQtyUnits: orderedUnits,
+                    receivedQtyUnits: summary?.totalUnits ?? added * pl.caseQty,
+                    poUnitCostCents: pl.unitCostCents,
+                    invoiceUnitCostCents: invUnitCost,
+                    financialImpactCents: Math.abs(costDiff) * (summary?.totalUnits ?? added * pl.caseQty),
+                    status: "open",
+                  });
+                  variancesCreated++;
+                }
+              }
+              if (nextReceived < pl.orderedCases) {
+                allReceived = false;
+              }
+            }
+
+            await tx
+              .update(purchaseOrders)
+              .set({ status: allReceived ? "received" : "partially_received" })
+              .where(eq(purchaseOrders.id, data.poId));
+          }
+
+          await tx.insert(auditLogs).values({
+            actor: actorName,
+            action: "grn_post",
+            entityType: "goods_receipt",
+            entityId: grn.id,
+            detailsJson: {
+              invoiceNumber: data.invoiceNumber,
+              totalInvoiceCents,
+              marginAlertsTriggered: createdAlerts.length,
+              variancesCreated,
+            },
+          });
+
+          return { errorStatus: null, grnId: grn.id, variancesCreated };
         });
+      } catch (err) {
+        if (getPgErrorCode(err) === "23505") {
+          return reply.status(409).send({
+            error: `Invoice "${data.invoiceNumber}" has already been received for this supplier.`,
+          });
+        }
+        throw err;
+      }
 
-        return { grnId: grn.id, variancesCreated };
-      });
+      if (grnOutcome.errorStatus) {
+        return reply.status(grnOutcome.errorStatus).send({ error: grnOutcome.error });
+      }
 
       return reply.status(201).send({
         grnId: grnOutcome.grnId,
