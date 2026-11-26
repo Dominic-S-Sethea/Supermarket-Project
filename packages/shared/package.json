@@ -18,6 +18,10 @@
       "types": "./dist/barcodes.d.ts",
       "import": "./dist/barcodes.js"
     },
+    "./emvqr": {
+      "types": "./dist/emvqr.d.ts",
+      "import": "./dist/emvqr.js"
+    },
     "./pricing": {
       "types": "./dist/pricing.d.ts",
       "import": "./dist/pricing.js"

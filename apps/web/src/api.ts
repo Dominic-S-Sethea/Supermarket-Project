@@ -77,7 +77,9 @@ async function handleResponse<T>(res: Response, method: string, path: string): P
       res.status === 401 &&
       unauthorizedHandler &&
       !path.startsWith("/api/auth/login") &&
-      !path.startsWith("/api/auth/me")
+      !path.startsWith("/api/auth/me") &&
+      !path.startsWith("/api/auth/verify-override") &&
+      !path.startsWith("/api/auth/change-pin")
     ) {
       unauthorizedHandler();
     }

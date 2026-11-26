@@ -236,6 +236,37 @@ export async function applyDatabaseConstraintsAndViews() {
             batch_multiplier >= 1 AND expected_output_units >= 1 AND actual_output_units >= 1 AND trim_waste_units >= 0
           );
       END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_store_settings_valid'
+      ) THEN
+        ALTER TABLE store_settings
+          ADD CONSTRAINT chk_store_settings_valid CHECK (
+            secondary_fx_rate > 0 AND secondary_rounding_step >= 1 AND cash_skim_limit_cents >= 1000
+            AND default_qr_rail IN ('khqr', 'promptpay', 'paynow')
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_payment_intents_valid'
+      ) THEN
+        ALTER TABLE payment_intents
+          ADD CONSTRAINT chk_payment_intents_valid CHECK (
+            amount_cents >= 1
+            AND rail IN ('khqr', 'promptpay', 'paynow', 'card_terminal')
+            AND status IN ('pending', 'paid', 'expired', 'failed', 'cancelled')
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_parked_baskets_valid'
+      ) THEN
+        ALTER TABLE parked_baskets
+          ADD CONSTRAINT chk_parked_baskets_valid CHECK (
+            subtotal_cents >= 0 AND item_count >= 1
+            AND status IN ('parked', 'recalled', 'cancelled')
+          );
+      END IF;
     END $$;
   `);
 

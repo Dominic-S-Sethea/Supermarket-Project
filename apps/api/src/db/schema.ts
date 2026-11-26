@@ -484,12 +484,20 @@ export const salePayments = pgTable(
     saleId: uuid("sale_id")
       .notNull()
       .references(() => sales.id, { onDelete: "restrict" }),
-    method: text("method").notNull(), // cash | card | mobile_pay | voucher
+    method: text("method").notNull(), // cash | card | mobile_pay | khqr | promptpay | paynow | voucher | store_credit | loyalty_points
     amountCents: bigint("amount_cents", { mode: "number" }).notNull(),
     tenderedCents: bigint("tendered_cents", { mode: "number" }),
     changeCents: bigint("change_cents", { mode: "number" }),
+    externalRef: text("external_ref"),
+    paymentIntentId: uuid("payment_intent_id"),
+    currencyCode: text("currency_code").notNull().default("USD"),
+    foreignAmount: bigint("foreign_amount", { mode: "number" }),
+    fxRateUsed: doublePrecision("fx_rate_used"),
   },
-  (t) => [index("idx_sale_payments_sale").on(t.saleId)]
+  (t) => [
+    index("idx_sale_payments_sale").on(t.saleId),
+    index("idx_sale_payments_intent").on(t.paymentIntentId),
+  ]
 );
 
 export const auditLogs = pgTable(
@@ -1089,4 +1097,86 @@ export const productionBatches = pgTable(
     index("idx_production_batches_produced").on(t.producedAt),
   ]
 );
+
+// ============================================================================
+// 12. FLAGSHIP STORE SETTINGS, SE ASIA EMVCO PAYMENT INTENTS & PARKED BASKETS
+// ============================================================================
+
+export const storeSettings = pgTable("store_settings", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  code: text("code").notNull().unique().default("FLAGSHIP"),
+  legalName: text("legal_name").notNull().default("SupermarketOS Flagship Retail Co., Ltd."),
+  storeName: text("store_name").notNull().default("SupermarketOS Flagship #01"),
+  address: text("address").notNull().default("128 Monivong Blvd, Phnom Penh"),
+  taxId: text("tax_id").notNull().default("VAT-KH-100294812"),
+  primaryCurrency: text("primary_currency").notNull().default("USD"),
+  secondaryCurrency: text("secondary_currency").default("KHR"),
+  secondaryFxRate: doublePrecision("secondary_fx_rate").notNull().default(4100),
+  secondaryRoundingStep: integer("secondary_rounding_step").notNull().default(100),
+  cashSkimLimitCents: bigint("cash_skim_limit_cents", { mode: "number" }).notNull().default(200000),
+  receiptHeader: text("receipt_header").notNull().default("Fresh Produce · Butcher · Bakery · Everyday Essentials"),
+  receiptFooter: text("receipt_footer").notNull().default("Thank you for shopping at SupermarketOS Flagship!"),
+  defaultQrRail: text("default_qr_rail").notNull().default("khqr"), // khqr | promptpay | paynow
+  paymentProvider: text("payment_provider").notNull().default("mock_sandbox"),
+  khqrAccountId: text("khqr_account_id").notNull().default("flagship_market@aba"),
+  khqrMerchantId: text("khqr_merchant_id").default("MERCH-88412"),
+  khqrAcquiringBank: text("khqr_acquiring_bank").notNull().default("ABA Bank"),
+  khqrCity: text("khqr_city").notNull().default("Phnom Penh"),
+  promptpayProxy: text("promptpay_proxy").notNull().default("0812345678"),
+  paynowUen: text("paynow_uen").notNull().default("202612345K"),
+  fiscalProvider: text("fiscal_provider").notNull().default("local_hash_chain"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const paymentIntents = pgTable(
+  "payment_intents",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    registerCode: text("register_code").notNull().default("REG-01"),
+    rail: text("rail").notNull(), // khqr | promptpay | paynow | card_terminal
+    provider: text("provider").notNull().default("mock_sandbox"),
+    status: text("status").notNull().default("pending"), // pending | paid | expired | failed | cancelled
+    amountCents: bigint("amount_cents", { mode: "number" }).notNull(),
+    currencyCode: text("currency_code").notNull().default("USD"),
+    displayAmount: text("display_amount").notNull(),
+    billReference: text("bill_reference").notNull().unique(),
+    qrPayload: text("qr_payload"),
+    externalRef: text("external_ref"),
+    saleId: uuid("sale_id").references(() => sales.id, { onDelete: "set null" }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    createdBy: text("created_by").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("idx_payment_intents_status_created").on(t.status, t.createdAt),
+    index("idx_payment_intents_sale").on(t.saleId),
+  ]
+);
+
+export const parkedBaskets = pgTable(
+  "parked_baskets",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    holdCode: text("hold_code").notNull().unique(),
+    registerCode: text("register_code").notNull().default("REG-01"),
+    cashierName: text("cashier_name").notNull(),
+    customerLabel: text("customer_label"),
+    customerId: uuid("customer_id").references(() => customers.id, { onDelete: "set null" }),
+    couponCode: text("coupon_code"),
+    linesJson: jsonb("lines_json").notNull(),
+    subtotalCents: bigint("subtotal_cents", { mode: "number" }).notNull(),
+    itemCount: integer("item_count").notNull(),
+    note: text("note"),
+    status: text("status").notNull().default("parked"), // parked | recalled | cancelled
+    parkedAt: timestamp("parked_at", { withTimezone: true }).defaultNow().notNull(),
+    recalledAt: timestamp("recalled_at", { withTimezone: true }),
+    recalledBy: text("recalled_by"),
+  },
+  (t) => [
+    index("idx_parked_baskets_status_parked").on(t.status, t.parkedAt),
+    index("idx_parked_baskets_register").on(t.registerCode),
+  ]
+);
+
 

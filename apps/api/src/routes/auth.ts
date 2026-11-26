@@ -1,7 +1,9 @@
 import {
   ChangePinSchema,
+  generateUuidV7,
   LoginSchema,
   validateCredentialStrength,
+  VerifySupervisorOverrideSchema,
   type UserRole,
 } from "@supermarket/shared";
 import { and, eq, isNull, ne } from "drizzle-orm";
@@ -228,4 +230,111 @@ export async function authRoutes(app: FastifyInstance) {
       return { ok: true, otherSessionsRevoked: revokedCount };
     }
   );
+
+  // In-lane Supervisor PIN Override (authorizes manager/owner action without logging out cashier)
+  app.post(
+    "/api/auth/verify-override",
+    { preHandler: [requireAuth, loginLimiter] },
+    async (req, reply) => {
+      const parsed = VerifySupervisorOverrideSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+      const data = parsed.data;
+      const cashier = req.authUser!;
+
+      // Hard food-safety guard: recalled items can NEVER be overridden in-lane
+      if (data.actionType === "recall_override") {
+        await db.insert(auditLogs).values({
+          actor: cashier.fullName,
+          action: "recall_override_denied",
+          entityType: "pos_override",
+          entityId: data.registerCode,
+          detailsJson: {
+            cashier: cashier.fullName,
+            requestedSupervisor: data.username.trim().toLowerCase(),
+            reason: data.reason,
+          },
+        });
+        return reply.status(403).send({
+          error:
+            "FOOD-SAFETY GUARD: Recalled products cannot be overridden in-lane. Clear the recall from Catalog after QA inspection.",
+        });
+      }
+
+      const supUsername = data.username.trim().toLowerCase();
+      const lockState = checkLoginLockout(supUsername);
+      if (lockState.locked) {
+        reply.header("Retry-After", String(lockState.retryAfterSec));
+        return reply.status(429).send({
+          error: `Supervisor account temporarily locked due to repeated failed PIN attempts. Retry in ${lockState.retryAfterSec}s.`,
+        });
+      }
+
+      const [found] = await db
+        .select()
+        .from(users)
+        .where(and(eq(users.username, supUsername), eq(users.active, true)))
+        .limit(1);
+
+      let pinValid = false;
+      if (!found) {
+        await runDummyPinWork(data.pin);
+      } else {
+        pinValid = await verifyPin(data.pin, found.pinHash);
+      }
+
+      if (!found || !pinValid) {
+        const failState = recordFailedLogin(supUsername);
+        if (failState.locked) {
+          reply.header("Retry-After", String(failState.retryAfterSec));
+          return reply.status(429).send({
+            error: `Supervisor account temporarily locked. Retry in ${failState.retryAfterSec}s.`,
+          });
+        }
+        return reply.status(401).send({ error: "Invalid supervisor username or PIN." });
+      }
+
+      if (found.role !== "owner" && found.role !== "manager") {
+        return reply.status(403).send({
+          error: "Supervisor override requires an active Store Manager or Owner account.",
+        });
+      }
+
+      clearLoginFailures(supUsername);
+      const overrideId = generateUuidV7();
+      const approvedAt = new Date().toISOString();
+
+      await db.insert(auditLogs).values({
+        actor: found.fullName,
+        action: data.actionType === "no_sale_drawer" ? "no_sale_drawer" : "supervisor_override",
+        entityType: "pos_override",
+        entityId: overrideId,
+        detailsJson: {
+          overrideId,
+          actionType: data.actionType,
+          reason: data.reason,
+          registerCode: data.registerCode,
+          cashierId: cashier.id,
+          cashierName: cashier.fullName,
+          cashierRole: cashier.role,
+          supervisorId: found.id,
+          supervisorName: found.fullName,
+          supervisorRole: found.role,
+          metadata: data.metadata ?? null,
+        },
+      });
+
+      return {
+        approved: true,
+        overrideId,
+        supervisorId: found.id,
+        supervisorName: found.fullName,
+        supervisorRole: found.role as UserRole,
+        actionType: data.actionType,
+        approvedAt,
+      };
+    }
+  );
 }
+

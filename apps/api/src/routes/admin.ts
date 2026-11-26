@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { CreateUserSchema, UpdateUserSchema } from "@supermarket/shared";
+import { CreateUserSchema, UpdateStoreSettingsSchema, UpdateUserSchema } from "@supermarket/shared";
 import { and, desc, eq, gt, ilike, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getPgErrorCode } from "../app.js";
@@ -9,11 +9,13 @@ import {
   auditLogs,
   db,
   posShifts,
+  storeSettings,
   userSessions,
   users,
 } from "../db/index.js";
-import { hashPin, requireRole } from "../plugins/auth.js";
+import { hashPin, requireAuth, requireRole } from "../plugins/auth.js";
 import { createRateLimiter } from "../plugins/security.js";
+import { getOrCreateStoreSettings } from "../services/payments.js";
 
 const UuidSchema = z.string().uuid();
 
@@ -419,4 +421,48 @@ export async function adminRoutes(app: FastifyInstance) {
       };
     }
   );
+
+  // =========================================================================
+  // FLAGSHIP STORE SETTINGS (MULTI-CURRENCY, DUAL-CASH FX & SE ASIA QR RAILS)
+  // =========================================================================
+  app.get("/api/store-settings", { preHandler: [requireAuth] }, async () => {
+    const settings = await getOrCreateStoreSettings();
+    return { settings };
+  });
+
+  app.patch(
+    "/api/store-settings",
+    { preHandler: [requireRole(["owner", "manager"]), adminMutationLimiter] },
+    async (req, reply) => {
+      const parsed = UpdateStoreSettingsSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+      const updates = parsed.data;
+      if (Object.keys(updates).length === 0) {
+        return reply.status(400).send({ error: "Provide at least one setting field to update." });
+      }
+
+      const existing = await getOrCreateStoreSettings();
+      const [updated] = await db
+        .update(storeSettings)
+        .set({
+          ...updates,
+          updatedAt: new Date(),
+        })
+        .where(eq(storeSettings.id, existing.id))
+        .returning();
+
+      await db.insert(auditLogs).values({
+        actor: req.authUser!.fullName,
+        action: "store_settings_update",
+        entityType: "store_settings",
+        entityId: updated.id,
+        detailsJson: { updatedFields: Object.keys(updates) },
+      });
+
+      return { settings: updated };
+    }
+  );
 }
+

@@ -89,6 +89,7 @@ export const PosSaleUploadSchema = z.object({
   customerId: z.string().uuid().nullable().optional(),
   couponCode: z.string().min(3).max(40).nullable().optional(),
   priceOverrideReason: z.string().min(3).max(160).nullable().optional(),
+  supervisorOverrideBy: z.string().trim().min(2).max(120).nullable().optional(),
   lines: z
     .array(
       z.object({
@@ -113,10 +114,25 @@ export const PosSaleUploadSchema = z.object({
     .array(
       z.object({
         id: z.string().uuid(),
-        method: z.enum(["cash", "card", "mobile_pay", "voucher"]),
+        method: z.enum([
+          "cash",
+          "card",
+          "mobile_pay",
+          "khqr",
+          "promptpay",
+          "paynow",
+          "voucher",
+          "store_credit",
+          "loyalty_points",
+        ]),
         amountCents: z.number().int().min(0),
         tenderedCents: z.number().int().min(0).optional(),
         changeCents: z.number().int().min(0).optional(),
+        externalRef: z.string().trim().max(120).nullable().optional(),
+        paymentIntentId: z.string().uuid().nullable().optional(),
+        currencyCode: z.string().trim().min(3).max(3).optional(),
+        foreignAmount: z.number().int().min(0).nullable().optional(),
+        fxRateUsed: z.number().positive().nullable().optional(),
       })
     )
     .min(1),
@@ -452,3 +468,71 @@ export const LogProductionBatchSchema = z.object({
   lotCode: z.string().trim().min(2).max(64).optional(),
   notes: z.string().trim().max(500).optional(),
 });
+
+export const UpdateStoreSettingsSchema = z.object({
+  legalName: z.string().trim().min(2).max(160).optional(),
+  storeName: z.string().trim().min(2).max(120).optional(),
+  address: z.string().trim().min(2).max(240).optional(),
+  taxId: z.string().trim().min(2).max(64).optional(),
+  primaryCurrency: z.enum(["USD", "EUR", "THB", "SGD"]).optional(),
+  secondaryCurrency: z.enum(["KHR", "USD", "THB", "EUR"]).nullable().optional(),
+  secondaryFxRate: z.number().positive().max(1_000_000).optional(),
+  secondaryRoundingStep: z.number().int().min(1).max(100_000).optional(),
+  cashSkimLimitCents: z.number().int().min(1000).max(100_000_000).optional(),
+  receiptHeader: z.string().trim().max(240).optional(),
+  receiptFooter: z.string().trim().max(240).optional(),
+  defaultQrRail: z.enum(["khqr", "promptpay", "paynow"]).optional(),
+  paymentProvider: z
+    .enum(["mock_sandbox", "bakong_khqr", "promptpay_gateway", "paynow_gateway", "stripe_terminal"])
+    .optional(),
+  khqrAccountId: z.string().trim().min(3).max(64).optional(),
+  khqrMerchantId: z.string().trim().max(64).nullable().optional(),
+  khqrAcquiringBank: z.string().trim().min(2).max(64).optional(),
+  khqrCity: z.string().trim().min(2).max(40).optional(),
+  promptpayProxy: z.string().trim().min(8).max(32).optional(),
+  paynowUen: z.string().trim().min(5).max(32).optional(),
+  fiscalProvider: z.enum(["local_hash_chain", "fiskaly_tse"]).optional(),
+});
+
+export const CreatePaymentIntentSchema = z.object({
+  registerCode: z.string().trim().min(1).max(32).default("REG-01"),
+  rail: z.enum(["khqr", "promptpay", "paynow", "card_terminal"]),
+  amountCents: z.number().int().min(1).max(100_000_000),
+  currencyCode: z.enum(["USD", "KHR", "THB", "SGD", "EUR"]).optional(),
+  billReference: z.string().trim().min(3).max(25).optional(),
+  ttlSeconds: z.number().int().min(30).max(900).default(300),
+});
+
+export const PaymentWebhookSchema = z.object({
+  billReference: z.string().trim().min(3).max(64),
+  externalRef: z.string().trim().min(3).max(120),
+  status: z.enum(["paid", "failed", "expired"]),
+  amountCents: z.number().int().min(1).optional(),
+});
+
+export const ParkBasketSchema = z.object({
+  registerCode: z.string().trim().min(1).max(32).default("REG-01"),
+  customerLabel: z.string().trim().max(120).nullable().optional(),
+  customerId: z.string().uuid().nullable().optional(),
+  couponCode: z.string().trim().max(40).nullable().optional(),
+  note: z.string().trim().max(240).nullable().optional(),
+  lines: z.array(z.record(z.string(), z.unknown())).min(1).max(200),
+  subtotalCents: z.number().int().min(0).max(100_000_000),
+});
+
+export const VerifySupervisorOverrideSchema = z.object({
+  username: z.string().trim().min(2).max(64),
+  pin: z.string().trim().min(4).max(64),
+  actionType: z.enum([
+    "line_void",
+    "basket_void",
+    "price_override",
+    "manual_discount",
+    "no_sale_drawer",
+    "recall_override",
+  ]),
+  reason: z.string().trim().min(3).max(200),
+  registerCode: z.string().trim().min(1).max(32).default("REG-01"),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+

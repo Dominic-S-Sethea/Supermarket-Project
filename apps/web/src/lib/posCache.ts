@@ -1,3 +1,4 @@
+import type { PaymentMethod, StoreSettingsDto } from "@supermarket/shared/dtos";
 import type { PromotionRule } from "@supermarket/shared/pricing";
 import { ApiError } from "../api.ts";
 
@@ -7,9 +8,11 @@ const KEY = "latest_v1";
 
 export const OFFLINE_QUEUE_KEY = "supermarket_os_offline_pos_queue_v1";
 export const DEAD_LETTER_QUEUE_KEY = "supermarket_os_pos_dead_letter_v1";
+export const LOCAL_PARKED_BASKETS_KEY = "supermarket_os_local_parked_baskets_v1";
 
 export interface PosBootstrapSnapshot {
   syncedAt: string;
+  storeSettings?: StoreSettingsDto;
   products: {
     id: string;
     sku: string;
@@ -66,6 +69,19 @@ export interface PosBootstrapSnapshot {
   }[];
 }
 
+export interface QueuedPosPayment {
+  id: string;
+  method: PaymentMethod;
+  amountCents: number;
+  tenderedCents?: number;
+  changeCents?: number;
+  externalRef?: string | null;
+  paymentIntentId?: string | null;
+  currencyCode?: string;
+  foreignAmount?: number | null;
+  fxRateUsed?: number | null;
+}
+
 export interface QueuedPosSale {
   id: string;
   registerCode: string;
@@ -77,6 +93,7 @@ export interface QueuedPosSale {
   ageVerified: boolean;
   customerId?: string | null;
   couponCode?: string | null;
+  supervisorOverrideBy?: string | null;
   lines: {
     id: string;
     productId: string;
@@ -93,13 +110,7 @@ export interface QueuedPosSale {
     taxCents: number;
     lineTotalCents: number;
   }[];
-  payments: {
-    id: string;
-    method: "cash" | "card" | "mobile_pay";
-    amountCents: number;
-    tenderedCents?: number;
-    changeCents?: number;
-  }[];
+  payments: QueuedPosPayment[];
 }
 
 export interface DeadLetterPosSale {
@@ -293,6 +304,56 @@ export function removeDeadLetterSale(
   const next = loadDeadLetterQueue(storage).filter((d) => d.sale.id !== saleId);
   saveDeadLetterQueue(next, storage);
   return next;
+}
+
+export interface LocalParkedBasketRecord {
+  id: string;
+  holdCode: string;
+  registerCode: string;
+  cashierName: string;
+  customerLabel: string | null;
+  customerId: string | null;
+  couponCode: string | null;
+  linesJson: unknown[];
+  subtotalCents: number;
+  itemCount: number;
+  note: string | null;
+  parkedAt: string;
+}
+
+export function loadLocalParkedBaskets(
+  storage: Pick<Storage, "getItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): LocalParkedBasketRecord[] {
+  if (!storage) return [];
+  try {
+    const raw = storage.getItem(LOCAL_PARKED_BASKETS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (b): b is LocalParkedBasketRecord =>
+        Boolean(b && typeof b === "object" && typeof (b as LocalParkedBasketRecord).id === "string")
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function saveLocalParkedBaskets(
+  baskets: LocalParkedBasketRecord[],
+  storage: Pick<Storage, "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): boolean {
+  if (!storage) return false;
+  try {
+    storage.setItem(LOCAL_PARKED_BASKETS_KEY, JSON.stringify(baskets));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function openDb(): Promise<IDBDatabase> {

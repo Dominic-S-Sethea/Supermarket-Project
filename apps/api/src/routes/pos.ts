@@ -3,11 +3,15 @@ import type { FastifyInstance } from "fastify";
 import {
   computeTaxCents,
   computeWeightedPriceCents,
+  CreatePaymentIntentSchema,
   deriveWeightFromPriceGrams,
   evaluateCart,
+  generateQrMatrix,
   generateUuidV7,
   normalizePluCode,
+  ParkBasketSchema,
   parseScaleBarcode,
+  PaymentWebhookSchema,
   PosSaleUploadSchema,
   type CartInputLine,
   type PromotionRule,
@@ -24,6 +28,8 @@ import {
   db,
   inventoryBatches,
   loyaltyLedger,
+  parkedBaskets,
+  paymentIntents,
   posShifts,
   productBarcodes,
   products,
@@ -37,14 +43,23 @@ import {
 } from "../db/index.js";
 import { getPgErrorCode } from "../app.js";
 import { requireRole } from "../plugins/auth.js";
+import {
+  generateExternalSettlementRef,
+  getOrCreateStoreSettings,
+  resolvePaymentAdapter,
+  verifyWebhookSignature,
+} from "../services/payments.js";
+
+const UuidSchema = z.string().uuid();
 
 export async function posRoutes(app: FastifyInstance) {
-  // Lightweight offline-first bootstrap payload (includes fresh PLU/allergen/recall metadata, basket upsells & ETag)
+  // Lightweight offline-first bootstrap payload (includes fresh PLU/allergen/recall metadata, store settings, basket upsells & ETag)
   app.get(
     "/api/pos/bootstrap",
     { preHandler: [requireRole(["owner", "manager", "cashier"])] },
     async (req, reply) => {
       const canSeeCost = req.authUser?.role === "owner" || req.authUser?.role === "manager";
+      const settings = await getOrCreateStoreSettings();
       const verRes = await db.execute(sql`
         SELECT
           (SELECT count(*)::text || ':' || coalesce(max(updated_at)::text, '') || ':' || count(*) FILTER (WHERE recalled = true)::text FROM products WHERE active = true) AS p_ver,
@@ -52,13 +67,14 @@ export async function posRoutes(app: FastifyInstance) {
           (SELECT count(*)::text || ':' || coalesce(max(starts_at)::text, '') || ':' || coalesce(max(ends_at)::text, '') FROM promotions WHERE active = true) AS pr_ver,
           (SELECT count(*)::text FROM tax_rates) AS t_ver,
           (SELECT count(*)::text FROM categories) AS c_ver,
-          (SELECT coalesce(max(computed_at)::text, '') FROM analytics_basket_rules) AS r_ver
+          (SELECT coalesce(max(computed_at)::text, '') FROM analytics_basket_rules) AS r_ver,
+          (SELECT coalesce(max(updated_at)::text, '') FROM store_settings) AS s_ver
       `);
       const vRow = (verRes.rows[0] ?? {}) as Record<string, string>;
       const etagHash = crypto
         .createHash("sha256")
         .update(
-          `${canSeeCost ? "mgr" : "cash"}|${vRow.p_ver}|${vRow.b_ver}|${vRow.pr_ver}|${vRow.t_ver}|${vRow.c_ver}|${vRow.r_ver}`
+          `${canSeeCost ? "mgr" : "cash"}|${vRow.p_ver}|${vRow.b_ver}|${vRow.pr_ver}|${vRow.t_ver}|${vRow.c_ver}|${vRow.r_ver}|${vRow.s_ver}`
         )
         .digest("hex")
         .slice(0, 24);
@@ -127,6 +143,7 @@ export async function posRoutes(app: FastifyInstance) {
         syncedAt: new Date().toISOString(),
         productCount: prods.length,
         barcodeCount: bcs.length,
+        storeSettings: settings,
         products: canSeeCost
           ? prods
           : prods.map(({ avgCostCents: _cost, ...pub }) => pub),
@@ -695,6 +712,72 @@ export async function posRoutes(app: FastifyInstance) {
             }
           }
 
+          // Verify any referenced EMVCo QR / terminal payment intents are settled & unlinked
+          const referencedIntentIds = Array.from(
+            new Set(
+              payload.payments
+                .map((p) => p.paymentIntentId)
+                .filter((id): id is string => Boolean(id))
+            )
+          ).sort();
+          if (payload.kind === "sale" && referencedIntentIds.length > 0) {
+            const lockedIntents = await tx
+              .select()
+              .from(paymentIntents)
+              .where(inArray(paymentIntents.id, referencedIntentIds))
+              .orderBy(asc(paymentIntents.id))
+              .for("update");
+            if (lockedIntents.length !== referencedIntentIds.length) {
+              txRejection = { status: 400, message: "Referenced paymentIntentId was not found." };
+              return;
+            }
+            for (const intent of lockedIntents) {
+              if (intent.status !== "paid") {
+                txRejection = {
+                  status: 409,
+                  message: `Payment intent ${intent.billReference} is "${intent.status}" and must be settled ("paid") before finalizing checkout.`,
+                };
+                return;
+              }
+              if (intent.saleId && intent.saleId !== payload.id) {
+                txRejection = {
+                  status: 409,
+                  message: `Payment intent ${intent.billReference} has already been linked to another receipt.`,
+                };
+                return;
+              }
+            }
+          }
+
+          // Validate loyalty_points tender leg requires customerId & sufficient balance (1 pt = 1 cent)
+          const loyaltyRedeemCents =
+            payload.kind === "sale"
+              ? payload.payments
+                  .filter((p) => p.method === "loyalty_points")
+                  .reduce((s, p) => s + p.amountCents, 0)
+              : 0;
+          if (loyaltyRedeemCents > 0) {
+            if (!payload.customerId) {
+              txRejection = {
+                status: 400,
+                message: "Loyalty points tender requires a linked loyalty customer.",
+              };
+              return;
+            }
+            const [checkCust] = await tx
+              .select({ pointsBalance: customers.pointsBalance })
+              .from(customers)
+              .where(eq(customers.id, payload.customerId))
+              .for("update");
+            if (!checkCust || checkCust.pointsBalance < loyaltyRedeemCents) {
+              txRejection = {
+                status: 400,
+                message: `Insufficient loyalty points balance (available: ${checkCust?.pointsBalance ?? 0} pts, requested: ${loyaltyRedeemCents} pts).`,
+              };
+              return;
+            }
+          }
+
           const inserted = await tx
             .insert(sales)
             .values({
@@ -772,8 +855,35 @@ export async function posRoutes(app: FastifyInstance) {
               amountCents: p.amountCents,
               tenderedCents: p.tenderedCents ?? p.amountCents,
               changeCents: p.changeCents ?? 0,
+              externalRef: p.externalRef ?? null,
+              paymentIntentId: p.paymentIntentId ?? null,
+              currencyCode: p.currencyCode ?? "USD",
+              foreignAmount: p.foreignAmount ?? null,
+              fxRateUsed: p.fxRateUsed ?? null,
             }))
           );
+
+          if (payload.kind === "sale" && referencedIntentIds.length > 0) {
+            await tx
+              .update(paymentIntents)
+              .set({ saleId: payload.id })
+              .where(inArray(paymentIntents.id, referencedIntentIds));
+          }
+
+          if (payload.supervisorOverrideBy) {
+            await tx.insert(auditLogs).values({
+              actor: payload.supervisorOverrideBy,
+              action: "pos_sale_supervisor_override",
+              entityType: "sale",
+              entityId: payload.id,
+              detailsJson: {
+                receiptNo: payload.receiptNo,
+                cashier: actor.fullName,
+                supervisor: payload.supervisorOverrideBy,
+                reason: payload.priceOverrideReason ?? "In-lane supervisor approval",
+              },
+            });
+          }
 
           // Append immutable inventory ledger rows + locked FEFO batch depletion/restoration
           // Sort lines by productId for deterministic row-lock ordering across concurrent checkouts
@@ -1000,12 +1110,20 @@ export async function posRoutes(app: FastifyInstance) {
                 await tx
                   .update(customers)
                   .set({
-                    pointsBalance: lockedCust.pointsBalance + pts,
+                    pointsBalance: Math.max(0, lockedCust.pointsBalance - loyaltyRedeemCents + pts),
                     lifetimeSpendCents: lockedCust.lifetimeSpendCents + totalCents,
                     visits60d: lockedCust.visits60d + 1,
                     lastVisitAt: new Date(payload.soldAt),
                   })
                   .where(eq(customers.id, lockedCust.id));
+                if (loyaltyRedeemCents > 0) {
+                  await tx.insert(loyaltyLedger).values({
+                    customerId: lockedCust.id,
+                    saleId: payload.id,
+                    pointsDelta: -loyaltyRedeemCents,
+                    reason: "redeem",
+                  });
+                }
                 if (pts > 0) {
                   await tx.insert(loyaltyLedger).values({
                     customerId: lockedCust.id,
@@ -1380,4 +1498,385 @@ export async function posRoutes(app: FastifyInstance) {
       return closedShift;
     }
   );
+
+  // =========================================================================
+  // MILESTONE 2: SE ASIA EMVCo QR PAYMENT INTENTS (KHQR / PROMPTPAY / PAYNOW)
+  // =========================================================================
+  app.post(
+    "/api/pos/payment-intents",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req, reply) => {
+      const parsed = CreatePaymentIntentSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+      const data = parsed.data;
+      const settings = await getOrCreateStoreSettings();
+      const adapter = resolvePaymentAdapter(data.rail, settings.paymentProvider);
+      const id = generateUuidV7();
+      const billReference =
+        data.billReference ??
+        `${data.registerCode.replace(/[^A-Z0-9]/gi, "").slice(0, 6).toUpperCase()}-${id.slice(-8).toUpperCase()}`;
+      const expiresAt = new Date(Date.now() + data.ttlSeconds * 1000);
+
+      const built = await adapter.createIntent(
+        {
+          rail: data.rail,
+          amountCents: data.amountCents,
+          currencyCode: data.currencyCode,
+          billReference,
+          registerCode: data.registerCode,
+          expiresAtMs: expiresAt.getTime(),
+        },
+        settings
+      );
+
+      const [intent] = await db
+        .insert(paymentIntents)
+        .values({
+          id,
+          registerCode: data.registerCode,
+          rail: data.rail,
+          provider: built.provider,
+          status: "pending",
+          amountCents: data.amountCents,
+          currencyCode: built.currencyCode,
+          displayAmount: built.displayAmount,
+          billReference,
+          qrPayload: built.qrPayload,
+          externalRef: built.externalRef,
+          expiresAt,
+          createdBy: req.authUser!.fullName,
+        })
+        .returning();
+
+      const qrMatrix = intent.qrPayload ? generateQrMatrix(intent.qrPayload) : null;
+      return reply.status(201).send({ intent, qrMatrix });
+    }
+  );
+
+  app.get(
+    "/api/pos/payment-intents/:id",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid payment intent ID format." });
+      }
+      const [intent] = await db
+        .select()
+        .from(paymentIntents)
+        .where(eq(paymentIntents.id, id))
+        .limit(1);
+      if (!intent) return reply.status(404).send({ error: "Payment intent not found." });
+
+      if (intent.status === "pending" && new Date(intent.expiresAt).getTime() <= Date.now()) {
+        const [expired] = await db
+          .update(paymentIntents)
+          .set({ status: "expired" })
+          .where(and(eq(paymentIntents.id, id), eq(paymentIntents.status, "pending")))
+          .returning();
+        return { intent: expired ?? intent };
+      }
+
+      return { intent };
+    }
+  );
+
+  app.post(
+    "/api/pos/payment-intents/:id/simulate-settle",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid payment intent ID format." });
+      }
+
+      const result = await db.transaction(async (tx) => {
+        const [intent] = await tx
+          .select()
+          .from(paymentIntents)
+          .where(eq(paymentIntents.id, id))
+          .for("update");
+        if (!intent) return { status: 404 as const, error: "Payment intent not found." };
+
+        if (intent.status === "paid") {
+          return { status: 200 as const, intent, alreadyPaid: true };
+        }
+        if (intent.status !== "pending") {
+          return {
+            status: 409 as const,
+            error: `Cannot settle payment intent in "${intent.status}" state.`,
+          };
+        }
+        if (new Date(intent.expiresAt).getTime() <= Date.now()) {
+          await tx
+            .update(paymentIntents)
+            .set({ status: "expired" })
+            .where(eq(paymentIntents.id, id));
+          return { status: 409 as const, error: "Payment intent has expired. Generate a fresh QR code." };
+        }
+
+        const extRef = generateExternalSettlementRef(
+          intent.rail as "khqr" | "promptpay" | "paynow" | "card_terminal"
+        );
+        const [settled] = await tx
+          .update(paymentIntents)
+          .set({
+            status: "paid",
+            externalRef: extRef,
+            paidAt: new Date(),
+          })
+          .where(eq(paymentIntents.id, id))
+          .returning();
+
+        await tx.insert(auditLogs).values({
+          actor: req.authUser!.fullName,
+          action: "payment_intent_settled",
+          entityType: "payment_intent",
+          entityId: settled.id,
+          detailsJson: {
+            rail: settled.rail,
+            provider: settled.provider,
+            billReference: settled.billReference,
+            externalRef: extRef,
+            amountCents: settled.amountCents,
+            displayAmount: settled.displayAmount,
+            mode: "sandbox_simulate",
+          },
+        });
+
+        return { status: 200 as const, intent: settled, alreadyPaid: false };
+      });
+
+      if ("error" in result) {
+        return reply.status(result.status).send({ error: result.error });
+      }
+      return { intent: result.intent, alreadyPaid: result.alreadyPaid };
+    }
+  );
+
+  app.post(
+    "/api/pos/payment-intents/:id/cancel",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid payment intent ID format." });
+      }
+      const [updated] = await db
+        .update(paymentIntents)
+        .set({ status: "cancelled" })
+        .where(and(eq(paymentIntents.id, id), eq(paymentIntents.status, "pending")))
+        .returning();
+      if (!updated) {
+        const [existing] = await db
+          .select()
+          .from(paymentIntents)
+          .where(eq(paymentIntents.id, id))
+          .limit(1);
+        if (!existing) return reply.status(404).send({ error: "Payment intent not found." });
+        return reply
+          .status(409)
+          .send({ error: `Cannot cancel payment intent in "${existing.status}" state.` });
+      }
+      return { intent: updated };
+    }
+  );
+
+  app.post("/api/pos/payment-intents/webhook", async (req, reply) => {
+    const rawBody = JSON.stringify(req.body ?? {});
+    const sig = req.headers["x-payment-signature"] as string | undefined;
+    if (!verifyWebhookSignature(rawBody, sig)) {
+      return reply.status(401).send({ error: "Invalid payment webhook signature." });
+    }
+    const parsed = PaymentWebhookSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    const data = parsed.data;
+
+    const result = await db.transaction(async (tx) => {
+      const [intent] = await tx
+        .select()
+        .from(paymentIntents)
+        .where(eq(paymentIntents.billReference, data.billReference))
+        .for("update");
+      if (!intent) return { status: 404 as const, error: "Bill reference not found." };
+
+      if (data.amountCents !== undefined && data.amountCents !== intent.amountCents) {
+        return {
+          status: 400 as const,
+          error: `Webhook amount mismatch (expected ${intent.amountCents}c, got ${data.amountCents}c).`,
+        };
+      }
+      if (intent.status === "paid") {
+        return { status: 200 as const, intent, idempotent: true };
+      }
+      if (intent.status !== "pending") {
+        return {
+          status: 409 as const,
+          error: `Cannot apply webhook to intent in "${intent.status}" state.`,
+        };
+      }
+
+      const [updated] = await tx
+        .update(paymentIntents)
+        .set({
+          status: data.status,
+          externalRef: data.externalRef,
+          paidAt: data.status === "paid" ? new Date() : null,
+        })
+        .where(eq(paymentIntents.id, intent.id))
+        .returning();
+
+      await tx.insert(auditLogs).values({
+        actor: "payment_gateway_webhook",
+        action: "payment_intent_webhook",
+        entityType: "payment_intent",
+        entityId: updated.id,
+        detailsJson: {
+          billReference: updated.billReference,
+          externalRef: data.externalRef,
+          status: data.status,
+          rail: updated.rail,
+        },
+      });
+
+      return { status: 200 as const, intent: updated, idempotent: false };
+    });
+
+    if ("error" in result) {
+      return reply.status(result.status).send({ error: result.error });
+    }
+    return { intent: result.intent, idempotent: result.idempotent };
+  });
+
+  // =========================================================================
+  // MILESTONE 2: HOLD / PARK & RECALL BASKETS (CROSS-LANE POS WORKFLOW)
+  // =========================================================================
+  app.get(
+    "/api/pos/parked-baskets",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async () => {
+      const baskets = await db
+        .select()
+        .from(parkedBaskets)
+        .where(eq(parkedBaskets.status, "parked"))
+        .orderBy(desc(parkedBaskets.parkedAt))
+        .limit(50);
+      return { baskets };
+    }
+  );
+
+  app.post(
+    "/api/pos/parked-baskets",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req, reply) => {
+      const parsed = ParkBasketSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+      const data = parsed.data;
+      const id = generateUuidV7();
+      const holdCode = `HOLD-${id.slice(-4).toUpperCase()}`;
+
+      const [basket] = await db
+        .insert(parkedBaskets)
+        .values({
+          id,
+          holdCode,
+          registerCode: data.registerCode,
+          cashierName: req.authUser!.fullName,
+          customerLabel: data.customerLabel ?? null,
+          customerId: data.customerId ?? null,
+          couponCode: data.couponCode ?? null,
+          linesJson: data.lines,
+          subtotalCents: data.subtotalCents,
+          itemCount: data.lines.length,
+          note: data.note ?? null,
+          status: "parked",
+        })
+        .returning();
+
+      await db.insert(auditLogs).values({
+        actor: req.authUser!.fullName,
+        action: "basket_park",
+        entityType: "parked_basket",
+        entityId: basket.id,
+        detailsJson: {
+          holdCode: basket.holdCode,
+          registerCode: basket.registerCode,
+          itemCount: basket.itemCount,
+          subtotalCents: basket.subtotalCents,
+        },
+      });
+
+      return reply.status(201).send({ basket });
+    }
+  );
+
+  app.post(
+    "/api/pos/parked-baskets/:id/recall",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid parked basket ID format." });
+      }
+
+      const [recalled] = await db
+        .update(parkedBaskets)
+        .set({
+          status: "recalled",
+          recalledAt: new Date(),
+          recalledBy: req.authUser!.fullName,
+        })
+        .where(and(eq(parkedBaskets.id, id), eq(parkedBaskets.status, "parked")))
+        .returning();
+
+      if (!recalled) {
+        const [existing] = await db
+          .select({ status: parkedBaskets.status })
+          .from(parkedBaskets)
+          .where(eq(parkedBaskets.id, id))
+          .limit(1);
+        if (!existing) return reply.status(404).send({ error: "Parked basket not found." });
+        return reply
+          .status(409)
+          .send({ error: `Basket has already been ${existing.status}.` });
+      }
+
+      await db.insert(auditLogs).values({
+        actor: req.authUser!.fullName,
+        action: "basket_recall",
+        entityType: "parked_basket",
+        entityId: recalled.id,
+        detailsJson: { holdCode: recalled.holdCode, recalledBy: req.authUser!.fullName },
+      });
+
+      return { basket: recalled };
+    }
+  );
+
+  app.delete(
+    "/api/pos/parked-baskets/:id",
+    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid parked basket ID format." });
+      }
+      const [cancelled] = await db
+        .update(parkedBaskets)
+        .set({ status: "cancelled" })
+        .where(and(eq(parkedBaskets.id, id), eq(parkedBaskets.status, "parked")))
+        .returning();
+      if (!cancelled) {
+        return reply.status(404).send({ error: "Active parked basket not found." });
+      }
+      return { ok: true, id: cancelled.id };
+    }
+  );
 }
+

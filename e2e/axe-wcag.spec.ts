@@ -106,6 +106,31 @@ test.describe("SupermarketOS Automated WCAG 2.0/2.1/2.2 A/AA Gate (axe-core)", (
     await page.keyboard.press("Escape");
     await expect(page.locator('[role="dialog"]')).toHaveCount(0);
 
+    // Milestone 2 POS Modals: Hold/Recall, Supervisor PIN Override, and Split Tender / EMVCo QR
+    await page.click("#open-parked-baskets-btn");
+    await expect(page.locator('[role="dialog"][aria-modal="true"]')).toBeVisible();
+    await scanAxe(page, "POS Parked Baskets Modal (navy)", findings);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+
+    await page.click("#open-supervisor-override-btn");
+    await expect(page.locator('[role="dialog"][aria-modal="true"]')).toBeVisible();
+    await scanAxe(page, "POS Supervisor PIN Override Modal (navy)", findings);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+
+    // Add a quick item so Split Tender / EMVCo QR Checkout modal opens
+    const quickSku = page.locator("button.quick-sku-btn").last();
+    await quickSku.click();
+    await expect(page.locator("#pos-pay-qr-btn")).toBeEnabled();
+    await page.click("#pos-pay-qr-btn");
+    await expect(page.locator('[role="dialog"][aria-modal="true"]')).toBeVisible();
+    await scanAxe(page, "POS EMVCo QR & Split Tender Modal (navy)", findings);
+    await page.click("#checkout-tab-cash");
+    await scanAxe(page, "POS Dual-Currency Cash Tab (navy)", findings);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+
     // Operations lazy subtabs + WAI-ARIA tablist
     await page.click("#nav-operations");
     await settleView(page);
@@ -144,10 +169,11 @@ test.describe("SupermarketOS Automated WCAG 2.0/2.1/2.2 A/AA Gate (axe-core)", (
       await scanAxe(page, `ShiftDiagnostics/${subId} (navy)`, findings);
     }
 
-    // Admin subtabs
+    // Admin subtabs (including Milestone 2 Store & QR Rails Settings)
     await page.click("#nav-admin");
     await settleView(page);
     for (const subId of [
+      "admin-subtab-settings",
       "admin-subtab-audit",
       "admin-subtab-reconciliation",
       "admin-subtab-pipeline",
@@ -178,6 +204,22 @@ test.describe("SupermarketOS Automated WCAG 2.0/2.1/2.2 A/AA Gate (axe-core)", (
     await page.keyboard.press("Escape");
     await expect(toggleBtn).toHaveAttribute("aria-expanded", "false");
     await expect(toggleBtn).toBeFocused();
+
+    expect(findings, JSON.stringify(findings, null, 2)).toEqual([]);
+  });
+
+  test("standalone /customer-display route passes axe-core WCAG 2.2 AA across Navy, Dark, and Light themes", async ({
+    page,
+  }) => {
+    const findings: Array<{ label: string; violations: unknown[] }> = [];
+    await page.goto("/customer-display");
+    await expect(page.locator("#cfd-grand-total")).toBeVisible();
+
+    for (const theme of ["navy", "dark", "light"] as const) {
+      await page.click(`#theme-btn-surface-${theme}`);
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      await scanAxe(page, `Customer Display (${theme})`, findings);
+    }
 
     expect(findings, JSON.stringify(findings, null, 2)).toEqual([]);
   });

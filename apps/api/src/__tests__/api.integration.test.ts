@@ -1,4 +1,9 @@
-import { buildScaleBarcode, buildValidEan13, generateUuidV7 } from "@supermarket/shared";
+import {
+  buildScaleBarcode,
+  buildValidEan13,
+  generateUuidV7,
+  parseEmvQrTlv,
+} from "@supermarket/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { executeCopilotTool } from "../ai/tools.js";
@@ -19,6 +24,8 @@ import {
   inventoryBatches,
   loyaltyLedger,
   marginAlerts,
+  parkedBaskets,
+  paymentIntents,
   pool,
   posShifts,
   productBarcodes,
@@ -2872,6 +2879,418 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(zplRes.json().zpl).toContain("/ kg");
     expect(zplRes.json().zpl).toContain("ALLERGENS: GLUTEN");
   });
+
+  it("Flagship Milestone 2: supports Store Settings, SE Asia EMVCo KHQR/PromptPay/PayNow intents & webhooks, split-tender dual-currency checkout, parked baskets & supervisor PIN overrides", async () => {
+    // 1. Store Settings RBAC & live POS bootstrap propagation
+    const initSettingsRes = await app.inject({
+      method: "GET",
+      url: "/api/store-settings",
+      headers: authHeaders(cashierToken),
+    });
+    expect(initSettingsRes.statusCode).toBe(200);
+    const origFx = Number(initSettingsRes.json().settings.secondaryFxRate);
+
+    const cashierPatchSettings = await app.inject({
+      method: "PATCH",
+      url: "/api/store-settings",
+      headers: authHeaders(cashierToken),
+      payload: { secondaryFxRate: 4200 },
+    });
+    expect(cashierPatchSettings.statusCode).toBe(403);
+
+    try {
+      const patchSettings = await app.inject({
+        method: "PATCH",
+        url: "/api/store-settings",
+        headers: authHeaders(ownerToken),
+        payload: { secondaryFxRate: 4150 },
+      });
+      expect(patchSettings.statusCode).toBe(200);
+      expect(patchSettings.json().settings.secondaryFxRate).toBe(4150);
+
+      const bootRes = await app.inject({
+        method: "GET",
+        url: "/api/pos/bootstrap",
+        headers: authHeaders(cashierToken),
+      });
+      expect(bootRes.statusCode).toBe(200);
+      expect(bootRes.json().storeSettings.secondaryFxRate).toBe(4150);
+    } finally {
+      await app.inject({
+        method: "PATCH",
+        url: "/api/store-settings",
+        headers: authHeaders(ownerToken),
+        payload: { secondaryFxRate: origFx },
+      });
+    }
+
+    // 2. SE Asia EMVCo QR Payment Intents (KHQR, PromptPay, PayNow)
+    const createdIntentIds: string[] = [];
+    const createdSaleIds: string[] = [];
+    const createdBasketIds: string[] = [];
+
+    try {
+      const [khqrRes, ppRes, pnRes] = await Promise.all([
+        app.inject({
+          method: "POST",
+          url: "/api/pos/payment-intents",
+          headers: authHeaders(cashierToken),
+          payload: { rail: "khqr", amountCents: 250, currencyCode: "USD" },
+        }),
+        app.inject({
+          method: "POST",
+          url: "/api/pos/payment-intents",
+          headers: authHeaders(cashierToken),
+          payload: { rail: "promptpay", amountCents: 49900 },
+        }),
+        app.inject({
+          method: "POST",
+          url: "/api/pos/payment-intents",
+          headers: authHeaders(cashierToken),
+          payload: { rail: "paynow", amountCents: 1850 },
+        }),
+      ]);
+      expect(khqrRes.statusCode).toBe(201);
+      expect(ppRes.statusCode).toBe(201);
+      expect(pnRes.statusCode).toBe(201);
+
+      const khqrIntent = khqrRes.json().intent as {
+        id: string;
+        billReference: string;
+        qrPayload: string;
+        status: string;
+      };
+      const ppIntent = ppRes.json().intent as { id: string; billReference: string; qrPayload: string };
+      const pnIntent = pnRes.json().intent as { id: string; billReference: string; qrPayload: string };
+      createdIntentIds.push(khqrIntent.id, ppIntent.id, pnIntent.id);
+
+      expect(parseEmvQrTlv(khqrIntent.qrPayload).valid).toBe(true);
+      expect(parseEmvQrTlv(ppIntent.qrPayload).rail).toBe("promptpay");
+      expect(parseEmvQrTlv(pnIntent.qrPayload).rail).toBe("paynow");
+      expect(khqrRes.json().qrMatrix.size).toBeGreaterThanOrEqual(29);
+
+      // Fetch a packaged item (e.g. BAKE-40010 Sourdough Loaf $4.95 -> split $2.50 KHQR + $2.45 KHR cash)
+      const loafScan = await app.inject({
+        method: "GET",
+        url: "/api/products/scan/40010",
+        headers: authHeaders(cashierToken),
+      });
+      expect(loafScan.statusCode).toBe(200);
+      const loaf = loafScan.json() as {
+        productId: string;
+        barcode: string;
+        sellPriceCents: number;
+      };
+
+      const loafTax = Math.round(loaf.sellPriceCents - (loaf.sellPriceCents * 10000) / 10700);
+      const unpaidSaleId = generateUuidV7();
+      // Attempting checkout with an UNPAID (pending) intent -> strictly 409 Conflict
+      const unpaidAttempt = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: {
+          id: unpaidSaleId,
+          receiptNo: `TEST-UNPAID-${unpaidSaleId.slice(-6)}`,
+          registerCode: "REG-01",
+          kind: "sale",
+          soldAt: new Date().toISOString(),
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: loaf.productId,
+              scannedBarcode: loaf.barcode,
+              packLabel: "750g Loaf",
+              packQty: 1,
+              qtyPacks: 1,
+              unitPriceCents: loaf.sellPriceCents,
+              discountCents: 0,
+              taxRateBp: 700,
+              taxCents: loafTax,
+              lineTotalCents: loaf.sellPriceCents,
+            },
+          ],
+          payments: [
+            {
+              id: generateUuidV7(),
+              method: "khqr",
+              amountCents: 250,
+              paymentIntentId: khqrIntent.id,
+            },
+            {
+              id: generateUuidV7(),
+              method: "cash",
+              amountCents: loaf.sellPriceCents - 250,
+              currencyCode: "KHR",
+              foreignAmount: 10000,
+              fxRateUsed: 4100,
+            },
+          ],
+        },
+      });
+      expect(unpaidAttempt.statusCode).toBe(409);
+
+      // Settle KHQR via sandbox simulate-settle & PromptPay via idempotent gateway webhook
+      const settleKhqr = await app.inject({
+        method: "POST",
+        url: `/api/pos/payment-intents/${khqrIntent.id}/simulate-settle`,
+        headers: authHeaders(cashierToken),
+        payload: {},
+      });
+      expect(settleKhqr.statusCode).toBe(200);
+      expect(settleKhqr.json().intent.status).toBe("paid");
+      const khqrExtRef = settleKhqr.json().intent.externalRef as string;
+      expect(khqrExtRef).toMatch(/^BAKONG-/);
+
+      const wh1 = await app.inject({
+        method: "POST",
+        url: "/api/pos/payment-intents/webhook",
+        payload: {
+          billReference: ppIntent.billReference,
+          externalRef: "BOT-PP-8841200",
+          status: "paid",
+          amountCents: 49900,
+        },
+      });
+      expect(wh1.statusCode).toBe(200);
+      expect(wh1.json().idempotent).toBe(false);
+      const wh2 = await app.inject({
+        method: "POST",
+        url: "/api/pos/payment-intents/webhook",
+        payload: {
+          billReference: ppIntent.billReference,
+          externalRef: "BOT-PP-8841200",
+          status: "paid",
+        },
+      });
+      expect(wh2.statusCode).toBe(200);
+      expect(wh2.json().idempotent).toBe(true);
+
+      // Complete split-tender sale ($2.50 KHQR + remainder dual-currency KHR cash)
+      const [loafBatchBefore] = await db
+        .select()
+        .from(inventoryBatches)
+        .where(eq(inventoryBatches.productId, loaf.productId))
+        .limit(1);
+
+      const splitSaleId = generateUuidV7();
+      const splitRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: {
+          id: splitSaleId,
+          receiptNo: `TEST-SPLIT-${splitSaleId.slice(-6)}`,
+          registerCode: "REG-01",
+          kind: "sale",
+          soldAt: new Date().toISOString(),
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: loaf.productId,
+              scannedBarcode: loaf.barcode,
+              packLabel: "750g Loaf",
+              packQty: 1,
+              qtyPacks: 1,
+              unitPriceCents: loaf.sellPriceCents,
+              discountCents: 0,
+              taxRateBp: 700,
+              taxCents: loafTax,
+              lineTotalCents: loaf.sellPriceCents,
+            },
+          ],
+          payments: [
+            {
+              id: generateUuidV7(),
+              method: "khqr",
+              amountCents: 250,
+              externalRef: khqrExtRef,
+              paymentIntentId: khqrIntent.id,
+              currencyCode: "USD",
+            },
+            {
+              id: generateUuidV7(),
+              method: "cash",
+              amountCents: loaf.sellPriceCents - 250,
+              tenderedCents: loaf.sellPriceCents - 250,
+              changeCents: 0,
+              currencyCode: "KHR",
+              foreignAmount: 10000,
+              fxRateUsed: 4100,
+            },
+          ],
+        },
+      });
+      expect(splitRes.statusCode).toBe(201);
+      createdSaleIds.push(splitSaleId);
+
+      const storedPays = await db
+        .select()
+        .from(salePayments)
+        .where(eq(salePayments.saleId, splitSaleId));
+      expect(storedPays).toHaveLength(2);
+      expect(storedPays.find((p) => p.method === "khqr")?.externalRef).toBe(khqrExtRef);
+      expect(storedPays.find((p) => p.method === "cash")?.foreignAmount).toBe(10000);
+
+      // Reusing the same settled paymentIntentId on another sale -> 409 Conflict
+      const replaySaleId = generateUuidV7();
+      const replayRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: {
+          id: replaySaleId,
+          receiptNo: `TEST-REPLAY-${replaySaleId.slice(-6)}`,
+          registerCode: "REG-01",
+          kind: "sale",
+          soldAt: new Date().toISOString(),
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: loaf.productId,
+              scannedBarcode: loaf.barcode,
+              packLabel: "750g Loaf",
+              packQty: 1,
+              qtyPacks: 1,
+              unitPriceCents: loaf.sellPriceCents,
+              discountCents: 0,
+              taxRateBp: 700,
+              taxCents: loafTax,
+              lineTotalCents: loaf.sellPriceCents,
+            },
+          ],
+          payments: [
+            {
+              id: generateUuidV7(),
+              method: "khqr",
+              amountCents: loaf.sellPriceCents,
+              paymentIntentId: khqrIntent.id,
+            },
+          ],
+        },
+      });
+      expect(replayRes.statusCode).toBe(409);
+
+      if (loafBatchBefore) {
+        await db
+          .update(inventoryBatches)
+          .set({ qtyRemaining: loafBatchBefore.qtyRemaining, status: loafBatchBefore.status })
+          .where(eq(inventoryBatches.id, loafBatchBefore.id));
+      }
+
+      // 3. Hold / Park & Recall Basket concurrency guard ([200, 409])
+      const parkRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/parked-baskets",
+        headers: authHeaders(cashierToken),
+        payload: {
+          registerCode: "REG-01",
+          customerLabel: "Shopper forgot wallet",
+          note: "Lane 1 hold",
+          subtotalCents: 495,
+          lines: [{ sku: "BAKE-40010", qtyPacks: 1 }],
+        },
+      });
+      expect(parkRes.statusCode).toBe(201);
+      const parkedId = parkRes.json().basket.id as string;
+      createdBasketIds.push(parkedId);
+      expect(parkRes.json().basket.holdCode).toMatch(/^HOLD-/);
+
+      const listParked = await app.inject({
+        method: "GET",
+        url: "/api/pos/parked-baskets",
+        headers: authHeaders(cashierToken),
+      });
+      expect(listParked.statusCode).toBe(200);
+      expect(
+        (listParked.json().baskets as { id: string }[]).some((b) => b.id === parkedId)
+      ).toBe(true);
+
+      const [recA, recB] = await Promise.all([
+        app.inject({
+          method: "POST",
+          url: `/api/pos/parked-baskets/${parkedId}/recall`,
+          headers: authHeaders(cashierToken),
+          payload: {},
+        }),
+        app.inject({
+          method: "POST",
+          url: `/api/pos/parked-baskets/${parkedId}/recall`,
+          headers: authHeaders(ownerToken),
+          payload: {},
+        }),
+      ]);
+      expect([recA.statusCode, recB.statusCode].sort()).toEqual([200, 409]);
+
+      // 4. In-Lane Supervisor PIN Override (RBAC, recall-override hard block, dual-actor audit log)
+      const recallOverrideBlocked = await app.inject({
+        method: "POST",
+        url: "/api/auth/verify-override",
+        headers: authHeaders(cashierToken),
+        payload: {
+          username: "owner",
+          pin: "1111",
+          actionType: "recall_override",
+          reason: "Customer insists on buying recalled item",
+        },
+      });
+      expect(recallOverrideBlocked.statusCode).toBe(403);
+
+      const cashierSelfOverride = await app.inject({
+        method: "POST",
+        url: "/api/auth/verify-override",
+        headers: authHeaders(cashierToken),
+        payload: {
+          username: "cashier1",
+          pin: "1234",
+          actionType: "no_sale_drawer",
+          reason: "Need change",
+        },
+      });
+      expect(cashierSelfOverride.statusCode).toBe(403);
+
+      const managerOverride = await app.inject({
+        method: "POST",
+        url: "/api/auth/verify-override",
+        headers: authHeaders(cashierToken),
+        payload: {
+          username: "manager",
+          pin: "9999",
+          actionType: "no_sale_drawer",
+          reason: "Customer coin change request",
+          registerCode: "REG-01",
+        },
+      });
+      expect(managerOverride.statusCode).toBe(200);
+      expect(managerOverride.json().approved).toBe(true);
+      expect(managerOverride.json().supervisorRole).toBe("manager");
+      const overrideId = managerOverride.json().overrideId as string;
+
+      const [auditRow] = await db
+        .select()
+        .from(auditLogs)
+        .where(eq(auditLogs.entityId, overrideId))
+        .limit(1);
+      expect(auditRow?.action).toBe("no_sale_drawer");
+      expect((auditRow?.detailsJson as { cashierName?: string; supervisorName?: string })?.supervisorName).toContain(
+        "Priya Patel"
+      );
+      await db.delete(auditLogs).where(eq(auditLogs.entityId, overrideId));
+    } finally {
+      if (createdIntentIds.length > 0) {
+        await db.delete(paymentIntents).where(inArray(paymentIntents.id, createdIntentIds));
+        await db.delete(auditLogs).where(inArray(auditLogs.entityId, createdIntentIds));
+      }
+      if (createdSaleIds.length > 0) {
+        await cleanupSales(createdSaleIds);
+      }
+      if (createdBasketIds.length > 0) {
+        await db.delete(parkedBaskets).where(inArray(parkedBaskets.id, createdBasketIds));
+        await db.delete(auditLogs).where(inArray(auditLogs.entityId, createdBasketIds));
+      }
+    }
+  });
 });
+
 
 

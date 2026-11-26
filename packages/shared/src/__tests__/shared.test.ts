@@ -733,4 +733,129 @@ describe("Milestone 1: Fresh produce, scale barcodes (GS1 20-29), weighted prici
   });
 });
 
+describe("Milestone 2: SE Asia EMVCo QR (KHQR / PromptPay / PayNow), QR Matrix & Dual-Currency Math", () => {
+  it("computes standard EMVCo CRC-16/CCITT-FALSE and encodes valid KHQR (USD & KHR), PromptPay (THB), and PayNow (SGD) payloads", async () => {
+    const {
+      buildKhqrPayload,
+      buildPayNowPayload,
+      buildPromptPayPayload,
+      crc16CcittFalse,
+      generateQrMatrix,
+      parseEmvQrTlv,
+      convertFromSecondaryToPrimaryCents,
+      convertToSecondaryCurrency,
+      formatCurrency,
+      CreatePaymentIntentSchema,
+      VerifySupervisorOverrideSchema,
+    } = await import("../index.js");
+
+    // Standard CRC-16/CCITT-FALSE check vector ("123456789" -> 0x29B1)
+    expect(crc16CcittFalse("123456789")).toBe("29B1");
+
+    // 1. Bakong KHQR (USD Tag 30 merchant + Tag 99 expiry + CRC-16)
+    const khqrUsd = buildKhqrPayload({
+      accountId: "flagship_market@aba",
+      merchantId: "MERCH-88412",
+      acquiringBank: "ABA Bank",
+      merchantName: "Flagship Supermarket",
+      merchantCity: "Phnom Penh",
+      currencyCode: "USD",
+      amountMinorUnits: 1445,
+      billReference: "REG01-9911",
+    });
+    const parsedKhqr = parseEmvQrTlv(khqrUsd.payload);
+    expect(parsedKhqr.valid).toBe(true);
+    expect(parsedKhqr.crcValid).toBe(true);
+    expect(parsedKhqr.rail).toBe("khqr");
+    expect(parsedKhqr.currencyNumeric).toBe("840");
+    expect(parsedKhqr.amount).toBe("14.45");
+    expect(parsedKhqr.billReference).toBe("REG01-9911");
+    expect(parsedKhqr.tags["30"]).toContain("flagship_market@aba");
+    expect(parsedKhqr.tags["99"]).toBeTruthy();
+
+    // Tampered CRC must fail validation
+    const tampered = `${khqrUsd.payload.slice(0, -1)}${khqrUsd.crc16.endsWith("A") ? "B" : "A"}`;
+    expect(parseEmvQrTlv(tampered).valid).toBe(false);
+    expect(parseEmvQrTlv(tampered).crcValid).toBe(false);
+
+    // 2. Bakong KHQR (KHR zero-decimal)
+    const khqrKhr = buildKhqrPayload({
+      accountId: "flagship_market@aba",
+      merchantName: "Flagship Supermarket",
+      currencyCode: "KHR",
+      amountMinorUnits: 59200,
+      billReference: "REG01-KHR1",
+    });
+    const parsedKhr = parseEmvQrTlv(khqrKhr.payload);
+    expect(parsedKhr.valid).toBe(true);
+    expect(parsedKhr.currencyNumeric).toBe("116");
+    expect(parsedKhr.amount).toBe("59200");
+
+    // 3. Thailand BOT PromptPay (AID A000000677010111, THB 764, mobile normalized to 0066...)
+    const pp = buildPromptPayPayload({
+      proxy: "081-234-5678",
+      merchantName: "Flagship Bangkok",
+      amountMinorUnits: 49950,
+      billReference: "PP-2026-01",
+    });
+    const parsedPp = parseEmvQrTlv(pp.payload);
+    expect(parsedPp.valid).toBe(true);
+    expect(parsedPp.rail).toBe("promptpay");
+    expect(parsedPp.currencyNumeric).toBe("764");
+    expect(parsedPp.amount).toBe("499.50");
+    expect(parsedPp.tags["29"]).toContain("A000000677010111");
+    expect(parsedPp.tags["29"]).toContain("0066812345678");
+
+    // 4. Singapore ABS PayNow (Tag 26 SG.PAYNOW, UEN proxy, non-editable locked amount, SGD 702)
+    const pn = buildPayNowPayload({
+      proxy: "202612345K",
+      merchantName: "Flagship SG",
+      amountMinorUnits: 2890,
+      billReference: "PN-2026-01",
+      expiryDateYyyymmdd: "20261231",
+    });
+    const parsedPn = parseEmvQrTlv(pn.payload);
+    expect(parsedPn.valid).toBe(true);
+    expect(parsedPn.rail).toBe("paynow");
+    expect(parsedPn.currencyNumeric).toBe("702");
+    expect(parsedPn.amount).toBe("28.90");
+    expect(parsedPn.tags["26"]).toContain("SG.PAYNOW");
+    expect(parsedPn.tags["26"]).toContain("202612345K");
+
+    // 5. ISO/IEC 18004 QR Matrix generation checks (finder patterns, timing, dark module, capacity)
+    const qr = generateQrMatrix(khqrUsd.payload);
+    expect(qr.version).toBeGreaterThanOrEqual(4);
+    expect(qr.size).toBe(qr.version * 4 + 17);
+    expect(qr.modules).toHaveLength(qr.size);
+    // Top-left 7x7 finder outer border + 3x3 inner core must be dark
+    expect(qr.modules[0][0]).toBe(true);
+    expect(qr.modules[3][3]).toBe(true);
+    expect(qr.modules[1][1]).toBe(false);
+    // Mandatory dark module at (size - 8, 8)
+    expect(qr.modules[qr.size - 8][8]).toBe(true);
+
+    // 6. Dual-currency USD <-> KHR conversion & formatting
+    expect(convertToSecondaryCurrency(1445, 4100, 100)).toBe(59200);
+    expect(convertFromSecondaryToPrimaryCents(41000, 4100)).toBe(1000);
+    expect(formatCurrency(59200, "KHR")).toBe("59,200 ៛");
+    expect(formatCurrency(1445, "USD")).toBe("$14.45");
+    expect(formatCurrency(2890, "SGD")).toBe("S$28.90");
+    expect(formatCurrency(49950, "THB")).toBe("฿499.50");
+
+    // 7. Milestone 2 schemas
+    expect(
+      CreatePaymentIntentSchema.safeParse({ rail: "khqr", amountCents: 1445 }).success
+    ).toBe(true);
+    expect(
+      VerifySupervisorOverrideSchema.safeParse({
+        username: "manager",
+        pin: "9999",
+        actionType: "no_sale_drawer",
+        reason: "Change coins for customer",
+      }).success
+    ).toBe(true);
+  });
+});
+
+
 

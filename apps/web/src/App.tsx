@@ -641,6 +641,7 @@ export function App() {
                 key={`adm-${refreshTick}`}
                 userRole={user.role}
                 currentUsername={user.username}
+                onSettingsSaved={() => setPosCatalogTick((t) => t + 1)}
               />
             )}
           </Suspense>

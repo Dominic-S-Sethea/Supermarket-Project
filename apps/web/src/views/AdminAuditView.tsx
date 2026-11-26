@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { formatMoney } from "@supermarket/shared/money";
 import {
@@ -11,12 +11,17 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  Store,
   UserPlus,
   Users,
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
 import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
+
+const StoreSettingsTab = lazy(() =>
+  import("../components/StoreSettingsTab").then((m) => ({ default: m.StoreSettingsTab }))
+);
 
 interface StaffUserRow {
   id: string;
@@ -98,7 +103,7 @@ interface PipelineRunRow {
   dqChecksJson: PipelineDqCheck[];
 }
 
-type AdminSubTab = "audit" | "reconciliation" | "pipeline" | "users" | "security";
+type AdminSubTab = "audit" | "reconciliation" | "pipeline" | "users" | "settings" | "security";
 
 const EXPORT_CARDS: {
   title: string;
@@ -141,18 +146,21 @@ const EXPORT_CARDS: {
 export function AdminAuditView({
   userRole,
   currentUsername,
+  onSettingsSaved,
 }: {
   userRole: UserRole;
   currentUsername: string;
+  onSettingsSaved?: () => void;
 }) {
   const isOwner = userRole === "owner";
-  const allowedSubTabs: AdminSubTab[] = useMemo(
-    () =>
-      isOwner
-        ? ["users", "audit", "reconciliation", "pipeline", "security"]
-        : ["audit", "reconciliation", "pipeline", "security"],
-    [isOwner]
-  );
+  const canManageSettings = userRole === "owner" || userRole === "manager";
+  const allowedSubTabs: AdminSubTab[] = useMemo(() => {
+    const tabs: AdminSubTab[] = [];
+    if (isOwner) tabs.push("users");
+    if (canManageSettings) tabs.push("settings");
+    tabs.push("audit", "reconciliation", "pipeline", "security");
+    return tabs;
+  }, [isOwner, canManageSettings]);
   const resolveSubTab = (): AdminSubTab => {
     const fromUrl = readQueryParam("sub") as AdminSubTab | null;
     if (fromUrl && allowedSubTabs.includes(fromUrl)) return fromUrl;
@@ -447,6 +455,20 @@ export function AdminAuditView({
                       label: (
                         <>
                           <Users size={14} aria-hidden="true" /> Staff &amp; Sessions
+                        </>
+                      ),
+                    },
+                  ]
+                : []),
+              ...(canManageSettings
+                ? [
+                    {
+                      id: "settings" as const,
+                      elementId: "admin-subtab-settings",
+                      panelId: "admin-panel-settings",
+                      label: (
+                        <>
+                          <Store size={14} aria-hidden="true" /> Store &amp; QR Rails
                         </>
                       ),
                     },
@@ -1237,6 +1259,12 @@ export function AdminAuditView({
             </button>
           </form>
         </section>
+      )}
+
+      {subTab === "settings" && canManageSettings && (
+        <Suspense fallback={<div className="panel">Loading store &amp; QR rail settings...</div>}>
+          <StoreSettingsTab onSaved={onSettingsSaved} />
+        </Suspense>
       )}
       </div>
     </div>

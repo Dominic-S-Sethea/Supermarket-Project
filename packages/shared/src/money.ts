@@ -241,3 +241,63 @@ export function computeLegalUnitPrice(
   }
   return null;
 }
+
+/**
+ * Convert primary minor units (e.g. USD cents) into secondary currency units
+ * (e.g. Cambodian KHR whole riel) with configurable rounding step (e.g. 100 KHR).
+ */
+export function convertToSecondaryCurrency(
+  primaryCents: number,
+  fxRate: number,
+  roundingStep = 100,
+  secondaryZeroDecimal = true
+): number {
+  if (!Number.isFinite(primaryCents) || !Number.isFinite(fxRate) || fxRate <= 0) return 0;
+  const raw = secondaryZeroDecimal ? (primaryCents / 100) * fxRate : primaryCents * fxRate;
+  const step = Number.isFinite(roundingStep) && roundingStep > 0 ? roundingStep : 1;
+  return Math.round(raw / step) * step;
+}
+
+/**
+ * Convert secondary currency tendered amount (e.g. 41,000 KHR) back into primary cents (e.g. 1,000 USD cents).
+ */
+export function convertFromSecondaryToPrimaryCents(
+  secondaryAmount: number,
+  fxRate: number,
+  secondaryZeroDecimal = true
+): number {
+  if (!Number.isFinite(secondaryAmount) || !Number.isFinite(fxRate) || fxRate <= 0) return 0;
+  const rawCents = secondaryZeroDecimal
+    ? (secondaryAmount / fxRate) * 100
+    : secondaryAmount / fxRate;
+  return Math.round(rawCents);
+}
+
+const CURRENCY_SYMBOLS: Record<string, { symbol: string; zeroDecimal?: boolean; suffix?: boolean }> = {
+  USD: { symbol: "$" },
+  EUR: { symbol: "€" },
+  SGD: { symbol: "S$" },
+  THB: { symbol: "฿" },
+  KHR: { symbol: "៛", zeroDecimal: true, suffix: true },
+};
+
+/**
+ * Format an integer minor-unit amount (or whole riel for KHR) in the specified currency code.
+ */
+export function formatCurrency(amountInt: number, currencyCode = "USD"): string {
+  const safe = Number.isFinite(amountInt) ? Math.round(amountInt) : 0;
+  const code = currencyCode.toUpperCase();
+  const meta = CURRENCY_SYMBOLS[code] ?? { symbol: `${code} ` };
+  const sign = safe < 0 ? "-" : "";
+  const abs = Math.abs(safe);
+  if (meta.zeroDecimal) {
+    const formatted = abs.toLocaleString("en-US");
+    return meta.suffix ? `${sign}${formatted} ${meta.symbol}` : `${sign}${meta.symbol}${formatted}`;
+  }
+  const formatted = (abs / 100).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return `${sign}${meta.symbol}${formatted}`;
+}
+

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { normalizePluCode, parseScaleBarcode } from "@supermarket/shared/barcodes";
-import type { UnitMode, UserRole } from "@supermarket/shared/dtos";
+import type { ParkedBasketDto, StoreSettingsDto, UnitMode, UserRole } from "@supermarket/shared/dtos";
 import {
   computeWeightedPriceCents,
+  convertToSecondaryCurrency,
   deriveWeightFromPriceGrams,
   formatBp,
+  formatCurrency,
   formatMeasure,
   formatMoney,
   generateUuidV7,
@@ -16,17 +18,30 @@ import {
   CreditCard,
   DollarSign,
   History,
+  KeyRound,
+  Monitor,
+  PauseCircle,
   Play,
+  QrCode,
   Receipt,
   RefreshCw,
   Scale,
   ShieldCheck,
   Sparkles,
+  Split,
   Trash2,
   Wifi,
 } from "lucide-react";
-import { ApiError, apiGet, apiPost } from "../api";
+import { ApiError, apiDelete, apiGet, apiPost } from "../api";
+import { PosCheckoutModal, type CheckoutTab } from "../components/PosCheckoutModal";
 import { PosFreshPluModal, type FreshPluItem } from "../components/PosFreshPluModal";
+import {
+  mapServerParkedBasket,
+  PosParkedBasketsModal,
+  PosSupervisorOverrideModal,
+  type LocalOrServerParkedBasket,
+  type SupervisorOverrideResult,
+} from "../components/PosHoldAndOverrideModals";
 import { PosLoyaltyCard, type AppliedCoupon, type PosCustomer } from "../components/PosLoyaltyCard";
 import {
   AgeVerificationModal,
@@ -39,19 +54,23 @@ import {
   type ZReportSummary,
 } from "../components/PosModals";
 import { PosScanBar } from "../components/PosScanBar";
+import { publishCfdState, type CfdActiveQr } from "../lib/cfdChannel";
 import {
   appendDeadLetterSale,
   classifySaleSyncError,
   enqueueOfflineSale,
   loadDeadLetterQueue,
+  loadLocalParkedBaskets,
   loadOfflineQueue,
   loadPosCache,
   mapBootstrapPromotions,
   removeDeadLetterSale,
+  saveLocalParkedBaskets,
   saveOfflineQueue,
   savePosCache,
   type DeadLetterPosSale,
   type PosBootstrapSnapshot,
+  type QueuedPosPayment,
   type QueuedPosSale,
 } from "../lib/posCache";
 
@@ -143,6 +162,23 @@ export function PosTerminalView({
   );
   const [showDeadLetterModal, setShowDeadLetterModal] = useState(false);
 
+  // Milestone 2: Store Settings, Split Tender / EMVCo QR Checkout, Hold/Recall & Supervisor PIN
+  const [storeSettings, setStoreSettings] = useState<StoreSettingsDto | null>(null);
+  const [showCheckoutModal, setShowCheckoutModal] = useState(false);
+  const [checkoutInitialTab, setCheckoutInitialTab] = useState<CheckoutTab>("qr");
+  const [activeCfdQr, setActiveCfdQr] = useState<CfdActiveQr | null>(null);
+  const [lastCompletedReceiptNo, setLastCompletedReceiptNo] = useState<string | null>(null);
+
+  const [showParkedModal, setShowParkedModal] = useState(false);
+  const [parkedBaskets, setParkedBaskets] = useState<LocalOrServerParkedBasket[]>([]);
+  const [loadingParked, setLoadingParked] = useState(false);
+  const [busyParkedId, setBusyParkedId] = useState<string | null>(null);
+  const [parkedError, setParkedError] = useState<string | null>(null);
+
+  const [showSupervisorModal, setShowSupervisorModal] = useState(false);
+  const [supervisorOverrideBy, setSupervisorOverrideBy] = useState<string | null>(null);
+  const [supervisorBanner, setSupervisorBanner] = useState<string | null>(null);
+
   const scanRef = useRef<HTMLInputElement>(null);
   const flushLockRef = useRef(false);
   const saleLockRef = useRef(false);
@@ -152,12 +188,19 @@ export function PosTerminalView({
   offlineQueueRef.current = offlineQueue;
   simulatedOfflineRef.current = simulatedOffline;
 
-  // Reset age verification automatically whenever basket becomes empty
+  const handleActiveQrChange = useCallback((qr: CfdActiveQr | null) => {
+    setActiveCfdQr(qr);
+  }, []);
+
+  // Reset age verification automatically whenever basket becomes empty; clear paid receipt banner when ringing starts
   useEffect(() => {
     if (cart.length === 0 && ageVerified) {
       setAgeVerified(false);
     }
-  }, [cart.length, ageVerified]);
+    if (cart.length > 0 && lastCompletedReceiptNo) {
+      setLastCompletedReceiptNo(null);
+    }
+  }, [cart.length, ageVerified, lastCompletedReceiptNo]);
 
   const anyModalOpen = Boolean(
     pendingAgeItem ||
@@ -165,7 +208,10 @@ export function PosTerminalView({
       showShiftClose ||
       showShiftOpen ||
       showRecentReceipts ||
-      showDeadLetterModal
+      showDeadLetterModal ||
+      showCheckoutModal ||
+      showParkedModal ||
+      showSupervisorModal
   );
 
   // Re-focus barcode scanner input when POS tab becomes active and no modal is open
@@ -174,6 +220,45 @@ export function PosTerminalView({
       scanRef.current?.focus();
     }
   }, [isActive, anyModalOpen]);
+
+  const loadParkedBaskets = useCallback(async (signal?: AbortSignal) => {
+    const localRows: LocalOrServerParkedBasket[] = loadLocalParkedBaskets().map((b) => ({
+      ...b,
+      source: "local" as const,
+    }));
+    if (simulatedOfflineRef.current) {
+      if (!signal?.aborted) setParkedBaskets(localRows);
+      return;
+    }
+    setLoadingParked(true);
+    try {
+      const res = await apiGet<{ baskets: ParkedBasketDto[] }>("/api/pos/parked-baskets", signal);
+      if (!signal?.aborted) {
+        setParkedBaskets([...res.baskets.map(mapServerParkedBasket), ...localRows]);
+      }
+    } catch {
+      if (!signal?.aborted) {
+        setParkedBaskets(localRows);
+      }
+    } finally {
+      if (!signal?.aborted) setLoadingParked(false);
+    }
+  }, []);
+
+  // Global F6 shortcut to open Hold / Park & Recall Baskets modal
+  useEffect(() => {
+    if (!isActive || anyModalOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "F6") {
+        e.preventDefault();
+        setParkedError(null);
+        setShowParkedModal(true);
+        void loadParkedBaskets();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isActive, anyModalOpen, loadParkedBaskets]);
 
   const loadActiveShift = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -291,6 +376,9 @@ export function PosTerminalView({
       setTaxMap(tMap);
       setPromos(parsedPromos);
       setBasketRules(data.basketRules ?? []);
+      if (data.storeSettings) {
+        setStoreSettings(data.storeSettings);
+      }
       setSyncedAt(data.syncedAt);
       setCacheSource(source);
       setBootstrapError(null);
@@ -337,13 +425,14 @@ export function PosTerminalView({
     [hydrateFromSnapshot]
   );
 
-  // Initial load + active shift hydration
+  // Initial load + active shift & parked baskets hydration
   useEffect(() => {
     const controller = new AbortController();
     void loadBootstrap(controller.signal);
     void loadActiveShift(controller.signal);
+    void loadParkedBaskets(controller.signal);
     return () => controller.abort();
-  }, [loadBootstrap, loadActiveShift]);
+  }, [loadBootstrap, loadActiveShift, loadParkedBaskets]);
 
   // Refresh POS catalog/promos in place whenever Catalog or AI Copilot executes a mutation (H-17)
   useEffect(() => {
@@ -404,6 +493,50 @@ export function PosTerminalView({
       }),
     [cart, promos, evalHour, couponEligibleNow, appliedCoupon]
   );
+
+  // Live Customer-Facing Display (/customer-display) BroadcastChannel + localStorage mirror
+  useEffect(() => {
+    const status =
+      activeCfdQr && activeCfdQr.status === "pending"
+        ? "awaiting_qr"
+        : evaluated.lines.length > 0
+          ? "ringing"
+          : lastCompletedReceiptNo
+            ? "paid"
+            : "idle";
+
+    publishCfdState({
+      storeName: storeSettings?.storeName ?? "SupermarketOS Flagship Market",
+      receiptHeader:
+        storeSettings?.receiptHeader ?? "Fresh Produce · Meat · Deli · Bakery · Packaged FMCG",
+      receiptFooter:
+        storeSettings?.receiptFooter ?? "Thank you for shopping at SupermarketOS Flagship!",
+      registerCode: "REG-01",
+      cashierName,
+      primaryCurrency: storeSettings?.primaryCurrency ?? "USD",
+      secondaryCurrency: storeSettings?.secondaryCurrency ?? "KHR",
+      secondaryFxRate: storeSettings?.secondaryFxRate ?? 4100,
+      secondaryRoundingStep: storeSettings?.secondaryRoundingStep ?? 100,
+      status,
+      lines: evaluated.lines.map((l) => ({
+        lineKey: l.lineKey,
+        name: l.name,
+        packLabel: l.packLabel,
+        qtyPacks: l.qtyPacks,
+        weightGrams: l.weightGrams ?? null,
+        unitMode: l.unitMode,
+        lineTotalCents: l.lineTotalCents,
+        discountCents: l.discountCents,
+      })),
+      subtotalCents: evaluated.subtotalBeforeDiscountCents,
+      discountCents: evaluated.totalDiscountCents,
+      taxCents: evaluated.totalTaxCents,
+      grandTotalCents: evaluated.grandTotalCents,
+      activeQr: activeCfdQr,
+      lastReceiptNo: lastCompletedReceiptNo,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [evaluated, storeSettings, cashierName, activeCfdQr, lastCompletedReceiptNo]);
 
   // Offline-safe Basket Upsell Nudges derived from cached analytics_basket_rules
   const upsellSuggestions = useMemo(() => {
@@ -730,21 +863,55 @@ export function PosTerminalView({
     setDeadLetterQueue(nextDlq);
   };
 
+  const primaryCurrency = storeSettings?.primaryCurrency ?? "USD";
+  const secondaryCurrency = storeSettings?.secondaryCurrency ?? "KHR";
+  const secondaryFxRate = storeSettings?.secondaryFxRate ?? 4100;
+  const secondaryRoundingStep = storeSettings?.secondaryRoundingStep ?? 100;
+
   const buildPaperReceipt = (
     receiptNo: string,
     saleId: string,
-    method: "cash" | "card" | "mobile_pay",
-    statusTag: "[OFFLINE QUEUED]" | "[SYNCED]"
+    payments: QueuedPosPayment[],
+    statusTag: "[OFFLINE QUEUED]" | "[SYNCED]",
+    overrideActor: string | null
   ): string => {
     const hasExclusiveTax = cart.some((c) => !c.taxInclusive && c.taxRateBp > 0);
     const taxLabel = hasExclusiveTax ? "Tax (Incl./Excl.):  " : "Included Tax:       ";
+    const storeTitle = (storeSettings?.storeName ?? "SUPERMARKET OS — LANE 01").toUpperCase();
+    const secondaryTotalLine =
+      secondaryCurrency && evaluated.grandTotalCents > 0
+        ? `Equiv (${secondaryCurrency} @ ${secondaryFxRate.toLocaleString()}): ${formatCurrency(
+            convertToSecondaryCurrency(
+              evaluated.grandTotalCents,
+              secondaryFxRate,
+              secondaryRoundingStep
+            ),
+            secondaryCurrency
+          )}`
+        : "";
+    const paymentLines = payments.map((p) => {
+      const label = p.method.toUpperCase();
+      const fxSuffix =
+        p.foreignAmount && secondaryCurrency
+          ? ` (${formatCurrency(p.foreignAmount, secondaryCurrency)} @ ${p.fxRateUsed ?? secondaryFxRate})`
+          : "";
+      const refSuffix = p.externalRef ? ` [${p.externalRef}]` : "";
+      const chgSuffix =
+        p.changeCents && p.changeCents > 0
+          ? ` | Chg ${formatCurrency(p.changeCents, primaryCurrency)}`
+          : "";
+      return `  ${label.padEnd(14)} ${formatCurrency(p.amountCents, primaryCurrency).padStart(10)}${fxSuffix}${refSuffix}${chgSuffix}`;
+    });
     return [
-      "        SUPERMARKET OS — LANE 01        ",
+      storeTitle,
+      storeSettings?.address ?? "",
+      storeSettings?.taxId ? `Tax ID: ${storeSettings.taxId}` : "",
       `Receipt: ${receiptNo}   ${statusTag}`,
       `Cashier: ${cashierName}   ${new Date().toLocaleTimeString()}`,
       attachedCustomer
         ? `Loyalty: ${attachedCustomer.fullName} (${attachedCustomer.phone})`
         : "",
+      overrideActor ? `Supervisor Auth: ${overrideActor}` : "",
       "----------------------------------------",
       ...evaluated.lines.map((l) => {
         const isWeighted =
@@ -764,9 +931,13 @@ export function PosTerminalView({
         ? `Coupon Applied:     ${appliedCoupon.code.padStart(20)}`
         : "",
       `${taxLabel}${formatMoney(evaluated.totalTaxCents).padStart(20)}`,
-      `TOTAL PAID (${method.toUpperCase()}): ${formatMoney(evaluated.grandTotalCents).padStart(16)}`,
+      `TOTAL PAID:         ${formatCurrency(evaluated.grandTotalCents, primaryCurrency).padStart(20)}`,
+      secondaryTotalLine,
+      "Tenders:",
+      ...paymentLines,
       evaluated.requiresAgeCheck ? "** ALCOHOL AGE VERIFIED (ID CHECKED) **" : "",
       "----------------------------------------",
+      storeSettings?.receiptFooter ?? "",
       `Client UUIDv7: ${saleId.slice(0, 18)}...`,
     ]
       .filter(Boolean)
@@ -824,8 +995,8 @@ export function PosTerminalView({
     }
   };
 
-  const completeSale = async (method: "cash" | "card" | "mobile_pay") => {
-    if (evaluated.lines.length === 0 || saleLockRef.current) return;
+  const completeSaleWithPayments = async (payments: QueuedPosPayment[]) => {
+    if (evaluated.lines.length === 0 || payments.length === 0 || saleLockRef.current) return;
     saleLockRef.current = true;
     setSubmittingSale(true);
     setSyncError(null);
@@ -846,6 +1017,7 @@ export function PosTerminalView({
         ageVerified: evaluated.requiresAgeCheck && ageVerified,
         customerId: attachedCustomer?.id ?? null,
         couponCode: couponEligibleNow && appliedCoupon ? appliedCoupon.code : null,
+        supervisorOverrideBy,
         lines: evaluated.lines.map((l) => ({
           id: generateUuidV7(),
           productId: l.productId,
@@ -862,26 +1034,22 @@ export function PosTerminalView({
           taxCents: l.taxCents,
           lineTotalCents: l.lineTotalCents,
         })),
-        payments: [
-          {
-            id: generateUuidV7(),
-            method,
-            amountCents: evaluated.grandTotalCents,
-            tenderedCents: evaluated.grandTotalCents,
-            changeCents: 0,
-          },
-        ],
+        payments,
       };
 
       if (simulatedOffline) {
         const nextQueue = enqueueOfflineSale(payload);
         setOfflineQueue(nextQueue);
-        setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[OFFLINE QUEUED]"));
+        setReceiptPreview(
+          buildPaperReceipt(receiptNo, saleId, payments, "[OFFLINE QUEUED]", supervisorOverrideBy)
+        );
         setSyncMessage(`Saved offline locally (${receiptNo}). Checkout uninterrupted!`);
       } else {
         try {
           const res = await apiPost<{ pointsEarned?: number }>("/api/pos/sales", payload);
-          setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[SYNCED]"));
+          setReceiptPreview(
+            buildPaperReceipt(receiptNo, saleId, payments, "[SYNCED]", supervisorOverrideBy)
+          );
           const ptsNote =
             res.pointsEarned && res.pointsEarned > 0
               ? ` (+${res.pointsEarned} loyalty pts earned)`
@@ -896,7 +1064,9 @@ export function PosTerminalView({
           }
           const nextQueue = enqueueOfflineSale(payload);
           setOfflineQueue(nextQueue);
-          setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[OFFLINE QUEUED]"));
+          setReceiptPreview(
+            buildPaperReceipt(receiptNo, saleId, payments, "[OFFLINE QUEUED]", supervisorOverrideBy)
+          );
           if (kind === "auth") {
             setSyncError(`Session expired — ${receiptNo} queued safely offline until you sign back in.`);
           } else {
@@ -910,11 +1080,159 @@ export function PosTerminalView({
       setAttachedCustomer(null);
       setAppliedCoupon(null);
       setCouponFeedback(null);
+      setSupervisorOverrideBy(null);
+      setActiveCfdQr(null);
+      setShowCheckoutModal(false);
+      setLastCompletedReceiptNo(receiptNo);
       scanRef.current?.focus();
     } finally {
       saleLockRef.current = false;
       setSubmittingSale(false);
     }
+  };
+
+  const completeQuickSale = async (method: "cash" | "card") => {
+    await completeSaleWithPayments([
+      {
+        id: generateUuidV7(),
+        method,
+        amountCents: evaluated.grandTotalCents,
+        tenderedCents: evaluated.grandTotalCents,
+        changeCents: 0,
+        currencyCode: primaryCurrency,
+      },
+    ]);
+  };
+
+  const handleParkCurrentBasket = async (customerLabel: string, note: string) => {
+    if (cart.length === 0 || busyParkedId) return;
+    setBusyParkedId("park");
+    setParkedError(null);
+    const persistLocal = () => {
+      const id = generateUuidV7();
+      const holdCode = `LOC-${id.slice(-4).toUpperCase()}`;
+      const existing = loadLocalParkedBaskets();
+      saveLocalParkedBaskets([
+        {
+          id,
+          holdCode,
+          registerCode: "REG-01",
+          cashierName,
+          customerLabel: customerLabel || null,
+          customerId: attachedCustomer?.id ?? null,
+          couponCode: appliedCoupon?.code ?? null,
+          linesJson: cart,
+          subtotalCents: evaluated.grandTotalCents,
+          itemCount: cart.length,
+          note: note || null,
+          parkedAt: new Date().toISOString(),
+        },
+        ...existing,
+      ]);
+      return holdCode;
+    };
+
+    try {
+      let holdCode: string;
+      if (simulatedOffline) {
+        holdCode = persistLocal();
+      } else {
+        try {
+          const res = await apiPost<{ basket: ParkedBasketDto }>("/api/pos/parked-baskets", {
+            registerCode: "REG-01",
+            customerLabel: customerLabel || null,
+            customerId: attachedCustomer?.id ?? null,
+            couponCode: appliedCoupon?.code ?? null,
+            note: note || null,
+            lines: cart,
+            subtotalCents: evaluated.grandTotalCents,
+          });
+          holdCode = res.basket.holdCode;
+        } catch {
+          holdCode = persistLocal();
+        }
+      }
+      setCart([]);
+      setAgeVerified(false);
+      setAttachedCustomer(null);
+      setAppliedCoupon(null);
+      setCouponFeedback(null);
+      setSupervisorOverrideBy(null);
+      setSyncMessage(`Parked active basket as ${holdCode}. Ready for next shopper!`);
+      await loadParkedBaskets();
+      setShowParkedModal(false);
+      scanRef.current?.focus();
+    } catch (err) {
+      setParkedError(err instanceof Error ? err.message : "Failed parking active basket.");
+    } finally {
+      setBusyParkedId(null);
+    }
+  };
+
+  const handleRecallBasket = async (basket: LocalOrServerParkedBasket) => {
+    if (busyParkedId) return;
+    setBusyParkedId(basket.id);
+    setParkedError(null);
+    try {
+      let recalledLines = basket.linesJson;
+      if (basket.source === "server") {
+        const res = await apiPost<{ basket: ParkedBasketDto }>(
+          `/api/pos/parked-baskets/${basket.id}/recall`,
+          {}
+        );
+        recalledLines = res.basket.linesJson;
+      } else {
+        const remaining = loadLocalParkedBaskets().filter((b) => b.id !== basket.id);
+        saveLocalParkedBaskets(remaining);
+      }
+      setCart(recalledLines as CartInputLine[]);
+      setLastCompletedReceiptNo(null);
+      setSyncMessage(`Recalled parked basket ${basket.holdCode} (${recalledLines.length} line(s)).`);
+      await loadParkedBaskets();
+      setShowParkedModal(false);
+      scanRef.current?.focus();
+    } catch (err) {
+      setParkedError(err instanceof Error ? err.message : "Failed recalling parked basket.");
+      await loadParkedBaskets();
+    } finally {
+      setBusyParkedId(null);
+    }
+  };
+
+  const handleDiscardBasket = async (basket: LocalOrServerParkedBasket) => {
+    if (busyParkedId) return;
+    setBusyParkedId(basket.id);
+    setParkedError(null);
+    try {
+      if (basket.source === "server") {
+        await apiDelete(`/api/pos/parked-baskets/${basket.id}`);
+      } else {
+        const remaining = loadLocalParkedBaskets().filter((b) => b.id !== basket.id);
+        saveLocalParkedBaskets(remaining);
+      }
+      await loadParkedBaskets();
+    } catch (err) {
+      setParkedError(err instanceof Error ? err.message : "Failed discarding parked basket.");
+    } finally {
+      setBusyParkedId(null);
+    }
+  };
+
+  const handleSupervisorApproved = (res: SupervisorOverrideResult, reason: string) => {
+    const label = res.actionType.replace(/_/g, " ").toUpperCase();
+    if (res.actionType === "basket_void") {
+      setCart([]);
+      setAgeVerified(false);
+      setSupervisorOverrideBy(null);
+    } else if (res.actionType === "line_void") {
+      setCart((prev) => prev.slice(0, -1));
+      setSupervisorOverrideBy(res.supervisorName);
+    } else if (res.actionType === "price_override") {
+      setSupervisorOverrideBy(res.supervisorName);
+    }
+    setSupervisorBanner(
+      `Supervisor Override Approved (${label}) by ${res.supervisorName} [${res.supervisorRole}] — "${reason}" · Audit #${res.overrideId.slice(0, 8)}`
+    );
   };
 
   const handleOpenShift = async () => {
@@ -1098,6 +1416,36 @@ export function PosTerminalView({
           >
             <Scale size={14} aria-hidden="true" /> Fresh PLU / Scale ({freshPluItems.length})
           </button>
+          <button
+            id="open-parked-baskets-btn"
+            type="button"
+            className="btn"
+            onClick={() => {
+              setParkedError(null);
+              setShowParkedModal(true);
+              void loadParkedBaskets();
+            }}
+          >
+            <PauseCircle size={14} aria-hidden="true" /> Hold / Recall (F6)
+            {parkedBaskets.length > 0 ? ` (${parkedBaskets.length})` : ""}
+          </button>
+          <button
+            id="open-supervisor-override-btn"
+            type="button"
+            className="btn"
+            onClick={() => setShowSupervisorModal(true)}
+          >
+            <KeyRound size={14} aria-hidden="true" /> Supervisor PIN
+          </button>
+          <a
+            id="open-customer-display-btn"
+            href="/customer-display"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn"
+          >
+            <Monitor size={14} aria-hidden="true" /> Customer Display
+          </a>
           <select
             id="pos-daypart-select"
             aria-label="POS promotion clock daypart preview"
@@ -1190,6 +1538,15 @@ export function PosTerminalView({
         <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
           <span>{syncError}</span>
           <button type="button" className="btn btn-sm" onClick={() => setSyncError(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {supervisorBanner && (
+        <div id="supervisor-override-banner" className="banner banner-green" role="status" style={{ marginBottom: 12 }}>
+          <span>{supervisorBanner}</span>
+          <button type="button" className="btn btn-sm" onClick={() => setSupervisorBanner(null)}>
             Dismiss
           </button>
         </div>
@@ -1521,8 +1878,30 @@ export function PosTerminalView({
             )}
             <div className="total-row grand">
               <span>Total Due</span>
-              <span className="mono">{formatMoney(evaluated.grandTotalCents)}</span>
+              <span className="mono">{formatCurrency(evaluated.grandTotalCents, primaryCurrency)}</span>
             </div>
+            {secondaryCurrency && (
+              <div
+                id="pos-secondary-total"
+                className="total-row"
+                style={{ fontSize: 12, color: "var(--accent-primary-ink)", fontWeight: 600 }}
+              >
+                <span>
+                  Dual Currency ({secondaryCurrency} @ {secondaryFxRate.toLocaleString()})
+                </span>
+                <span className="mono">
+                  ≈{" "}
+                  {formatCurrency(
+                    convertToSecondaryCurrency(
+                      evaluated.grandTotalCents,
+                      secondaryFxRate,
+                      secondaryRoundingStep
+                    ),
+                    secondaryCurrency
+                  )}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="tender-grid">
@@ -1531,7 +1910,7 @@ export function PosTerminalView({
               type="button"
               className="btn btn-primary"
               disabled={evaluated.lines.length === 0 || submittingSale}
-              onClick={() => void completeSale("cash")}
+              onClick={() => void completeQuickSale("cash")}
             >
               <DollarSign size={14} aria-hidden="true" /> {submittingSale ? "Saving..." : "Cash"}
             </button>
@@ -1540,18 +1919,33 @@ export function PosTerminalView({
               type="button"
               className="btn btn-primary"
               disabled={evaluated.lines.length === 0 || submittingSale}
-              onClick={() => void completeSale("card")}
+              onClick={() => void completeQuickSale("card")}
             >
               <CreditCard size={14} aria-hidden="true" /> Card
             </button>
             <button
-              id="pos-pay-mobile-btn"
+              id="pos-pay-qr-btn"
               type="button"
               className="btn"
               disabled={evaluated.lines.length === 0 || submittingSale}
-              onClick={() => void completeSale("mobile_pay")}
+              onClick={() => {
+                setCheckoutInitialTab("qr");
+                setShowCheckoutModal(true);
+              }}
             >
-              Mobile Pay
+              <QrCode size={14} aria-hidden="true" /> KHQR / QR
+            </button>
+            <button
+              id="open-split-tender-btn"
+              type="button"
+              className="btn"
+              disabled={evaluated.lines.length === 0 || submittingSale}
+              onClick={() => {
+                setCheckoutInitialTab("cash");
+                setShowCheckoutModal(true);
+              }}
+            >
+              <Split size={14} aria-hidden="true" /> Split / {secondaryCurrency || "Multi"}
             </button>
           </div>
         </aside>
@@ -1640,6 +2034,40 @@ export function PosTerminalView({
           handleScanSubmit(code);
         }}
         onClose={() => setShowFreshPluModal(false)}
+      />
+
+      <PosCheckoutModal
+        open={showCheckoutModal}
+        initialTab={checkoutInitialTab}
+        grandTotalCents={evaluated.grandTotalCents}
+        storeSettings={storeSettings}
+        attachedCustomer={attachedCustomer}
+        simulatedOffline={simulatedOffline}
+        submittingSale={submittingSale}
+        onActiveQrChange={handleActiveQrChange}
+        onFinalizeSale={completeSaleWithPayments}
+        onClose={() => setShowCheckoutModal(false)}
+      />
+
+      <PosParkedBasketsModal
+        open={showParkedModal}
+        canParkCurrent={cart.length > 0}
+        currentItemCount={cart.length}
+        currentSubtotalCents={evaluated.grandTotalCents}
+        baskets={parkedBaskets}
+        loading={loadingParked}
+        busyId={busyParkedId}
+        error={parkedError}
+        onParkCurrent={handleParkCurrentBasket}
+        onRecall={handleRecallBasket}
+        onDiscard={handleDiscardBasket}
+        onClose={() => setShowParkedModal(false)}
+      />
+
+      <PosSupervisorOverrideModal
+        open={showSupervisorModal}
+        onApproved={handleSupervisorApproved}
+        onClose={() => setShowSupervisorModal(false)}
       />
     </div>
   );

@@ -586,5 +586,178 @@ describe("Flagship Milestone 1: PosFreshPluModal & FreshProductionTab", () => {
   });
 });
 
+describe("Flagship Milestone 2: QrCodeSvg, PosCheckoutModal & CustomerDisplayView", () => {
+  it("renders a crisp ISO/IEC 18004 SVG QR code with white quiet zone for a valid KHQR payload", async () => {
+    const { buildKhqrPayload } = await import("@supermarket/shared/emvqr");
+    const { QrCodeSvg } = await import("../components/QrCodeSvg");
+
+    const khqr = buildKhqrPayload({
+      accountId: "supermarket_flagship@aclb",
+      merchantName: "SUPERMARKET OS",
+      merchantCity: "PHNOM PENH",
+      currencyCode: "USD",
+      amountMinorUnits: 1250,
+      billReference: "REG01-TEST01",
+    });
+
+    const { container } = render(
+      <QrCodeSvg payload={khqr.payload} sizePx={200} label="KHQR payment QR for $12.50" />
+    );
+
+    const img = screen.getByRole("img", { name: "KHQR payment QR for $12.50" });
+    expect(img).toBeInTheDocument();
+    expect(container.querySelector("rect")?.getAttribute("fill")).toBe("#ffffff");
+    const pathD = container.querySelector("path")?.getAttribute("d") ?? "";
+    expect(pathD.length).toBeGreaterThan(200);
+  });
+
+  it("supports split tender combining dual-currency KHR cash and Card inside PosCheckoutModal", async () => {
+    const { PosCheckoutModal } = await import("../components/PosCheckoutModal");
+    const onFinalize = vi.fn().mockResolvedValue(undefined);
+    const onActiveQrChange = vi.fn();
+
+    render(
+      <PosCheckoutModal
+        open
+        initialTab="cash"
+        grandTotalCents={1000}
+        storeSettings={{
+          id: "store-1",
+          storeCode: "FLAGSHIP",
+          legalName: "SupermarketOS Flagship Co., Ltd.",
+          storeName: "SupermarketOS Flagship Market",
+          address: "123 Norodom Blvd",
+          taxId: "K001-990011223",
+          primaryCurrency: "USD",
+          secondaryCurrency: "KHR",
+          secondaryFxRate: 4100,
+          secondaryRoundingStep: 100,
+          cashSkimLimitCents: 50000,
+          receiptHeader: "Fresh Daily",
+          receiptFooter: "Thank you!",
+          defaultQrRail: "khqr",
+          paymentProvider: "mock_sandbox",
+          khqrAccountId: "flagship@aclb",
+          khqrMerchantId: null,
+          khqrAcquiringBank: "ABA Bank",
+          khqrCity: "Phnom Penh",
+          promptpayProxy: "0812345678",
+          paynowUen: "202412345A",
+          fiscalProvider: "local_hash_chain",
+          updatedAt: new Date().toISOString(),
+        }}
+        attachedCustomer={null}
+        simulatedOffline={false}
+        submittingSale={false}
+        onActiveQrChange={onActiveQrChange}
+        onFinalizeSale={onFinalize}
+        onClose={vi.fn()}
+      />
+    );
+
+    // Pay $5.00 equivalent using 20,500 KHR (0 USD)
+    fireEvent.change(screen.getByLabelText(/Cash Tendered \(USD\)/i), { target: { value: "0" } });
+    fireEvent.change(screen.getByLabelText(/Cash Tendered \(KHR/i), { target: { value: "20500" } });
+    fireEvent.click(screen.getByRole("button", { name: /Apply \$5\.00 Cash/i }));
+
+    // Remaining balance should now be $5.00; switch to Card tab and pay remaining $5.00
+    fireEvent.click(screen.getByRole("button", { name: /Card \/ Credit \/ Points/i }));
+    expect(screen.getByLabelText(/Amount to Apply \(USD\)/i)).toHaveValue(5);
+    fireEvent.click(screen.getByRole("button", { name: /Apply Card Terminal/i }));
+
+    const finalizeBtn = screen.getByRole("button", { name: /Finalize Receipt \(\$10\.00\)/i });
+    expect(finalizeBtn).toBeEnabled();
+    fireEvent.click(finalizeBtn);
+
+    await waitFor(() => {
+      expect(onFinalize).toHaveBeenCalledTimes(1);
+    });
+    const submittedLegs = onFinalize.mock.calls[0][0] as Array<{
+      method: string;
+      amountCents: number;
+      foreignAmount?: number | null;
+    }>;
+    expect(submittedLegs).toHaveLength(2);
+    expect(submittedLegs[0]).toMatchObject({
+      method: "cash",
+      amountCents: 500,
+      foreignAmount: 20500,
+    });
+    expect(submittedLegs[1]).toMatchObject({
+      method: "card",
+      amountCents: 500,
+    });
+  });
+
+  it("hydrates CustomerDisplayView with live dual-currency totals and EMVCo QR from cfdChannel", async () => {
+    const { buildKhqrPayload } = await import("@supermarket/shared/emvqr");
+    const { publishCfdState, CFD_STORAGE_KEY } = await import("../lib/cfdChannel");
+    const { CustomerDisplayView } = await import("../views/CustomerDisplayView");
+
+    const qr = buildKhqrPayload({
+      accountId: "flagship@aclb",
+      merchantName: "SUPERMARKET OS",
+      merchantCity: "PHNOM PENH",
+      currencyCode: "USD",
+      amountMinorUnits: 1000,
+      billReference: "REG01-CFD01",
+    });
+
+    publishCfdState({
+      storeName: "SupermarketOS Flagship Market",
+      receiptHeader: "Fresh Produce & Grocery",
+      receiptFooter: "See you again!",
+      registerCode: "REG-01",
+      cashierName: "Elena Morales",
+      primaryCurrency: "USD",
+      secondaryCurrency: "KHR",
+      secondaryFxRate: 4100,
+      secondaryRoundingStep: 100,
+      status: "awaiting_qr",
+      lines: [
+        {
+          lineKey: "l1",
+          name: "Cavendish Bananas (Loose)",
+          packLabel: "1.000 kg",
+          qtyPacks: 1,
+          weightGrams: 1000,
+          unitMode: "weight_g",
+          lineTotalCents: 1000,
+          discountCents: 0,
+        },
+      ],
+      subtotalCents: 1000,
+      discountCents: 0,
+      taxCents: 0,
+      grandTotalCents: 1000,
+      activeQr: {
+        intentId: "intent-1",
+        rail: "khqr",
+        displayAmount: "$10.00",
+        currencyCode: "USD",
+        billReference: "REG01-CFD01",
+        qrPayload: qr.payload,
+        status: "pending",
+        externalRef: null,
+        expiresAt: new Date(Date.now() + 300_000).toISOString(),
+      },
+      lastReceiptNo: null,
+      updatedAt: new Date().toISOString(),
+    });
+
+    render(<CustomerDisplayView />);
+
+    expect(screen.getByRole("heading", { name: "SupermarketOS Flagship Market" })).toBeInTheDocument();
+    expect(screen.getByText("Cavendish Bananas (Loose)")).toBeInTheDocument();
+    expect(screen.getByText(/41,000 ៛/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: /Customer display KHQR QR for \$10\.00/i })
+    ).toBeInTheDocument();
+
+    localStorage.removeItem(CFD_STORAGE_KEY);
+  });
+});
+
+
 
 
