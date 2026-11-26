@@ -1,10 +1,15 @@
 import cors from "@fastify/cors";
 import { sql } from "drizzle-orm";
 import Fastify from "fastify";
+import { env } from "./config/env.js";
 import { db } from "./db/index.js";
 import { registerAuthHook } from "./plugins/auth.js";
 import { registerMetrics } from "./plugins/metrics.js";
-import { registerCsrfOriginCheck, registerSecurityHeaders } from "./plugins/security.js";
+import {
+  registerCsrfOriginCheck,
+  registerSecurityHeaders,
+  resolveCorrelationId,
+} from "./plugins/security.js";
 import { adminRoutes } from "./routes/admin.js";
 import { aiRoutes } from "./routes/ai.js";
 import { analyticsRoutes } from "./routes/analytics.js";
@@ -34,7 +39,26 @@ export function getPgErrorCode(err: unknown): string | undefined {
 
 export async function buildApp(logger = true) {
   const app = Fastify({
-    logger: logger ? { level: process.env.LOG_LEVEL ?? "info" } : false,
+    trustProxy: env.trustProxy,
+    genReqId: (req) => resolveCorrelationId(req.headers["x-request-id"]),
+    logger: logger
+      ? {
+          level: process.env.LOG_LEVEL ?? env.logLevel,
+          redact: {
+            paths: [
+              "req.headers.authorization",
+              "req.headers.cookie",
+              "res.headers['set-cookie']",
+              "*.pin",
+              "*.currentPin",
+              "*.newPin",
+              "*.token",
+              "*.password",
+            ],
+            censor: "[REDACTED]",
+          },
+        }
+      : false,
     bodyLimit: 12 * 1024 * 1024,
   });
 

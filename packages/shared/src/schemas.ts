@@ -72,7 +72,7 @@ export const PosSaleUploadSchema = z.object({
         packQty: z.number().int().min(1),
         qtyPacks: z.number().int().min(1),
         unitPriceCents: z.number().int().min(0),
-        unitCostCents: z.number().int().min(0),
+        unitCostCents: z.number().int().min(0).optional().default(0),
         discountCents: z.number().int().min(0),
         taxRateBp: z.number().int().min(0),
         taxCents: z.number().int().min(0),
@@ -120,7 +120,8 @@ export const CreateGrnSchema = z.object({
 
 export const LoginSchema = z.object({
   username: z.string().min(1).max(64),
-  pin: z.string().min(4).max(12),
+  pin: z.string().min(4).max(64),
+  includeToken: z.boolean().optional(),
 });
 
 export const CreatePurchaseOrderSchema = z.object({
@@ -289,26 +290,88 @@ export const CompleteFloorTaskSchema = z.object({
   actualQty: z.number().int().min(0).max(100_000).optional(),
 });
 
-export const CreateUserSchema = z.object({
-  username: z
-    .string()
-    .trim()
-    .min(3)
-    .max(40)
-    .regex(/^[a-z0-9._-]+$/i, "Username may only contain letters, digits, dots, underscores, and hyphens"),
-  fullName: z.string().trim().min(2).max(120),
-  role: UserRoleSchema,
-  pin: z.string().trim().min(4).max(12),
-});
+export const WEAK_CREDENTIALS = new Set([
+  "0000",
+  "1111",
+  "2222",
+  "3333",
+  "4444",
+  "5555",
+  "6666",
+  "7777",
+  "8888",
+  "9999",
+  "1234",
+  "4321",
+  "000000",
+  "111111",
+  "123456",
+  "654321",
+  "password",
+  "admin123",
+  "supermarket",
+]);
 
-export const UpdateUserSchema = z.object({
-  fullName: z.string().trim().min(2).max(120).optional(),
-  role: UserRoleSchema.optional(),
-  active: z.boolean().optional(),
-  pin: z.string().trim().min(4).max(12).optional(),
-});
+export const PRIVILEGED_ROLES = new Set<UserRole>(["owner", "manager", "accountant"]);
 
-export const ChangePinSchema = z.object({
-  currentPin: z.string().trim().min(4).max(12),
-  newPin: z.string().trim().min(4).max(12),
-});
+export function validateCredentialStrength(pin: string, role?: UserRole): string | null {
+  const clean = pin.trim();
+  const lower = clean.toLowerCase();
+  if (WEAK_CREDENTIALS.has(lower) || /^(.)\1+$/.test(clean)) {
+    return "PIN/password is too predictable. Avoid repeated digits or trivial sequences.";
+  }
+  if (role && PRIVILEGED_ROLES.has(role) && clean.length < 8) {
+    return `Role "${role}" requires a PIN or password of at least 8 characters.`;
+  }
+  if (clean.length < 4 || clean.length > 64) {
+    return "PIN or password must be 4 to 64 characters.";
+  }
+  return null;
+}
+
+export const CreateUserSchema = z
+  .object({
+    username: z
+      .string()
+      .trim()
+      .min(3)
+      .max(40)
+      .regex(/^[a-z0-9._-]+$/i, "Username may only contain letters, digits, dots, underscores, and hyphens"),
+    fullName: z.string().trim().min(2).max(120),
+    role: UserRoleSchema,
+    pin: z.string().trim().min(4).max(64),
+  })
+  .superRefine((d, ctx) => {
+    const err = validateCredentialStrength(d.pin, d.role);
+    if (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["pin"], message: err });
+    }
+  });
+
+export const UpdateUserSchema = z
+  .object({
+    fullName: z.string().trim().min(2).max(120).optional(),
+    role: UserRoleSchema.optional(),
+    active: z.boolean().optional(),
+    pin: z.string().trim().min(4).max(64).optional(),
+  })
+  .superRefine((d, ctx) => {
+    if (d.pin !== undefined) {
+      const err = validateCredentialStrength(d.pin, d.role);
+      if (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["pin"], message: err });
+      }
+    }
+  });
+
+export const ChangePinSchema = z
+  .object({
+    currentPin: z.string().trim().min(4).max(64),
+    newPin: z.string().trim().min(4).max(64),
+  })
+  .superRefine((d, ctx) => {
+    const err = validateCredentialStrength(d.newPin);
+    if (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["newPin"], message: err });
+    }
+  });

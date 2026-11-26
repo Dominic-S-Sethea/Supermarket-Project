@@ -52,7 +52,7 @@ interface ProductPick {
   id: string;
   sku: string;
   name: string;
-  avgCostCents: number;
+  avgCostCents?: number;
   primarySellPriceCents: number;
 }
 
@@ -802,7 +802,8 @@ export function OperationsView({
                     ) : (
                       productOptions.map((p) => (
                         <option key={p.id} value={p.id}>
-                          {p.sku} — {p.name} (Cost {formatMoney(p.avgCostCents)})
+                          {p.sku} — {p.name}
+                          {typeof p.avgCostCents === "number" ? ` (Cost ${formatMoney(p.avgCostCents)})` : ""}
                         </option>
                       ))
                     )}

@@ -25,11 +25,11 @@ beforeAll(async () => {
   await app.ready();
 
   const logins = await Promise.all([
-    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "owner", pin: "1111" } }),
-    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "manager", pin: "9999" } }),
-    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "accountant", pin: "4444" } }),
-    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "cashier1", pin: "1234" } }),
-    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "clerk1", pin: "2222" } }),
+    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "owner", pin: "1111", includeToken: true } }),
+    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "manager", pin: "9999", includeToken: true } }),
+    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "accountant", pin: "4444", includeToken: true } }),
+    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "cashier1", pin: "1234", includeToken: true } }),
+    app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "clerk1", pin: "2222", includeToken: true } }),
   ]);
   for (const r of logins) {
     expect(r.statusCode).toBe(200);
@@ -39,6 +39,10 @@ beforeAll(async () => {
   accountantToken = (logins[2].json() as { token: string }).token;
   cashierToken = (logins[3].json() as { token: string }).token;
   clerkToken = (logins[4].json() as { token: string }).token;
+
+  // Versioned v1.<kid>.<payload>.<sig> session token format (L-06)
+  expect(ownerToken.startsWith("v1.")).toBe(true);
+  expect(ownerToken.split(".").length).toBe(4);
 
   const setCookie = logins[0].headers["set-cookie"];
   const rawCookie = Array.isArray(setCookie) ? setCookie[0] : setCookie ?? "";
@@ -327,5 +331,159 @@ describe("SupermarketOS OWASP Security Hardening Suite", () => {
     expect(metricsRes.body).toContain("http_requests_total");
     expect(metricsRes.body).toContain("pg_pool_connections");
     expect(metricsRes.body).toContain("supermarket_auth_lockouts_total");
+  });
+
+  it("enforces Wave 2A hardening: cookie-only default login, change-pin lockout, credential policy, RBAC DTO scoping, generic 403s, and role-change session revocation", async () => {
+    // 1. Default browser login omits raw token from JSON body (cookie-only isolation — H-13)
+    const webLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "owner", pin: "1111" },
+    });
+    expect(webLogin.statusCode).toBe(200);
+    expect((webLogin.json() as { token?: string }).token).toBeUndefined();
+    expect(String(webLogin.headers["set-cookie"] ?? "")).toContain(`${SESSION_COOKIE_NAME}=`);
+
+    // 2. Generic 403 does not enumerate internal allowed roles & /api/openapi.json requires auth (M-16)
+    const forbidden = await app.inject({
+      method: "GET",
+      url: "/api/admin/users",
+      headers: authHeaders(cashierToken),
+    });
+    expect(forbidden.statusCode).toBe(403);
+    expect(JSON.stringify(forbidden.json())).not.toContain("Allowed:");
+
+    const unauthOpenApi = await app.inject({ method: "GET", url: "/api/openapi.json" });
+    expect(unauthOpenApi.statusCode).toBe(401);
+    const cashierOpenApi = await app.inject({
+      method: "GET",
+      url: "/api/openapi.json",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierOpenApi.statusCode).toBe(403);
+
+    // 3. RBAC sensitive-data DTO scoping (H-15)
+    const [cashierMeta, cashierProds, cashierBoot, cashierRecent, cashierSemantic, clerkSemantic] =
+      await Promise.all([
+        app.inject({ method: "GET", url: "/api/meta", headers: authHeaders(cashierToken) }),
+        app.inject({ method: "GET", url: "/api/products?page=1&pageSize=10", headers: authHeaders(cashierToken) }),
+        app.inject({ method: "GET", url: "/api/pos/bootstrap", headers: authHeaders(cashierToken) }),
+        app.inject({ method: "GET", url: "/api/pos/recent-sales", headers: authHeaders(cashierToken) }),
+        app.inject({ method: "GET", url: "/api/ai/search/semantic?q=beer", headers: authHeaders(cashierToken) }),
+        app.inject({ method: "GET", url: "/api/ai/search/semantic?q=beer", headers: authHeaders(clerkToken) }),
+      ]);
+    expect(cashierMeta.statusCode).toBe(200);
+    expect(cashierMeta.json().suppliers).toEqual([]);
+    expect(cashierProds.statusCode).toBe(200);
+    expect(cashierProds.json().items[0].avgCostCents).toBeUndefined();
+    expect(cashierProds.json().items[0].marginBp).toBeUndefined();
+    expect(cashierBoot.statusCode).toBe(200);
+    expect(cashierBoot.json().products[0].avgCostCents).toBeUndefined();
+    expect(cashierRecent.statusCode).toBe(200);
+    for (const s of cashierRecent.json().sales as { totalCostCents?: number; lines: { unitCostCents?: number }[] }[]) {
+      expect(s.totalCostCents).toBeUndefined();
+      for (const l of s.lines) expect(l.unitCostCents).toBeUndefined();
+    }
+    expect(cashierSemantic.statusCode).toBe(403);
+    expect(clerkSemantic.statusCode).toBe(200);
+    if (clerkSemantic.json().items.length > 0) {
+      expect(clerkSemantic.json().items[0].avgCostCents).toBeUndefined();
+    }
+
+    // 4. Weak PIN denylist & privileged 8+ char credential policy (H-13)
+    const weakPinRes = await app.inject({
+      method: "POST",
+      url: "/api/admin/users",
+      headers: authHeaders(),
+      payload: { username: "weak_pin_test", fullName: "Weak Pin", role: "cashier", pin: "5555" },
+    });
+    expect(weakPinRes.statusCode).toBe(400);
+
+    const shortMgrPinRes = await app.inject({
+      method: "POST",
+      url: "/api/admin/users",
+      headers: authHeaders(),
+      payload: { username: "short_mgr_test", fullName: "Short Mgr", role: "manager", pin: "7392" },
+    });
+    expect(shortMgrPinRes.statusCode).toBe(400);
+
+    // 5. Versioned scrypt hash, role-change session revocation (M-15), and change-pin lockout (H-12)
+    const tempUser = `sec_w2a_${Date.now().toString().slice(-6)}`;
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/admin/users",
+      headers: authHeaders(),
+      payload: { username: tempUser, fullName: "Wave2A Tester", role: "cashier", pin: "7392" },
+    });
+    expect(created.statusCode).toBe(201);
+    const createdId = (created.json() as { user: { id: string } }).user.id;
+
+    try {
+      const [dbUser] = await db.select().from(users).where(eq(users.id, createdId));
+      expect(dbUser.pinHash.startsWith("scrypt$N=32768")).toBe(true);
+
+      const login1 = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { username: tempUser, pin: "7392", includeToken: true },
+      });
+      expect(login1.statusCode).toBe(200);
+      const tok1 = (login1.json() as { token: string }).token;
+
+      // Role change must revoke existing session immediately (M-15)
+      const rolePatch = await app.inject({
+        method: "PATCH",
+        url: `/api/admin/users/${createdId}`,
+        headers: authHeaders(),
+        payload: { role: "stock_clerk" },
+      });
+      expect(rolePatch.statusCode).toBe(200);
+      expect(rolePatch.json().sessionsRevoked).toBeGreaterThanOrEqual(1);
+
+      const afterRoleCheck = await app.inject({
+        method: "GET",
+        url: "/api/products?page=1&pageSize=10",
+        headers: authHeaders(tok1),
+      });
+      expect(afterRoleCheck.statusCode).toBe(401);
+
+      // Re-login and brute-force change-pin -> 5th bad currentPin triggers 429 lockout & revokes session (H-12)
+      const login2 = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { username: tempUser, pin: "7392", includeToken: true },
+      });
+      const tok2 = (login2.json() as { token: string }).token;
+
+      for (let i = 0; i < 4; i++) {
+        const bad = await app.inject({
+          method: "POST",
+          url: "/api/auth/change-pin",
+          headers: authHeaders(tok2),
+          payload: { currentPin: "9871", newPin: "4826" },
+        });
+        expect(bad.statusCode).toBe(401);
+      }
+      const locked = await app.inject({
+        method: "POST",
+        url: "/api/auth/change-pin",
+        headers: authHeaders(tok2),
+        payload: { currentPin: "9871", newPin: "4826" },
+      });
+      expect(locked.statusCode).toBe(429);
+
+      // Active session revoked upon lockout
+      const afterLockout = await app.inject({
+        method: "GET",
+        url: "/api/products?page=1&pageSize=10",
+        headers: authHeaders(tok2),
+      });
+      expect(afterLockout.statusCode).toBe(401);
+    } finally {
+      resetLoginLockouts();
+      await db.delete(userSessions).where(eq(userSessions.userId, createdId));
+      await db.delete(auditLogs).where(eq(auditLogs.entityId, createdId));
+      await db.delete(users).where(eq(users.id, createdId));
+    }
   });
 });

@@ -240,8 +240,15 @@ export async function exportRoutes(app: FastifyInstance) {
     return csv;
   });
 
-  // 5. Machine-readable OpenAPI 3.1 Contract Spec
-  app.get("/api/openapi.json", async () => ({
+  // 5. Machine-readable OpenAPI 3.1 Contract Spec (restricted to management & finance roles)
+  app.get(
+    "/api/openapi.json",
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    async (_req, reply) => {
+      if (!env.enableOpenApiDocs) {
+        return reply.status(404).send({ error: "OpenAPI documentation is disabled." });
+      }
+      return {
     openapi: "3.1.0",
     info: {
       title: "SupermarketOS Retail Operations, Offline POS & BI API",
@@ -319,5 +326,7 @@ export async function exportRoutes(app: FastifyInstance) {
       "/exports/shifts.csv": { get: { summary: "Z-Report shift closeout CSV", tags: ["Exports"] } },
       "/exports/audit-logs.csv": { get: { summary: "Immutable compliance audit log CSV", tags: ["Exports"] } },
     },
-  }));
+      };
+    }
+  );
 }

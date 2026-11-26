@@ -47,7 +47,7 @@ docker run -d --name "$API_CTR" \
 echo "[docker-smoke] Starting production Nginx Web container (${WEB_CTR} -> 127.0.0.1:${HOST_PORT})..."
 docker run -d --name "$WEB_CTR" \
   --network "$NET_NAME" \
-  -p "127.0.0.1:${HOST_PORT}:80" \
+  -p "127.0.0.1:${HOST_PORT}:8080" \
   supermarket-os-web:verify >/dev/null
 
 echo "[docker-smoke] Waiting for Nginx -> API -> PostgreSQL readiness probe..."
@@ -66,23 +66,31 @@ for i in $(seq 1 30); do
 done
 echo "  ✓ GET /api/health via Nginx -> 200 connected"
 
-echo "[docker-smoke] Verifying Nginx SPA root & security headers..."
+echo "[docker-smoke] Verifying Nginx SPA root & security headers (CSP, HSTS, X-Frame-Options)..."
 SPA_HTML=$(curl -sfD - "http://127.0.0.1:${HOST_PORT}/")
 echo "$SPA_HTML" | grep -qi "X-Frame-Options: DENY"
+echo "$SPA_HTML" | grep -qi "Content-Security-Policy:"
+echo "$SPA_HTML" | grep -qi "Strict-Transport-Security:"
 echo "$SPA_HTML" | grep -q "SupermarketOS"
-echo "  ✓ GET / served built SPA with X-Frame-Options: DENY"
+echo "  ✓ GET / served built SPA with CSP, HSTS & X-Frame-Options: DENY"
 
-echo "[docker-smoke] Verifying OpenAPI 3.1 contract..."
-curl -sf "http://127.0.0.1:${HOST_PORT}/api/openapi.json" | grep -q '"openapi":"3.1.0"'
-echo "  ✓ GET /api/openapi.json -> 3.1.0"
+echo "[docker-smoke] Verifying /api/openapi.json blocks unauthenticated requests (401)..."
+OPENAPI_UNAUTH=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${HOST_PORT}/api/openapi.json")
+test "$OPENAPI_UNAUTH" -eq 401
+echo "  ✓ GET /api/openapi.json unauthenticated -> 401"
 
 echo "[docker-smoke] Authenticating as owner via Nginx /api/auth/login..."
 LOGIN_JSON=$(curl -sf -X POST "http://127.0.0.1:${HOST_PORT}/api/auth/login" \
   -H "Content-Type: application/json" \
-  -d '{"username":"owner","pin":"1111"}')
+  -H "X-Auth-Mode: bearer" \
+  -d '{"username":"owner","pin":"1111","includeToken":true}')
 TOKEN=$(printf '%s' "$LOGIN_JSON" | node -e "const d = JSON.parse(require('fs').readFileSync(0,'utf8')); process.stdout.write(d.token || '');")
 test -n "$TOKEN"
-echo "  ✓ POST /api/auth/login -> JWT issued"
+echo "  ✓ POST /api/auth/login -> bearer token issued"
+
+echo "[docker-smoke] Verifying authenticated OpenAPI 3.1 contract..."
+curl -sf "http://127.0.0.1:${HOST_PORT}/api/openapi.json" -H "Authorization: Bearer ${TOKEN}" | grep -q '"openapi":"3.1.0"'
+echo "  ✓ GET /api/openapi.json (owner) -> 3.1.0"
 
 echo "[docker-smoke] Verifying Prometheus /api/metrics via Nginx..."
 METRICS_OUT=$(curl -sf "http://127.0.0.1:${HOST_PORT}/api/metrics" -H "Authorization: Bearer ${TOKEN}")

@@ -33,7 +33,7 @@ import {
   taxRates,
 } from "../db/index.js";
 import { env } from "../config/env.js";
-import { requireAuth, requireRole } from "../plugins/auth.js";
+import { requireRole } from "../plugins/auth.js";
 import { createRateLimiter } from "../plugins/security.js";
 
 const UuidSchema = z.string().uuid();
@@ -121,19 +121,30 @@ export async function aiRoutes(app: FastifyInstance) {
     return syncProductEmbeddings(parsed.data.force);
   });
 
-  app.get("/api/ai/search/semantic", { preHandler: [requireAuth] }, async (req, reply) => {
-    const q = req.query as { q?: string; limit?: string };
-    const query = (q.q ?? "").trim();
-    if (!query) {
-      return reply.status(400).send({ error: "Query parameter q is required." });
+  app.get(
+    "/api/ai/search/semantic",
+    { preHandler: [requireRole(["owner", "manager", "stock_clerk"]), aiComputeLimiter] },
+    async (req, reply) => {
+      const q = req.query as { q?: string; limit?: string };
+      const query = (q.q ?? "").trim();
+      if (!query) {
+        return reply.status(400).send({ error: "Query parameter q is required." });
+      }
+      if (query.length > 500) {
+        return reply.status(400).send({ error: "Query parameter q must be <= 500 characters." });
+      }
+      const rawLimit = Number(q.limit);
+      const limit = Number.isFinite(rawLimit) ? Math.min(60, Math.max(5, Math.trunc(rawLimit))) : 30;
+      const result = await semanticSearchProducts(query, limit);
+      if (req.authUser?.role === "stock_clerk") {
+        return {
+          ...result,
+          items: result.items.map(({ avgCostCents: _c, minMarginBp: _mm, marginBp: _m, ...pub }) => pub),
+        };
+      }
+      return result;
     }
-    if (query.length > 500) {
-      return reply.status(400).send({ error: "Query parameter q must be <= 500 characters." });
-    }
-    const rawLimit = Number(q.limit);
-    const limit = Number.isFinite(rawLimit) ? Math.min(60, Math.max(5, Math.trunc(rawLimit))) : 30;
-    return semanticSearchProducts(query, limit);
-  });
+  );
 
   // Multimodal Supplier Invoice / Delivery Note -> GRN Scanner
   app.post("/api/ai/grn/parse-invoice", { preHandler: managerAiLimited }, async (req, reply) => {
@@ -503,7 +514,33 @@ export async function aiRoutes(app: FastifyInstance) {
           .where(eq(productBarcodes.productId, productId))
           .for("update");
         const primary = allBcs.find((b) => b.isPrimary) ?? allBcs[0];
-        const ratio = newSellPrice / Math.max(1, primary?.sellPriceCents ?? newSellPrice);
+        if (!primary) {
+          return { status: 404 as const, error: "Target product has no registered barcode." };
+        }
+
+        // Enforce floor-margin guard and max 40% single-step price-drop ceiling on primary barcode (blocks indirect prompt injection price drops)
+        const primaryFloorCents = computeSuggestedSellPriceCents(
+          prod.avgCostCents * primary.packQty,
+          prod.minMarginBp,
+          prod.taxRateBp,
+          prod.taxInclusive,
+          5
+        );
+        if (newSellPrice < primaryFloorCents) {
+          return {
+            status: 400 as const,
+            error: `Proposed price (${newSellPrice}c) breaches product floor margin guard (minimum ${primaryFloorCents}c).`,
+          };
+        }
+        const minAllowedStepPrice = Math.floor(primary.sellPriceCents * 0.6);
+        if (primary.sellPriceCents > 0 && newSellPrice < minAllowedStepPrice) {
+          return {
+            status: 400 as const,
+            error: `Proposed price (${newSellPrice}c) exceeds maximum 40% single-step drop from current shelf price (${primary.sellPriceCents}c).`,
+          };
+        }
+
+        const ratio = newSellPrice / Math.max(1, primary.sellPriceCents);
 
         for (const bc of allBcs) {
           if (bc.isPrimary) {

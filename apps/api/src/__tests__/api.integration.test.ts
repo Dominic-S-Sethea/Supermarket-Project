@@ -51,12 +51,12 @@ beforeAll(async () => {
     app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "owner", pin: "1111" },
+      payload: { username: "owner", pin: "1111", includeToken: true },
     }),
     app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "cashier1", pin: "1234" },
+      payload: { username: "cashier1", pin: "1234", includeToken: true },
     }),
   ]);
   expect(ownerLogin.statusCode).toBe(200);
@@ -172,7 +172,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const c4Login = await app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "cashier4", pin: "4567" },
+      payload: { username: "cashier4", pin: "4567", includeToken: true },
     });
     expect(c4Login.statusCode).toBe(200);
     const c4Token = (c4Login.json() as { token: string }).token;
@@ -1234,7 +1234,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const clerkLogin = await app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "clerk1", pin: "2222" },
+      payload: { username: "clerk1", pin: "2222", includeToken: true },
     });
     expect(clerkLogin.statusCode).toBe(200);
     const clerkToken = (clerkLogin.json() as { token: string }).token;
@@ -1474,7 +1474,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
           packQty: bc.packQty,
           qtyPacks,
           unitPriceCents: unitPrice,
-          unitCostCents: safeProd.avgCostCents,
+          unitCostCents: safeProd.avgCostCents ?? 0,
           discountCents,
           taxRateBp: tax.rateBp,
           taxCents: lineTax,
@@ -1617,7 +1617,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const clerkLogin = await app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "clerk1", pin: "2222" },
+      payload: { username: "clerk1", pin: "2222", includeToken: true },
     });
     expect(clerkLogin.statusCode).toBe(200);
     const clerkToken = (clerkLogin.json() as { token: string }).token;
@@ -1754,7 +1754,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const accLogin = await app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "accountant", pin: "4444" },
+      payload: { username: "accountant", pin: "4444", includeToken: true },
     });
     expect(accLogin.statusCode).toBe(200);
     const accountantToken = (accLogin.json() as { token: string }).token;
@@ -1783,7 +1783,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
         username: tempUsername,
         fullName: "Temp Governance Tester",
         role: "cashier",
-        pin: "5555",
+        pin: "7392",
       },
     });
     expect(createRes.statusCode).toBe(201);
@@ -1795,12 +1795,12 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
         app.inject({
           method: "POST",
           url: "/api/auth/login",
-          payload: { username: tempUsername, pin: "5555" },
+          payload: { username: tempUsername, pin: "7392", includeToken: true },
         }),
         app.inject({
           method: "POST",
           url: "/api/auth/login",
-          payload: { username: tempUsername, pin: "5555" },
+          payload: { username: tempUsername, pin: "7392", includeToken: true },
         }),
       ]);
       expect(sessA.statusCode).toBe(200);
@@ -1813,7 +1813,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
         method: "POST",
         url: "/api/auth/change-pin",
         headers: authHeaders(tokenA),
-        payload: { currentPin: "5555", newPin: "6789" },
+        payload: { currentPin: "7392", newPin: "8429" },
       });
       expect(rotRes.statusCode).toBe(200);
       expect(rotRes.json().otherSessionsRevoked).toBeGreaterThanOrEqual(1);
@@ -1833,7 +1833,31 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       });
       expect(checkA.statusCode).toBe(200);
 
-      // Owner deactivating user immediately revokes Session A
+      // Owner can explicitly revoke all sessions via POST /api/admin/users/:id/revoke-sessions
+      const revokeRes = await app.inject({
+        method: "POST",
+        url: `/api/admin/users/${createdUser.id}/revoke-sessions`,
+        headers: authHeaders(),
+      });
+      expect(revokeRes.statusCode).toBe(200);
+      expect(revokeRes.json().sessionsRevoked).toBeGreaterThanOrEqual(1);
+
+      const checkAAfterRevoke = await app.inject({
+        method: "GET",
+        url: "/api/pos/bootstrap",
+        headers: authHeaders(tokenA),
+      });
+      expect(checkAAfterRevoke.statusCode).toBe(401);
+
+      // Re-login with rotated PIN then verify deactivation revokes active session
+      const sessC = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { username: tempUsername, pin: "8429", includeToken: true },
+      });
+      expect(sessC.statusCode).toBe(200);
+      const tokenC = (sessC.json() as { token: string }).token;
+
       const deactRes = await app.inject({
         method: "PATCH",
         url: `/api/admin/users/${createdUser.id}`,
@@ -1843,12 +1867,12 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       expect(deactRes.statusCode).toBe(200);
       expect(deactRes.json().sessionsRevoked).toBeGreaterThanOrEqual(1);
 
-      const checkAAfterDeact = await app.inject({
+      const checkCAfterDeact = await app.inject({
         method: "GET",
         url: "/api/pos/bootstrap",
-        headers: authHeaders(tokenA),
+        headers: authHeaders(tokenC),
       });
-      expect(checkAAfterDeact.statusCode).toBe(401);
+      expect(checkCAfterDeact.statusCode).toBe(401);
 
       // Last active owner protection: cannot deactivate sole active owner
       const usersList = await app.inject({
@@ -1937,6 +1961,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       app.inject({
         method: "GET",
         url: "/api/openapi.json",
+        headers: authHeaders(accountantToken),
       }),
     ]);
     expect(invCsv.statusCode).toBe(200);

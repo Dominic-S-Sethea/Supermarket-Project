@@ -36,7 +36,8 @@ export async function posRoutes(app: FastifyInstance) {
   app.get(
     "/api/pos/bootstrap",
     { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async () => {
+    async (req) => {
+      const canSeeCost = req.authUser?.role === "owner" || req.authUser?.role === "manager";
       const [prods, bcs, promos, taxes, cats, rules] = await Promise.all([
         db
           .select({
@@ -85,7 +86,9 @@ export async function posRoutes(app: FastifyInstance) {
         syncedAt: new Date().toISOString(),
         productCount: prods.length,
         barcodeCount: bcs.length,
-        products: prods,
+        products: canSeeCost
+          ? prods
+          : prods.map(({ avgCostCents: _cost, ...pub }) => pub),
         barcodes: bcs,
         promotions: promos,
         taxRates: taxes,
@@ -791,10 +794,12 @@ export async function posRoutes(app: FastifyInstance) {
   app.get(
     "/api/pos/recent-sales",
     { preHandler: [requireRole(["owner", "manager", "cashier", "accountant"])] },
-    async () => {
+    async (req) => {
+      const isCashier = req.authUser?.role === "cashier";
       const recent = await db
         .select()
         .from(sales)
+        .where(isCashier ? eq(sales.cashierName, req.authUser!.fullName) : undefined)
         .orderBy(desc(sales.soldAt))
         .limit(25);
 
@@ -832,10 +837,15 @@ export async function posRoutes(app: FastifyInstance) {
           .where(and(inArray(sales.originalSaleId, saleIds), eq(sales.kind, "void"))),
       ]);
 
-      const linesBySale = new Map<string, typeof linesRows>();
+      const linesBySale = new Map<string, Record<string, unknown>[]>();
       for (const l of linesRows) {
         const list = linesBySale.get(l.saleId) ?? [];
-        list.push(l);
+        if (isCashier) {
+          const { unitCostCents: _c, ...pubLine } = l;
+          list.push(pubLine);
+        } else {
+          list.push(l);
+        }
         linesBySale.set(l.saleId, list);
       }
       const payBySale = new Map<string, typeof payRows>();
@@ -849,12 +859,17 @@ export async function posRoutes(app: FastifyInstance) {
       );
 
       return {
-        sales: recent.map((s) => ({
-          ...s,
-          alreadyVoided: voidedSet.has(s.id),
-          lines: linesBySale.get(s.id) ?? [],
-          payments: payBySale.get(s.id) ?? [],
-        })),
+        sales: recent.map((s) => {
+          const base = isCashier
+            ? (({ totalCostCents: _tc, ...rest }) => rest)(s)
+            : s;
+          return {
+            ...base,
+            alreadyVoided: voidedSet.has(s.id),
+            lines: linesBySale.get(s.id) ?? [],
+            payments: payBySale.get(s.id) ?? [],
+          };
+        }),
       };
     }
   );

@@ -40,17 +40,21 @@ export async function catalogRoutes(app: FastifyInstance) {
   });
   // Metadata bootstrap for dropdowns, promos, and filters
   app.get("/api/meta", { preHandler: [requireAuth] }, async (req) => {
+    const role = req.authUser?.role;
+    const canSeeSuppliers = role !== "cashier";
     const [depts, cats, taxes, sups, promos, staff] = await Promise.all([
       db.select().from(departments).orderBy(asc(departments.name)),
       db.select().from(categories).orderBy(asc(categories.name)),
       db.select().from(taxRates).orderBy(asc(taxRates.rateBp)),
-      db.select().from(suppliers).orderBy(asc(suppliers.name)),
+      canSeeSuppliers
+        ? db.select().from(suppliers).orderBy(asc(suppliers.name))
+        : Promise.resolve([]),
       db
         .select()
         .from(promotions)
         .where(eq(promotions.active, true))
         .orderBy(asc(promotions.priority)),
-      req.authUser?.role === "owner" || req.authUser?.role === "manager"
+      role === "owner" || role === "manager"
         ? db
             .select({
               id: users.id,
@@ -309,6 +313,11 @@ export async function catalogRoutes(app: FastifyInstance) {
     }
     const expiryMap = new Map(nextBatches.map((b) => [b.productId, b.earliestExpiry]));
 
+    const canSeeFinancials =
+      req.authUser?.role === "owner" ||
+      req.authUser?.role === "manager" ||
+      req.authUser?.role === "accountant";
+
     const items = rows.map((r) => {
       const barcodes = bcMap.get(r.id) ?? [];
       const primaryBc = barcodes.find((b) => b.isPrimary) ?? barcodes[0];
@@ -321,6 +330,17 @@ export async function catalogRoutes(app: FastifyInstance) {
         r.taxRateBp,
         r.taxInclusive
       );
+      if (!canSeeFinancials) {
+        const { avgCostCents: _c, minMarginBp: _mm, ...pub } = r;
+        return {
+          ...pub,
+          onHandUnits,
+          primaryBarcode: primaryBc?.barcode ?? "",
+          primarySellPriceCents: primarySell,
+          earliestExpiry: expiryMap.get(r.id) ?? null,
+          barcodes,
+        };
+      }
       return {
         ...r,
         onHandUnits,
@@ -339,6 +359,10 @@ export async function catalogRoutes(app: FastifyInstance) {
   app.get("/api/products/scan/:barcode", { preHandler: [requireAuth] }, async (req, reply) => {
     const { barcode } = req.params as { barcode: string };
     const clean = barcode.trim();
+    const canSeeFinancials =
+      req.authUser?.role === "owner" ||
+      req.authUser?.role === "manager" ||
+      req.authUser?.role === "accountant";
 
     const [found] = await db
       .select({
@@ -377,6 +401,10 @@ export async function catalogRoutes(app: FastifyInstance) {
       return reply.status(404).send({ error: "Barcode not found", barcode: clean });
     }
 
+    if (!canSeeFinancials) {
+      const { avgCostCents: _c, ...pub } = found;
+      return pub;
+    }
     return found;
   });
 

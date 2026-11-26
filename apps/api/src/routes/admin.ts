@@ -140,21 +140,11 @@ export async function adminRoutes(app: FastifyInstance) {
       const [existing] = await db.select().from(users).where(eq(users.id, id)).limit(1);
       if (!existing) return reply.status(404).send({ error: "Staff user not found." });
 
-      // Prevent locking out the last active owner
-      const demotingOrDisablingOwner =
-        existing.role === "owner" &&
-        existing.active &&
-        (data.active === false || (data.role !== undefined && data.role !== "owner"));
-      if (demotingOrDisablingOwner) {
-        const [ownerCount] = await db
-          .select({ cnt: sql<number>`count(*)::int` })
-          .from(users)
-          .where(and(eq(users.role, "owner"), eq(users.active, true)));
-        if (Number(ownerCount?.cnt ?? 0) <= 1) {
-          return reply.status(409).send({
-            error: "Cannot deactivate or demote the last active owner account.",
-          });
-        }
+      const nextRole = (data.role ?? existing.role) as import("@supermarket/shared").UserRole;
+      if (data.pin !== undefined) {
+        const { validateCredentialStrength } = await import("@supermarket/shared");
+        const credErr = validateCredentialStrength(data.pin, nextRole);
+        if (credErr) return reply.status(400).send({ error: credErr });
       }
 
       const patch: Partial<typeof users.$inferInsert> = {};
@@ -163,9 +153,36 @@ export async function adminRoutes(app: FastifyInstance) {
       if (data.active !== undefined) patch.active = data.active;
       if (data.pin !== undefined) patch.pinHash = await hashPin(data.pin);
 
-      const shouldRevokeSessions = data.active === false || data.pin !== undefined;
+      const roleChanged = data.role !== undefined && data.role !== existing.role;
+      const shouldRevokeSessions = data.active === false || data.pin !== undefined || roleChanged;
 
-      const updated = await db.transaction(async (tx) => {
+      const txResult = await db.transaction(async (tx) => {
+        const [lockedTarget] = await tx
+          .select()
+          .from(users)
+          .where(eq(users.id, id))
+          .for("update");
+        if (!lockedTarget) return { status: 404 as const, error: "Staff user not found." };
+
+        // Lock active owner rows inside the transaction to prevent concurrent last-owner lockout TOCTOU
+        const demotingOrDisablingOwner =
+          lockedTarget.role === "owner" &&
+          lockedTarget.active &&
+          (data.active === false || (data.role !== undefined && data.role !== "owner"));
+        if (demotingOrDisablingOwner) {
+          const activeOwners = await tx
+            .select({ id: users.id })
+            .from(users)
+            .where(and(eq(users.role, "owner"), eq(users.active, true)))
+            .for("update");
+          if (activeOwners.length <= 1) {
+            return {
+              status: 409 as const,
+              error: "Cannot deactivate or demote the last active owner account.",
+            };
+          }
+        }
+
         const [row] = await tx
           .update(users)
           .set(patch)
@@ -199,14 +216,18 @@ export async function adminRoutes(app: FastifyInstance) {
             role: row.role,
             active: row.active,
             pinReset: data.pin !== undefined,
+            roleChanged,
             sessionsRevoked: revokedCount,
           },
         });
 
-        return { user: row, sessionsRevoked: revokedCount };
+        return { status: 200 as const, user: row, sessionsRevoked: revokedCount };
       });
 
-      return updated;
+      if (txResult.status !== 200) {
+        return reply.status(txResult.status).send({ error: txResult.error });
+      }
+      return { user: txResult.user, sessionsRevoked: txResult.sessionsRevoked };
     }
   );
 

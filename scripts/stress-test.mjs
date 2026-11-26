@@ -130,11 +130,11 @@ async function main() {
     await waitForHealth();
     console.log(`[stress] Compiled API healthy at ${BASE_URL}`);
 
-    // Authenticate as owner
+    // Authenticate as owner (non-browser CLI explicitly requests bearer token)
     const loginRes = await fetch(`${BASE_URL}/api/auth/login`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "owner", pin: "1111" }),
+      headers: { "Content-Type": "application/json", "X-Auth-Mode": "bearer" },
+      body: JSON.stringify({ username: "owner", pin: "1111", includeToken: true }),
     });
     assert.equal(loginRes.status, 200, "Owner login must succeed");
     const { token } = await loginRes.json();

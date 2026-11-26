@@ -11,17 +11,23 @@ declare module "fastify" {
 
 const VALID_REQUEST_ID = /^[a-zA-Z0-9._-]{4,64}$/;
 
+export function resolveCorrelationId(headerVal: string | string[] | undefined): string {
+  const raw = Array.isArray(headerVal) ? headerVal[0] : headerVal;
+  return raw && VALID_REQUEST_ID.test(raw.trim()) ? raw.trim() : generateUuidV7();
+}
+
 export function registerSecurityHeaders(app: FastifyInstance) {
   app.decorateRequest("correlationId", "");
 
   app.addHook("onRequest", async (req) => {
-    const incoming = req.headers["x-request-id"];
-    const raw = Array.isArray(incoming) ? incoming[0] : incoming;
-    req.correlationId = raw && VALID_REQUEST_ID.test(raw.trim()) ? raw.trim() : generateUuidV7();
+    req.correlationId =
+      typeof req.id === "string" && VALID_REQUEST_ID.test(req.id)
+        ? req.id
+        : resolveCorrelationId(req.headers["x-request-id"]);
   });
 
   app.addHook("onSend", async (req, reply, payload) => {
-    reply.header("X-Request-Id", req.correlationId || generateUuidV7());
+    reply.header("X-Request-Id", req.correlationId || req.id || generateUuidV7());
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("X-Frame-Options", "DENY");
     reply.header("Referrer-Policy", "same-origin");
@@ -29,7 +35,7 @@ export function registerSecurityHeaders(app: FastifyInstance) {
     if (!reply.hasHeader("Content-Security-Policy")) {
       reply.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
     }
-    if (env.isProduction || req.protocol === "https") {
+    if (env.cookieSecure || env.isProduction || req.protocol === "https") {
       reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     }
     if (

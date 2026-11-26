@@ -28,15 +28,15 @@ interface ProductItem {
   categoryName: string;
   aisleLocation: string;
   baseUnitLabel: string;
-  avgCostCents: number;
-  minMarginBp: number;
+  avgCostCents?: number;
+  minMarginBp?: number;
   taxRateBp?: number;
   taxInclusive?: boolean;
   requiresAgeCheck: boolean;
   onHandUnits: number;
   primaryBarcode: string;
   primarySellPriceCents: number;
-  marginBp: number;
+  marginBp?: number;
   segment: string | null;
   units60d: number | null;
   earliestExpiry: string | null;
@@ -539,22 +539,28 @@ export function CatalogView({
                         ))}
                       </div>
                     </td>
-                    <td className="text-right mono">{formatMoney(item.avgCostCents)}</td>
+                    <td className="text-right mono">
+                      {typeof item.avgCostCents === "number" ? formatMoney(item.avgCostCents) : "—"}
+                    </td>
                     <td className="text-right mono" style={{ fontWeight: 600 }}>
                       {formatMoney(item.primarySellPriceCents)}
                     </td>
                     <td className="text-right">
-                      <span
-                        className={`tag mono ${
-                          item.marginBp < item.minMarginBp
-                            ? "tag-red"
-                            : item.marginBp >= 2600
-                              ? "tag-green"
-                              : "tag-neutral"
-                        }`}
-                      >
-                        {formatBp(item.marginBp)}
-                      </span>
+                      {typeof item.marginBp === "number" ? (
+                        <span
+                          className={`tag mono ${
+                            item.marginBp < (item.minMarginBp ?? 0)
+                              ? "tag-red"
+                              : item.marginBp >= 2600
+                                ? "tag-green"
+                                : "tag-neutral"
+                          }`}
+                        >
+                          {formatBp(item.marginBp)}
+                        </span>
+                      ) : (
+                        <span style={{ color: "var(--ink-muted)" }}>—</span>
+                      )}
                     </td>
                     <td className="text-right mono">
                       <span
@@ -649,12 +655,14 @@ export function CatalogView({
                   {selected.onHandUnits} {selected.baseUnitLabel}s
                 </div>
               </div>
-              <div className="kpi-tile">
-                <div className="kpi-label">Avg Base Cost (MWAC)</div>
-                <div className="kpi-value" style={{ fontSize: 20 }}>
-                  {formatMoney(selected.avgCostCents)}
+              {typeof selected.avgCostCents === "number" && (
+                <div className="kpi-tile">
+                  <div className="kpi-label">Avg Base Cost (MWAC)</div>
+                  <div className="kpi-value" style={{ fontSize: 20 }}>
+                    {formatMoney(selected.avgCostCents)}
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
 
             <div>
@@ -678,18 +686,21 @@ export function CatalogView({
                       <th>Pack Tier</th>
                       <th>GS1 Barcode</th>
                       <th className="text-right">Price</th>
-                      <th className="text-right">Net Margin</th>
+                      {typeof selected.avgCostCents === "number" && <th className="text-right">Net Margin</th>}
                       {canEditCatalog && <th />}
                     </tr>
                   </thead>
                   <tbody>
                     {selected.barcodes.map((b) => {
-                      const tierMargin = computeNetMarginBp(
-                        b.sellPriceCents,
-                        selected.avgCostCents * b.packQty,
-                        selected.taxRateBp ?? 0,
-                        selected.taxInclusive ?? true
-                      );
+                      const tierMargin =
+                        typeof selected.avgCostCents === "number"
+                          ? computeNetMarginBp(
+                              b.sellPriceCents,
+                              selected.avgCostCents * b.packQty,
+                              selected.taxRateBp ?? 0,
+                              selected.taxInclusive ?? true
+                            )
+                          : null;
                       return (
                         <tr key={b.id}>
                           <td>
@@ -700,11 +711,17 @@ export function CatalogView({
                           </td>
                           <td className="mono">{b.barcode}</td>
                           <td className="text-right mono">{formatMoney(b.sellPriceCents)}</td>
-                          <td className="text-right">
-                            <span className={`tag mono ${tierMargin < selected.minMarginBp ? "tag-red" : "tag-green"}`}>
-                              {formatBp(tierMargin)}
-                            </span>
-                          </td>
+                          {tierMargin !== null && (
+                            <td className="text-right">
+                              <span
+                                className={`tag mono ${
+                                  tierMargin < (selected.minMarginBp ?? 0) ? "tag-red" : "tag-green"
+                                }`}
+                              >
+                                {formatBp(tierMargin)}
+                              </span>
+                            </td>
+                          )}
                           {canEditCatalog && (
                             <td className="text-right">
                               {!b.isPrimary && (
