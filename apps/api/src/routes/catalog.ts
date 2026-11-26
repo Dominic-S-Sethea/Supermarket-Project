@@ -21,7 +21,6 @@ import {
   promotions,
   shelfTagQueue,
   stockBaselines,
-  stockMovements,
   suppliers,
   taxRates,
   users,
@@ -253,7 +252,11 @@ export async function catalogRoutes(app: FastifyInstance) {
           expiryAlertDays: products.expiryAlertDays,
           aisleLocation: products.aisleLocation,
           active: products.active,
-          baselineQty: sql<number>`coalesce(${stockBaselines.quantity}, 0)::int`,
+          onHandUnits: sql<number>`(coalesce(${stockBaselines.quantity}, 0) + coalesce((
+            SELECT sum(sm.qty_delta)
+            FROM stock_movements sm
+            WHERE sm.product_id = ${products.id} AND sm.folded = false
+          ), 0))::int`,
           abcClass: analyticsAbcXyz.abcClass,
           xyzClass: analyticsAbcXyz.xyzClass,
           segment: analyticsAbcXyz.segment,
@@ -277,7 +280,7 @@ export async function catalogRoutes(app: FastifyInstance) {
     }
 
     const pIds = rows.map((r) => r.id);
-    const [bcs, nextBatches, unfoldedRows] = await Promise.all([
+    const [bcs, nextBatches] = await Promise.all([
       db
         .select()
         .from(productBarcodes)
@@ -296,19 +299,6 @@ export async function catalogRoutes(app: FastifyInstance) {
           )
         )
         .groupBy(inventoryBatches.productId),
-      db
-        .select({
-          productId: stockMovements.productId,
-          delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
-        })
-        .from(stockMovements)
-        .where(
-          and(
-            eq(stockMovements.folded, false),
-            inArray(stockMovements.productId, pIds)
-          )
-        )
-        .groupBy(stockMovements.productId),
     ]);
 
     const bcMap = new Map<string, (typeof bcs)[number][]>();
@@ -318,23 +308,21 @@ export async function catalogRoutes(app: FastifyInstance) {
       bcMap.set(bc.productId, list);
     }
     const expiryMap = new Map(nextBatches.map((b) => [b.productId, b.earliestExpiry]));
-    const unfoldedMap = new Map(unfoldedRows.map((u) => [u.productId, Number(u.delta ?? 0)]));
 
     const items = rows.map((r) => {
       const barcodes = bcMap.get(r.id) ?? [];
       const primaryBc = barcodes.find((b) => b.isPrimary) ?? barcodes[0];
       const primarySell = primaryBc?.sellPriceCents ?? 0;
       const primaryPackQty = primaryBc?.packQty ?? 1;
-      const onHandUnits = Number(r.baselineQty ?? 0) + (unfoldedMap.get(r.id) ?? 0);
+      const onHandUnits = Number(r.onHandUnits ?? 0);
       const marginBp = computeNetMarginBp(
         primarySell,
         r.avgCostCents * primaryPackQty,
         r.taxRateBp,
         r.taxInclusive
       );
-      const { baselineQty: _baselineQty, ...rest } = r;
       return {
-        ...rest,
+        ...r,
         onHandUnits,
         primaryBarcode: primaryBc?.barcode ?? "",
         primarySellPriceCents: primarySell,

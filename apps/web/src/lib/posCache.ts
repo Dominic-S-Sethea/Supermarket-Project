@@ -6,6 +6,7 @@ const STORE_NAME = "bootstrap";
 const KEY = "latest_v1";
 
 export const OFFLINE_QUEUE_KEY = "supermarket_os_offline_pos_queue_v1";
+export const DEAD_LETTER_QUEUE_KEY = "supermarket_os_pos_dead_letter_v1";
 
 export interface PosBootstrapSnapshot {
   syncedAt: string;
@@ -17,7 +18,7 @@ export interface PosBootstrapSnapshot {
     categoryId: string;
     taxRateId: string;
     baseUnitLabel: string;
-    avgCostCents: number;
+    avgCostCents?: number;
     requiresAgeCheck: boolean;
   }[];
   barcodes: {
@@ -60,6 +61,7 @@ export interface PosBootstrapSnapshot {
 export interface QueuedPosSale {
   id: string;
   registerCode: string;
+  shiftId?: string | null;
   receiptNo: string;
   kind: "sale";
   soldAt: string;
@@ -88,6 +90,13 @@ export interface QueuedPosSale {
     tenderedCents?: number;
     changeCents?: number;
   }[];
+}
+
+export interface DeadLetterPosSale {
+  sale: QueuedPosSale;
+  error: string;
+  status: number | null;
+  failedAt: string;
 }
 
 export function isValidPosSnapshot(value: unknown): value is PosBootstrapSnapshot {
@@ -125,7 +134,7 @@ export type SaleSyncErrorKind = "permanent" | "auth" | "retryable";
 /**
  * Classify a POS sale upload error so the offline queue never silently drops
  * sales on session expiry (401) or transient outages (5xx/network), while
- * immediately halting retries on permanent client rejections (400/403/404/409/422).
+ * quarantining permanent client rejections (400/403/404/409/422) into the dead-letter queue.
  */
 export function classifySaleSyncError(err: unknown): SaleSyncErrorKind {
   if (err instanceof ApiError) {
@@ -160,6 +169,16 @@ function isValidQueuedSale(item: unknown): item is QueuedPosSale {
   );
 }
 
+function isValidDeadLetterSale(item: unknown): item is DeadLetterPosSale {
+  if (!item || typeof item !== "object") return false;
+  const d = item as Record<string, unknown>;
+  return (
+    isValidQueuedSale(d.sale) &&
+    typeof d.error === "string" &&
+    typeof d.failedAt === "string"
+  );
+}
+
 export function loadOfflineQueue(
   storage: Pick<Storage, "getItem"> | undefined = typeof localStorage !== "undefined"
     ? localStorage
@@ -190,6 +209,80 @@ export function saveOfflineQueue(
   } catch {
     return false;
   }
+}
+
+/**
+ * Synchronously append a sale to persistent offline storage before React state commits
+ * so an immediate 401 unmount cannot lose the receipt.
+ */
+export function enqueueOfflineSale(
+  sale: QueuedPosSale,
+  storage: Pick<Storage, "getItem" | "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): QueuedPosSale[] {
+  const existing = loadOfflineQueue(storage);
+  if (existing.some((s) => s.id === sale.id)) {
+    return existing;
+  }
+  const next = [...existing, sale];
+  saveOfflineQueue(next, storage);
+  return next;
+}
+
+export function loadDeadLetterQueue(
+  storage: Pick<Storage, "getItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): DeadLetterPosSale[] {
+  if (!storage) return [];
+  try {
+    const raw = storage.getItem(DEAD_LETTER_QUEUE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isValidDeadLetterSale);
+  } catch {
+    return [];
+  }
+}
+
+export function saveDeadLetterQueue(
+  items: DeadLetterPosSale[],
+  storage: Pick<Storage, "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): boolean {
+  if (!storage) return false;
+  try {
+    storage.setItem(DEAD_LETTER_QUEUE_KEY, JSON.stringify(items));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function appendDeadLetterSale(
+  entry: DeadLetterPosSale,
+  storage: Pick<Storage, "getItem" | "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): DeadLetterPosSale[] {
+  const existing = loadDeadLetterQueue(storage).filter((d) => d.sale.id !== entry.sale.id);
+  const next = [entry, ...existing];
+  saveDeadLetterQueue(next, storage);
+  return next;
+}
+
+export function removeDeadLetterSale(
+  saleId: string,
+  storage: Pick<Storage, "getItem" | "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): DeadLetterPosSale[] {
+  const next = loadDeadLetterQueue(storage).filter((d) => d.sale.id !== saleId);
+  saveDeadLetterQueue(next, storage);
+  return next;
 }
 
 function openDb(): Promise<IDBDatabase> {

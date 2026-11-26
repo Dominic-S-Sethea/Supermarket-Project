@@ -27,14 +27,19 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { apiGet, apiPost } from "../api";
+import { ApiError, apiGet, apiPost } from "../api";
 import {
+  appendDeadLetterSale,
   classifySaleSyncError,
+  enqueueOfflineSale,
+  loadDeadLetterQueue,
   loadOfflineQueue,
   loadPosCache,
   mapBootstrapPromotions,
+  removeDeadLetterSale,
   saveOfflineQueue,
   savePosCache,
+  type DeadLetterPosSale,
   type PosBootstrapSnapshot,
   type QueuedPosSale,
 } from "../lib/posCache";
@@ -171,6 +176,10 @@ export function PosTerminalView({
   } | null>(null);
 
   const [offlineQueue, setOfflineQueue] = useState<QueuedPosSale[]>(() => loadOfflineQueue());
+  const [deadLetterQueue, setDeadLetterQueue] = useState<DeadLetterPosSale[]>(() =>
+    loadDeadLetterQueue()
+  );
+  const [showDeadLetterModal, setShowDeadLetterModal] = useState(false);
 
   const scanRef = useRef<HTMLInputElement>(null);
   const flushLockRef = useRef(false);
@@ -181,10 +190,6 @@ export function PosTerminalView({
   offlineQueueRef.current = offlineQueue;
   simulatedOfflineRef.current = simulatedOffline;
 
-  useEffect(() => {
-    saveOfflineQueue(offlineQueue);
-  }, [offlineQueue]);
-
   // Reset age verification automatically whenever basket becomes empty (prevents carryover to next customer)
   useEffect(() => {
     if (cart.length === 0 && ageVerified) {
@@ -192,7 +197,9 @@ export function PosTerminalView({
     }
   }, [cart.length, ageVerified]);
 
-  const anyModalOpen = Boolean(pendingAgeItem || showShiftClose || showShiftOpen || showRecentReceipts);
+  const anyModalOpen = Boolean(
+    pendingAgeItem || showShiftClose || showShiftOpen || showRecentReceipts || showDeadLetterModal
+  );
 
   // Re-focus barcode scanner input when POS tab becomes active and no modal is open
   useEffect(() => {
@@ -210,6 +217,7 @@ export function PosTerminalView({
         setShowShiftClose(false);
         setShowShiftOpen(false);
         setShowRecentReceipts(false);
+        setShowDeadLetterModal(false);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -419,7 +427,7 @@ export function PosTerminalView({
           packQty: bc.packQty,
           qtyPacks: 1,
           unitPriceCents: bc.sellPriceCents,
-          unitCostCents: prod.avgCostCents,
+          unitCostCents: prod.avgCostCents ?? 0,
           taxRateBp: tax.rateBp,
           taxInclusive: tax.isInclusive,
           requiresAgeCheck: prod.requiresAgeCheck,
@@ -453,6 +461,7 @@ export function PosTerminalView({
     let authRequired = false;
     const remaining: QueuedPosSale[] = [];
     const permanentErrors: string[] = [];
+    let latestDeadLetters = deadLetterQueue;
 
     try {
       for (let i = 0; i < queueToFlush.length; i++) {
@@ -465,6 +474,12 @@ export function PosTerminalView({
           const kind = classifySaleSyncError(err);
           if (kind === "permanent") {
             permanentErrors.push(`${sale.receiptNo}: ${msg}`);
+            latestDeadLetters = appendDeadLetterSale({
+              sale,
+              error: msg,
+              status: err instanceof ApiError ? err.status : null,
+              failedAt: new Date().toISOString(),
+            });
           } else if (kind === "auth") {
             authRequired = true;
             remaining.push(...queueToFlush.slice(i));
@@ -474,7 +489,10 @@ export function PosTerminalView({
           }
         }
       }
+      // Persist remaining queue synchronously before state update (survives immediate 401 unmount)
+      saveOfflineQueue(remaining);
       setOfflineQueue(remaining);
+      setDeadLetterQueue(latestDeadLetters);
       if (synced > 0) {
         setSyncMessage(
           `Idempotently synced ${synced} queued receipt(s) to PostgreSQL & updated FEFO batches.`
@@ -487,7 +505,9 @@ export function PosTerminalView({
           `Session expired — ${remaining.length} receipt(s) remain safely queued locally until you sign back in.`
         );
       } else if (permanentErrors.length > 0) {
-        setSyncError(`Rejected receipt(s): ${permanentErrors.join("; ")}`);
+        setSyncError(
+          `Quarantined ${permanentErrors.length} rejected receipt(s) in Dead-Letter Queue for manager review: ${permanentErrors.join("; ")}`
+        );
       } else if (remaining.length > 0 && synced === 0) {
         setSyncError(`Still offline — ${remaining.length} receipt(s) remain queued locally.`);
       }
@@ -495,6 +515,31 @@ export function PosTerminalView({
       flushLockRef.current = false;
       setSyncingQueue(false);
     }
+  };
+
+  const handleRetryDeadLetter = async (entry: DeadLetterPosSale, stripCoupon = false) => {
+    if (syncingQueue) return;
+    setSyncingQueue(true);
+    setSyncError(null);
+    try {
+      const retrySale: QueuedPosSale = stripCoupon
+        ? { ...entry.sale, couponCode: null }
+        : entry.sale;
+      await apiPost("/api/pos/sales", retrySale);
+      const nextDlq = removeDeadLetterSale(entry.sale.id);
+      setDeadLetterQueue(nextDlq);
+      setSyncMessage(`Recovered quarantined receipt ${entry.sale.receiptNo} to PostgreSQL.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSyncError(`Retry failed for ${entry.sale.receiptNo}: ${msg}`);
+    } finally {
+      setSyncingQueue(false);
+    }
+  };
+
+  const handleDismissDeadLetter = (saleId: string) => {
+    const nextDlq = removeDeadLetterSale(saleId);
+    setDeadLetterQueue(nextDlq);
   };
 
   const buildPaperReceipt = (
@@ -631,7 +676,8 @@ export function PosTerminalView({
       };
 
       if (simulatedOffline) {
-        setOfflineQueue((q) => [...q, payload]);
+        const nextQueue = enqueueOfflineSale(payload);
+        setOfflineQueue(nextQueue);
         setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[OFFLINE QUEUED]"));
         setSyncMessage(`Saved offline locally (${receiptNo}). Checkout uninterrupted!`);
       } else {
@@ -650,7 +696,9 @@ export function PosTerminalView({
             setSyncError(msg);
             return;
           }
-          setOfflineQueue((q) => [...q, payload]);
+          // Synchronously persist to localStorage before React unmounts on 401 expiry
+          const nextQueue = enqueueOfflineSale(payload);
+          setOfflineQueue(nextQueue);
           setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[OFFLINE QUEUED]"));
           if (kind === "auth") {
             setSyncError(`Session expired — ${receiptNo} queued safely offline until you sign back in.`);
@@ -897,10 +945,25 @@ export function PosTerminalView({
       )}
 
       {syncError && (
-        <div className="banner banner-red" style={{ marginBottom: 12 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
           <span>{syncError}</span>
           <button className="btn btn-sm" onClick={() => setSyncError(null)}>
             Dismiss
+          </button>
+        </div>
+      )}
+
+      {deadLetterQueue.length > 0 && (
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
+          <span>
+            <strong>{deadLetterQueue.length} quarantined offline receipt(s)</strong> require reconciliation — saved locally so no paid sale is lost.
+          </span>
+          <button
+            id="open-dead-letter-modal-btn"
+            className="btn btn-sm"
+            onClick={() => setShowDeadLetterModal(true)}
+          >
+            Review Quarantined ({deadLetterQueue.length})
           </button>
         </div>
       )}
@@ -1540,6 +1603,99 @@ export function PosTerminalView({
 Expected Cash:  ${formatMoney(zReportResult.expectedCashCents)}
 Blind Counted:  ${formatMoney(zReportResult.blindCountedCashCents)}
 Variance:       ${formatMoney(zReportResult.varianceCents)}`}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Quarantined Offline Dead-Letter Queue Modal */}
+      {showDeadLetterModal && (
+        <div className="overlay centered" onClick={() => setShowDeadLetterModal(false)}>
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="dlq-modal-title"
+            style={{ maxWidth: 720, width: "94vw" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <h2 id="dlq-modal-title" style={{ margin: 0, fontSize: 18 }}>
+                  Quarantined Offline Receipts (Dead-Letter Queue)
+                </h2>
+                <p className="page-subtitle" style={{ margin: 0 }}>
+                  Receipts rejected with 4xx validation/conflict errors are preserved locally so paid transactions are never lost.
+                </p>
+              </div>
+              <button
+                className="btn btn-sm"
+                aria-label="Close quarantined receipts dialog"
+                onClick={() => setShowDeadLetterModal(false)}
+              >
+                <X size={14} /> Close
+              </button>
+            </div>
+            {deadLetterQueue.length === 0 ? (
+              <div style={{ color: "var(--ink-secondary)", padding: "12px 0" }}>
+                All quarantined receipts have been resolved.
+              </div>
+            ) : (
+              <div className="stack-md" style={{ gap: 10 }}>
+                {deadLetterQueue.map((entry) => {
+                  const totalCents = entry.sale.lines.reduce((s, l) => s + l.lineTotalCents, 0);
+                  return (
+                    <div key={entry.sale.id} className="triage-box">
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                        <strong className="mono">{entry.sale.receiptNo}</strong>
+                        <span className="tag tag-red mono">
+                          HTTP {entry.status ?? "ERR"} · {formatMoney(totalCents)}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 12.5, color: "var(--accent-crimson)", marginTop: 4 }}>
+                        {entry.error}
+                      </div>
+                      <div className="mono" style={{ fontSize: 11, color: "var(--ink-muted)", marginTop: 3 }}>
+                        Sold {new Date(entry.sale.soldAt).toLocaleString()} · {entry.sale.lines.length} line(s)
+                        {entry.sale.couponCode ? ` · Coupon: ${entry.sale.couponCode}` : ""}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                        <button
+                          className="btn btn-primary btn-sm"
+                          disabled={syncingQueue}
+                          onClick={() => void handleRetryDeadLetter(entry, false)}
+                        >
+                          <RefreshCw size={12} /> Retry Sync
+                        </button>
+                        {entry.sale.couponCode && (
+                          <button
+                            className="btn btn-amber btn-sm"
+                            disabled={syncingQueue}
+                            onClick={() => void handleRetryDeadLetter(entry, true)}
+                          >
+                            Retry Without Coupon
+                          </button>
+                        )}
+                        <a
+                          className="btn btn-sm"
+                          href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(entry, null, 2))}`}
+                          download={`${entry.sale.receiptNo}-quarantined.json`}
+                        >
+                          Export JSON
+                        </a>
+                        {canVoidOrRefund && (
+                          <button
+                            className="btn btn-danger btn-sm"
+                            onClick={() => handleDismissDeadLetter(entry.sale.id)}
+                          >
+                            Dismiss (Reconciled)
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

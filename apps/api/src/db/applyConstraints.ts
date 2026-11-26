@@ -36,6 +36,12 @@ export async function applyDatabaseConstraintsAndViews() {
   `);
 
   await db.execute(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_sales_single_void_per_original
+      ON sales (original_sale_id)
+      WHERE kind = 'void' AND original_sale_id IS NOT NULL;
+  `);
+
+  await db.execute(sql`
     CREATE UNIQUE INDEX IF NOT EXISTS uq_targeted_coupons_upper_code
       ON targeted_coupons (upper(code));
   `);

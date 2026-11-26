@@ -401,42 +401,116 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
         .where(eq(inventoryBatches.id, firstBatch.id));
     }
 
-    // Void once succeeds for manager/owner, second void for same originalSaleId -> 409 Conflict
+    // Tampered unitPriceCents (selling full-price item for 1c) -> 400 rejected (C-01)
+    const tamperedPrice = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(cashierToken),
+      payload: {
+        ...basePayload,
+        id: generateUuidV7(),
+        receiptNo: `TEST-TAMP-${generateUuidV7().slice(-6)}`,
+        lines: [{ ...basePayload.lines[0], id: generateUuidV7(), unitPriceCents: 1, lineTotalCents: 1 }],
+        payments: [{ id: generateUuidV7(), method: "cash", amountCents: 1 }],
+      },
+    });
+    expect(tamperedPrice.statusCode).toBe(400);
+
+    // Forged discount without qualifying promo or coupon -> 400 rejected (C-01)
+    if (bc.sellPriceCents > 10) {
+      const forgedDiscount = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: {
+          ...basePayload,
+          id: generateUuidV7(),
+          receiptNo: `TEST-DISC-${generateUuidV7().slice(-6)}`,
+          lines: [
+            {
+              ...basePayload.lines[0],
+              id: generateUuidV7(),
+              discountCents: bc.sellPriceCents - 1,
+              lineTotalCents: 1,
+            },
+          ],
+          payments: [{ id: generateUuidV7(), method: "cash", amountCents: 1 }],
+        },
+      });
+      expect(forgedDiscount.statusCode).toBe(400);
+    }
+
+    // Concurrent double-void on the same originalSaleId -> strictly 1x 201 + 1x 409 (C-01)
     const void1Id = generateUuidV7();
-    const void1 = await app.inject({
-      method: "POST",
-      url: "/api/pos/sales",
-      headers: authHeaders(ownerToken),
-      payload: {
-        ...basePayload,
-        id: void1Id,
-        receiptNo: `TEST-VOID1-${void1Id.slice(-6)}`,
-        kind: "void",
-        originalSaleId: saleId,
-        lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
-        payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
-      },
-    });
-    expect(void1.statusCode).toBe(201);
-
     const void2Id = generateUuidV7();
-    const void2 = await app.inject({
+    const [voidA, voidB] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(ownerToken),
+        payload: {
+          ...basePayload,
+          id: void1Id,
+          receiptNo: `TEST-VOID1-${void1Id.slice(-6)}`,
+          kind: "void",
+          originalSaleId: saleId,
+          lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+          payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+        },
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(ownerToken),
+        payload: {
+          ...basePayload,
+          id: void2Id,
+          receiptNo: `TEST-VOID2-${void2Id.slice(-6)}`,
+          kind: "void",
+          originalSaleId: saleId,
+          lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+          payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+        },
+      }),
+    ]);
+    expect([voidA.statusCode, voidB.statusCode].sort()).toEqual([201, 409]);
+
+    // Cumulative refund cap on concAId: first full refund succeeds (201), second refund blocked (409)
+    const refund1Id = generateUuidV7();
+    const refund2Id = generateUuidV7();
+    const refund1 = await app.inject({
       method: "POST",
       url: "/api/pos/sales",
       headers: authHeaders(ownerToken),
       payload: {
         ...basePayload,
-        id: void2Id,
-        receiptNo: `TEST-VOID2-${void2Id.slice(-6)}`,
-        kind: "void",
-        originalSaleId: saleId,
+        id: refund1Id,
+        receiptNo: `TEST-RFND1-${refund1Id.slice(-6)}`,
+        kind: "refund",
+        originalSaleId: concAId,
         lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
         payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
       },
     });
-    expect(void2.statusCode).toBe(409);
+    expect(refund1.statusCode).toBe(201);
 
-    const cleanupSaleIds = [saleId, concAId, concBId, void1Id];
+    const refund2 = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(ownerToken),
+      payload: {
+        ...basePayload,
+        id: refund2Id,
+        receiptNo: `TEST-RFND2-${refund2Id.slice(-6)}`,
+        kind: "refund",
+        originalSaleId: concAId,
+        lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+        payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+      },
+    });
+    expect(refund2.statusCode).toBe(409);
+
+    const cleanupSaleIds = [saleId, concAId, concBId, void1Id, void2Id, refund1Id];
     await db.delete(stockMovements).where(inArray(stockMovements.refId, cleanupSaleIds));
     await db.delete(sales).where(inArray(sales.id, cleanupSaleIds));
   });
@@ -1373,9 +1447,10 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const bc = boot.barcodes.find((b) => b.productId === safeProd.id)!;
     const tax = boot.taxRates.find((t) => t.id === safeProd.taxRateId)!;
 
-    const unitPrice = 1000;
+    const unitPrice = bc.sellPriceCents;
+    const qtyPacks = Math.max(1, Math.ceil(600 / Math.max(1, unitPrice)));
     const discountCents = 200;
-    const afterDiscount = unitPrice - discountCents; // 800c
+    const afterDiscount = unitPrice * qtyPacks - discountCents;
     const lineTax = tax.isInclusive
       ? Math.round((afterDiscount * tax.rateBp) / (10000 + tax.rateBp))
       : Math.round((afterDiscount * tax.rateBp) / 10000);
@@ -1397,7 +1472,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
           scannedBarcode: bc.barcode,
           packLabel: bc.packLabel,
           packQty: bc.packQty,
-          qtyPacks: 1,
+          qtyPacks,
           unitPriceCents: unitPrice,
           unitCostCents: safeProd.avgCostCents,
           discountCents,

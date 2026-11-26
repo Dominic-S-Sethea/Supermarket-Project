@@ -1,5 +1,12 @@
 import type { FastifyInstance } from "fastify";
-import { generateUuidV7, PosSaleUploadSchema } from "@supermarket/shared";
+import {
+  computeTaxCents,
+  evaluateCart,
+  generateUuidV7,
+  PosSaleUploadSchema,
+  type CartInputLine,
+  type PromotionRule,
+} from "@supermarket/shared";
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -109,27 +116,77 @@ export async function posRoutes(app: FastifyInstance) {
         });
       }
 
-      // Verify referenced products exist and load authoritative tax/age-check metadata
+      if ((payload.kind === "refund" || payload.kind === "void") && !payload.originalSaleId) {
+        return reply.status(400).send({
+          error: "originalSaleId is required for voids and refunds.",
+        });
+      }
+
+      // Verify referenced products, barcodes, and authoritative cost/price/tax/age metadata
       const uniquePids = Array.from(new Set(payload.lines.map((l) => l.productId)));
-      const foundProds = await db
-        .select({
-          id: products.id,
-          requiresAgeCheck: products.requiresAgeCheck,
-          taxInclusive: taxRates.isInclusive,
-          taxRateBp: taxRates.rateBp,
-        })
-        .from(products)
-        .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
-        .where(inArray(products.id, uniquePids));
+      const [foundProds, foundBarcodes, activePromos] = await Promise.all([
+        db
+          .select({
+            id: products.id,
+            sku: products.sku,
+            name: products.name,
+            categoryId: products.categoryId,
+            avgCostCents: products.avgCostCents,
+            requiresAgeCheck: products.requiresAgeCheck,
+            taxInclusive: taxRates.isInclusive,
+            taxRateBp: taxRates.rateBp,
+          })
+          .from(products)
+          .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
+          .where(inArray(products.id, uniquePids)),
+        db
+          .select({
+            productId: productBarcodes.productId,
+            barcode: productBarcodes.barcode,
+            packQty: productBarcodes.packQty,
+            packLabel: productBarcodes.packLabel,
+            sellPriceCents: productBarcodes.sellPriceCents,
+          })
+          .from(productBarcodes)
+          .where(inArray(productBarcodes.productId, uniquePids)),
+        payload.kind === "sale"
+          ? db.select().from(promotions).where(eq(promotions.active, true))
+          : Promise.resolve([]),
+      ]);
+
       if (foundProds.length !== uniquePids.length) {
         return reply.status(400).send({ error: "One or more line productId values do not exist." });
       }
       const prodMetaMap = new Map(foundProds.map((p) => [p.id, p]));
+      const barcodeMap = new Map(
+        foundBarcodes.map((b) => [`${b.productId}::${b.barcode}`, b])
+      );
 
       let cartRequiresAgeCheck = false;
+      const normalizedLines: (typeof payload.lines[number])[] = [];
+
       for (const l of payload.lines) {
         const meta = prodMetaMap.get(l.productId)!;
         if (meta.requiresAgeCheck) cartRequiresAgeCheck = true;
+
+        if (payload.kind === "sale") {
+          const authBarcode = barcodeMap.get(`${l.productId}::${l.scannedBarcode}`);
+          if (!authBarcode) {
+            return reply.status(400).send({
+              error: `Barcode "${l.scannedBarcode}" is not registered for product ${meta.sku}.`,
+            });
+          }
+          if (l.packQty !== authBarcode.packQty) {
+            return reply.status(400).send({
+              error: `Pack quantity mismatch for barcode "${l.scannedBarcode}" (expected ${authBarcode.packQty}, got ${l.packQty}).`,
+            });
+          }
+          if (l.unitPriceCents !== authBarcode.sellPriceCents) {
+            return reply.status(400).send({
+              error: `Unit price mismatch for barcode "${l.scannedBarcode}" (expected ${authBarcode.sellPriceCents}c, got ${l.unitPriceCents}c).`,
+            });
+          }
+        }
 
         const lineGross = l.unitPriceCents * l.qtyPacks;
         if (l.discountCents > lineGross) {
@@ -138,17 +195,32 @@ export async function posRoutes(app: FastifyInstance) {
           });
         }
         const afterDiscount = lineGross - l.discountCents;
-        const expectedLineTotal = meta.taxInclusive ? afterDiscount : afterDiscount + l.taxCents;
+        const authoritativeTaxCents = computeTaxCents(
+          afterDiscount,
+          meta.taxRateBp,
+          meta.taxInclusive
+        ).taxCents;
+        const expectedLineTotal = meta.taxInclusive
+          ? afterDiscount
+          : afterDiscount + authoritativeTaxCents;
         if (l.lineTotalCents !== expectedLineTotal) {
           return reply.status(400).send({
             error: `Invalid line total on product ${l.productId} (expected ${expectedLineTotal}c, got ${l.lineTotalCents}c)`,
           });
         }
-        if (meta.taxInclusive && l.taxCents > l.lineTotalCents) {
+        if (meta.taxInclusive && authoritativeTaxCents > l.lineTotalCents) {
           return reply.status(400).send({
             error: `Included tax exceeds line total on product ${l.productId}`,
           });
         }
+
+        normalizedLines.push({
+          ...l,
+          unitCostCents: meta.avgCostCents,
+          taxRateBp: meta.taxRateBp,
+          taxCents: authoritativeTaxCents,
+          lineTotalCents: expectedLineTotal,
+        });
       }
 
       if (payload.kind === "sale" && cartRequiresAgeCheck && !payload.ageVerified) {
@@ -174,14 +246,14 @@ export async function posRoutes(app: FastifyInstance) {
         }
       }
 
-      const subtotalCents = payload.lines.reduce(
+      const subtotalCents = normalizedLines.reduce(
         (s, l) => s + l.unitPriceCents * l.qtyPacks,
         0
       );
-      const discountCents = payload.lines.reduce((s, l) => s + l.discountCents, 0);
-      const taxCents = payload.lines.reduce((s, l) => s + l.taxCents, 0);
-      const totalCents = payload.lines.reduce((s, l) => s + l.lineTotalCents, 0);
-      const totalCostCents = payload.lines.reduce(
+      const discountCents = normalizedLines.reduce((s, l) => s + l.discountCents, 0);
+      const taxCents = normalizedLines.reduce((s, l) => s + l.taxCents, 0);
+      const totalCents = normalizedLines.reduce((s, l) => s + l.lineTotalCents, 0);
+      let totalCostCents = normalizedLines.reduce(
         (s, l) => s + l.unitCostCents * l.packQty * l.qtyPacks,
         0
       );
@@ -193,37 +265,36 @@ export async function posRoutes(app: FastifyInstance) {
         });
       }
 
+      let customerSegment: string | null = null;
       if (payload.customerId) {
         const [cust] = await db
-          .select({ id: customers.id })
+          .select({ id: customers.id, rfmSegment: customers.rfmSegment })
           .from(customers)
           .where(eq(customers.id, payload.customerId))
           .limit(1);
         if (!cust) {
           return reply.status(404).send({ error: "Referenced customerId not found." });
         }
+        customerSegment = cust.rfmSegment;
       }
 
-      if (payload.originalSaleId) {
-        const [orig] = await db
-          .select({ id: sales.id, kind: sales.kind })
-          .from(sales)
-          .where(eq(sales.id, payload.originalSaleId))
-          .limit(1);
-        if (!orig) {
-          return reply.status(404).send({ error: "Referenced originalSaleId not found." });
-        }
-        if (orig.kind !== "sale") {
-          return reply.status(400).send({
-            error: "Referenced originalSaleId must be a sale receipt.",
-          });
-        }
-      }
+      const mappedActivePromos: PromotionRule[] = activePromos.map((pr) => ({
+        ...((pr.rulesJson ?? {}) as Record<string, unknown>),
+        id: pr.id,
+        name: pr.name,
+        promoType: pr.promoType as PromotionRule["promoType"],
+        priority: pr.priority,
+        combinable: pr.combinable,
+        minMarginGuardBp: pr.minMarginGuardBp,
+        startsAt: pr.startsAt ? pr.startsAt.toISOString() : null,
+        endsAt: pr.endsAt ? pr.endsAt.toISOString() : null,
+        daypartStartHour: pr.daypartStartHour,
+        daypartEndHour: pr.daypartEndHour,
+      }));
 
       const sign = payload.kind === "refund" || payload.kind === "void" ? 1 : -1;
       let duplicate = false;
-      let alreadyVoided = false;
-      let couponRejection: { status: 400 | 409; message: string } | null = null;
+      let txRejection: { status: 400 | 404 | 409; message: string } | null = null;
       let pointsEarned = 0;
 
       try {
@@ -239,22 +310,161 @@ export async function posRoutes(app: FastifyInstance) {
             return;
           }
 
-          if (payload.kind === "void" && payload.originalSaleId) {
-            const [priorVoid] = await tx
-              .select({ id: sales.id })
+          // Row-lock original sale for voids/refunds to eliminate concurrent double-void and over-refund races
+          if ((payload.kind === "void" || payload.kind === "refund") && payload.originalSaleId) {
+            const [orig] = await tx
+              .select()
               .from(sales)
-              .where(
-                and(eq(sales.originalSaleId, payload.originalSaleId), eq(sales.kind, "void"))
-              )
-              .limit(1);
-            if (priorVoid) {
-              alreadyVoided = true;
+              .where(eq(sales.id, payload.originalSaleId))
+              .for("update");
+            if (!orig) {
+              txRejection = { status: 404, message: "Referenced originalSaleId not found." };
               return;
             }
+            if (orig.kind !== "sale") {
+              txRejection = {
+                status: 400,
+                message: "Referenced originalSaleId must be a sale receipt.",
+              };
+              return;
+            }
+
+            const priorReversals = await tx
+              .select({ id: sales.id, kind: sales.kind, totalCents: sales.totalCents })
+              .from(sales)
+              .where(eq(sales.originalSaleId, payload.originalSaleId));
+
+            if (priorReversals.some((r) => r.kind === "void")) {
+              txRejection = { status: 409, message: "Original sale has already been voided." };
+              return;
+            }
+
+            const priorRefunds = priorReversals.filter((r) => r.kind === "refund");
+            if (payload.kind === "void" && priorRefunds.length > 0) {
+              txRejection = {
+                status: 409,
+                message:
+                  "Original sale already has partial refunds and cannot be voided; post a refund for remaining items instead.",
+              };
+              return;
+            }
+
+            const origLines = await tx
+              .select()
+              .from(saleLines)
+              .where(eq(saleLines.saleId, orig.id));
+
+            const priorRefundIds = priorRefunds.map((r) => r.id);
+            const priorRefundLines =
+              priorRefundIds.length > 0
+                ? await tx
+                    .select()
+                    .from(saleLines)
+                    .where(inArray(saleLines.saleId, priorRefundIds))
+                : [];
+
+            // Aggregate original and already-refunded quantities per (productId, scannedBarcode)
+            const origAgg = new Map<
+              string,
+              {
+                qtyPacks: number;
+                packQty: number;
+                unitPriceCents: number;
+                unitCostCents: number;
+                lineTotalCents: number;
+              }
+            >();
+            for (const ol of origLines) {
+              const key = `${ol.productId}::${ol.scannedBarcode}`;
+              const cur = origAgg.get(key);
+              if (cur) {
+                cur.qtyPacks += ol.qtyPacks;
+                cur.lineTotalCents += ol.lineTotalCents;
+              } else {
+                origAgg.set(key, {
+                  qtyPacks: ol.qtyPacks,
+                  packQty: ol.packQty,
+                  unitPriceCents: ol.unitPriceCents,
+                  unitCostCents: ol.unitCostCents,
+                  lineTotalCents: ol.lineTotalCents,
+                });
+              }
+            }
+
+            const refundedAgg = new Map<string, { qtyPacks: number; lineTotalCents: number }>();
+            for (const rl of priorRefundLines) {
+              const key = `${rl.productId}::${rl.scannedBarcode}`;
+              const cur = refundedAgg.get(key) ?? { qtyPacks: 0, lineTotalCents: 0 };
+              cur.qtyPacks += rl.qtyPacks;
+              cur.lineTotalCents += rl.lineTotalCents;
+              refundedAgg.set(key, cur);
+            }
+
+            const reqAgg = new Map<string, { qtyPacks: number; lineTotalCents: number }>();
+            for (const l of normalizedLines) {
+              const key = `${l.productId}::${l.scannedBarcode}`;
+              const origItem = origAgg.get(key);
+              if (!origItem) {
+                txRejection = {
+                  status: 400,
+                  message: `Item "${l.scannedBarcode}" was not part of original receipt ${orig.receiptNo}.`,
+                };
+                return;
+              }
+              if (l.packQty !== origItem.packQty) {
+                txRejection = {
+                  status: 400,
+                  message: `Pack quantity mismatch for reversal item "${l.scannedBarcode}".`,
+                };
+                return;
+              }
+              // Use original sale cost-at-sale on restock movements
+              l.unitCostCents = origItem.unitCostCents;
+              const cur = reqAgg.get(key) ?? { qtyPacks: 0, lineTotalCents: 0 };
+              cur.qtyPacks += l.qtyPacks;
+              cur.lineTotalCents += l.lineTotalCents;
+              reqAgg.set(key, cur);
+            }
+
+            for (const [key, reqItem] of reqAgg.entries()) {
+              const origItem = origAgg.get(key)!;
+              const prevRef = refundedAgg.get(key) ?? { qtyPacks: 0, lineTotalCents: 0 };
+              const remainingQty = origItem.qtyPacks - prevRef.qtyPacks;
+              if (reqItem.qtyPacks > remainingQty) {
+                txRejection = {
+                  status: 409,
+                  message: `Reversal quantity (${reqItem.qtyPacks}) exceeds remaining refundable quantity (${remainingQty}) on receipt ${orig.receiptNo}.`,
+                };
+                return;
+              }
+              const remainingLineCents = Math.max(0, origItem.lineTotalCents - prevRef.lineTotalCents);
+              if (reqItem.lineTotalCents > remainingLineCents + 1) {
+                txRejection = {
+                  status: 400,
+                  message: `Reversal amount (${reqItem.lineTotalCents}c) exceeds remaining refundable line value (${remainingLineCents}c).`,
+                };
+                return;
+              }
+            }
+
+            const priorRefundedTotalCents = priorRefunds.reduce((s, r) => s + r.totalCents, 0);
+            if (priorRefundedTotalCents + totalCents > orig.totalCents) {
+              txRejection = {
+                status: 409,
+                message: `Cumulative refund/void total (${priorRefundedTotalCents + totalCents}c) exceeds original sale total (${orig.totalCents}c).`,
+              };
+              return;
+            }
+
+            totalCostCents = normalizedLines.reduce(
+              (s, l) => s + l.unitCostCents * l.packQty * l.qtyPacks,
+              0
+            );
           }
 
           // Atomic single-use loyalty coupon validation & row lock (prevents concurrent double-redemption)
           let lockedCouponId: string | null = null;
+          let lockedCouponDiscountCents = 0;
           if (payload.kind === "sale" && payload.couponCode) {
             const normalizedCode = payload.couponCode.trim().toUpperCase();
             const [coupon] = await tx
@@ -263,14 +473,14 @@ export async function posRoutes(app: FastifyInstance) {
               .where(sql`upper(${targetedCoupons.code}) = ${normalizedCode}`)
               .for("update");
             if (!coupon) {
-              couponRejection = {
+              txRejection = {
                 status: 400,
                 message: `Coupon code "${normalizedCode}" not found.`,
               };
               return;
             }
             if (coupon.redeemedSaleId) {
-              couponRejection = {
+              txRejection = {
                 status: 409,
                 message: `Coupon code "${coupon.code}" has already been redeemed.`,
               };
@@ -281,27 +491,71 @@ export async function posRoutes(app: FastifyInstance) {
               soldMs < new Date(coupon.validFrom).getTime() ||
               soldMs > new Date(coupon.validUntil).getTime()
             ) {
-              couponRejection = {
+              txRejection = {
                 status: 400,
                 message: `Coupon code "${coupon.code}" is expired or not yet valid.`,
               };
               return;
             }
             if (coupon.customerId && coupon.customerId !== payload.customerId) {
-              couponRejection = {
+              txRejection = {
                 status: 400,
                 message: `Coupon code "${coupon.code}" is restricted to a different loyalty customer.`,
               };
               return;
             }
+            if (coupon.rfmSegment && customerSegment !== coupon.rfmSegment) {
+              txRejection = {
+                status: 400,
+                message: `Coupon code "${coupon.code}" requires loyalty segment "${coupon.rfmSegment}".`,
+              };
+              return;
+            }
             if (subtotalCents < coupon.minBasketCents) {
-              couponRejection = {
+              txRejection = {
                 status: 400,
                 message: `Basket subtotal (${subtotalCents}c) is below coupon minimum (${coupon.minBasketCents}c).`,
               };
               return;
             }
             lockedCouponId = coupon.id;
+            lockedCouponDiscountCents = coupon.discountCents;
+          }
+
+          // Authoritative server-side discount validation via shared promotion engine (blocks forged discounts)
+          if (payload.kind === "sale" && discountCents > 0) {
+            const cartInputs: CartInputLine[] = normalizedLines.map((l) => {
+              const meta = prodMetaMap.get(l.productId)!;
+              return {
+                lineKey: l.id,
+                productId: l.productId,
+                categoryId: meta.categoryId,
+                sku: meta.sku,
+                name: meta.name,
+                scannedBarcode: l.scannedBarcode,
+                packLabel: l.packLabel,
+                packQty: l.packQty,
+                qtyPacks: l.qtyPacks,
+                unitPriceCents: l.unitPriceCents,
+                unitCostCents: meta.avgCostCents,
+                taxRateBp: meta.taxRateBp,
+                taxInclusive: meta.taxInclusive,
+                requiresAgeCheck: meta.requiresAgeCheck,
+              };
+            });
+            const soldDate = new Date(payload.soldAt);
+            const serverEval = evaluateCart(cartInputs, mappedActivePromos, {
+              evalNow: soldDate,
+              evalHour: soldDate.getHours(),
+              couponDiscountCents: lockedCouponDiscountCents,
+            });
+            if (discountCents > serverEval.totalDiscountCents) {
+              txRejection = {
+                status: 400,
+                message: `Total discount (${discountCents}c) exceeds maximum authorized promotion and coupon discount (${serverEval.totalDiscountCents}c).`,
+              };
+              return;
+            }
           }
 
           const inserted = await tx
@@ -342,7 +596,7 @@ export async function posRoutes(app: FastifyInstance) {
           }
 
           await tx.insert(saleLines).values(
-            payload.lines.map((l) => ({
+            normalizedLines.map((l) => ({
               id: l.id,
               saleId: payload.id,
               productId: l.productId,
@@ -373,7 +627,7 @@ export async function posRoutes(app: FastifyInstance) {
 
           // Append immutable inventory ledger rows + locked FEFO batch depletion on sales
           // Sort lines by productId for deterministic row-lock ordering across concurrent checkouts
-          const orderedLines = [...payload.lines].sort((a, b) =>
+          const orderedLines = [...normalizedLines].sort((a, b) =>
             a.productId.localeCompare(b.productId)
           );
           const movementRows: (typeof stockMovements.$inferInsert)[] = [];
@@ -503,6 +757,14 @@ export async function posRoutes(app: FastifyInstance) {
         });
       } catch (err: unknown) {
         if (getPgErrorCode(err) === "23505") {
+          const constraint =
+            (err as { constraint?: string; cause?: { constraint?: string } }).constraint ??
+            (err as { cause?: { constraint?: string } }).cause?.constraint;
+          if (constraint === "uq_sales_single_void_per_original") {
+            return reply.status(409).send({
+              error: "Original sale has already been voided.",
+            });
+          }
           return reply.status(409).send({
             error: `Receipt number "${payload.receiptNo}" already exists for a different sale ID.`,
           });
@@ -510,15 +772,9 @@ export async function posRoutes(app: FastifyInstance) {
         throw err;
       }
 
-      if (couponRejection) {
-        const rej = couponRejection as { status: 400 | 409; message: string };
+      if (txRejection) {
+        const rej = txRejection as { status: 400 | 404 | 409; message: string };
         return reply.status(rej.status).send({ error: rej.message });
-      }
-
-      if (alreadyVoided) {
-        return reply.status(409).send({
-          error: "Original sale has already been voided.",
-        });
       }
 
       return reply.status(duplicate ? 200 : 201).send({

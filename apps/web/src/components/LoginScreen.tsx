@@ -10,23 +10,33 @@ export interface SessionUser {
   role: UserRole;
 }
 
-const DEMO_PERSONAS: { label: string; role: string; username: string; pin: string }[] = [
-  { label: "Owner", role: "Full Access + AI", username: "owner", pin: "1111" },
-  { label: "Store Manager", role: "GRN, POs & AI", username: "manager", pin: "9999" },
-  { label: "Accountant", role: "Audit, Z-Reports & Exports", username: "accountant", pin: "4444" },
-  { label: "Cashier (Lane 01)", role: "POS & Shifts", username: "cashier1", pin: "1234" },
-  { label: "Stock Clerk", role: "FEFO & Counts", username: "clerk1", pin: "2222" },
-];
+const SHOW_DEMO_PERSONAS =
+  import.meta.env.DEV && import.meta.env.VITE_ENABLE_DEMO_LOGIN === "true";
+
+const DEMO_PERSONAS: { label: string; role: string; username: string; pin: string }[] =
+  SHOW_DEMO_PERSONAS
+    ? [
+        { label: "Owner", role: "Full Access + AI", username: "owner", pin: "1111" },
+        { label: "Store Manager", role: "GRN, POs & AI", username: "manager", pin: "9999" },
+        { label: "Accountant", role: "Audit, Z-Reports & Exports", username: "accountant", pin: "4444" },
+        { label: "Cashier (Lane 01)", role: "POS & Shifts", username: "cashier1", pin: "1234" },
+        { label: "Stock Clerk", role: "FEFO & Counts", username: "clerk1", pin: "2222" },
+      ]
+    : [];
 
 export function LoginScreen({
   onLoggedIn,
   sessionNotice,
+  apiHealthy = true,
+  onRetryConnection,
 }: {
   onLoggedIn: (user: SessionUser) => void;
   sessionNotice?: string | null;
+  apiHealthy?: boolean;
+  onRetryConnection?: () => void;
 }) {
-  const [username, setUsername] = useState("owner");
-  const [pin, setPin] = useState("1111");
+  const [username, setUsername] = useState("");
+  const [pin, setPin] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -37,8 +47,8 @@ export function LoginScreen({
       setError("Enter your staff username.");
       return;
     }
-    if (cleanPin.length < 4 || cleanPin.length > 12) {
-      setError("Staff PIN must be 4 to 12 characters.");
+    if (cleanPin.length < 4 || cleanPin.length > 64) {
+      setError("Staff PIN or password must be 4 to 64 characters.");
       return;
     }
     setError(null);
@@ -58,9 +68,9 @@ export function LoginScreen({
 
   return (
     <div className="login-shell">
-      <div className="login-card">
+      <main className="login-card">
         <div className="brand-lockup" style={{ borderBottomColor: "var(--border-hairline)", paddingLeft: 0 }}>
-          <div className="brand-mark">S</div>
+          <div className="brand-mark" aria-hidden="true">S</div>
           <div>
             <div className="brand-title" style={{ color: "var(--ink-primary)", fontSize: 18 }}>
               SupermarketOS
@@ -73,17 +83,30 @@ export function LoginScreen({
 
         <h1 style={{ fontSize: 20, margin: "0 0 6px" }}>Staff Sign-In</h1>
         <p className="panel-desc" style={{ marginBottom: 16 }}>
-          Enter your staff username and PIN, or pick a demo role below.
+          {SHOW_DEMO_PERSONAS
+            ? "Enter your staff username and PIN, or pick a local dev role below."
+            : "Enter your staff username and PIN / password to start your shift."}
         </p>
 
+        {!apiHealthy && (
+          <div className="banner banner-amber" role="alert" style={{ marginBottom: 14 }}>
+            <span>Store API is currently unreachable. Check LAN / server health before signing in.</span>
+            {onRetryConnection && (
+              <button type="button" className="btn btn-sm" onClick={onRetryConnection}>
+                Retry
+              </button>
+            )}
+          </div>
+        )}
+
         {sessionNotice && !error && (
-          <div className="banner banner-amber" style={{ marginBottom: 14 }}>
+          <div className="banner banner-amber" role="status" style={{ marginBottom: 14 }}>
             {sessionNotice}
           </div>
         )}
 
         {error && (
-          <div className="banner banner-red" style={{ marginBottom: 14 }}>
+          <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
             {error}
           </div>
         )}
@@ -109,7 +132,7 @@ export function LoginScreen({
             />
           </div>
           <div className="field">
-            <label htmlFor="login-pin">Staff PIN</label>
+            <label htmlFor="login-pin">Staff PIN / Password</label>
             <input
               id="login-pin"
               className="input mono"
@@ -119,7 +142,7 @@ export function LoginScreen({
               autoComplete="current-password"
               disabled={submitting}
               minLength={4}
-              maxLength={12}
+              maxLength={64}
               required
             />
           </div>
@@ -129,37 +152,39 @@ export function LoginScreen({
             className="btn btn-primary"
             disabled={submitting}
           >
-            <KeyRound size={14} /> {submitting ? "Signing in..." : "Sign In"}
+            <KeyRound size={14} aria-hidden="true" /> {submitting ? "Signing in..." : "Sign In"}
           </button>
         </form>
 
-        <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--border-hairline)" }}>
-          <div style={{ fontSize: 11.5, fontWeight: 600, color: "var(--ink-muted)", marginBottom: 8 }}>
-            <ShieldCheck size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
-            QUICK DEMO ROLE SIGN-IN
+        {SHOW_DEMO_PERSONAS && DEMO_PERSONAS.length > 0 && (
+          <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--border-hairline)" }}>
+            <div style={{ fontSize: 11.5, fontWeight: 600, color: "var(--ink-muted)", marginBottom: 8 }}>
+              <ShieldCheck size={12} aria-hidden="true" style={{ verticalAlign: "middle", marginRight: 4 }} />
+              LOCAL DEV DEMO ROLES
+            </div>
+            <div className="persona-grid">
+              {DEMO_PERSONAS.map((p) => (
+                <button
+                  key={p.username}
+                  type="button"
+                  className="quick-sku-btn"
+                  disabled={submitting}
+                  onClick={() => {
+                    setUsername(p.username);
+                    setPin(p.pin);
+                    void submitLogin(p.username, p.pin);
+                  }}
+                >
+                  <strong style={{ fontSize: 12.5 }}>{p.label}</strong>
+                  <span className="mono" style={{ fontSize: 11, color: "var(--ink-secondary)" }}>
+                    {p.username} · {p.role}
+                  </span>
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="persona-grid">
-            {DEMO_PERSONAS.map((p) => (
-              <button
-                key={p.username}
-                type="button"
-                className="quick-sku-btn"
-                disabled={submitting}
-                onClick={() => {
-                  setUsername(p.username);
-                  setPin(p.pin);
-                  void submitLogin(p.username, p.pin);
-                }}
-              >
-                <strong style={{ fontSize: 12.5 }}>{p.label}</strong>
-                <span className="mono" style={{ fontSize: 11, color: "var(--ink-secondary)" }}>
-                  {p.username} · {p.role}
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
+        )}
+      </main>
     </div>
   );
 }

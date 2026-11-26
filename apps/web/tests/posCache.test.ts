@@ -7,13 +7,18 @@ import {
   setUnauthorizedHandler,
 } from "../src/api.ts";
 import {
+  appendDeadLetterSale,
   classifySaleSyncError,
   clearPosCache,
+  DEAD_LETTER_QUEUE_KEY,
+  enqueueOfflineSale,
   isValidPosSnapshot,
+  loadDeadLetterQueue,
   loadOfflineQueue,
   loadPosCache,
   mapBootstrapPromotions,
   OFFLINE_QUEUE_KEY,
+  removeDeadLetterSale,
   saveOfflineQueue,
   savePosCache,
   type PosBootstrapSnapshot,
@@ -187,6 +192,44 @@ describe("POS offline queue and sync classification", () => {
     const [loaded] = loadOfflineQueue(mockStorage);
     assert.equal(loaded.customerId, loyaltySale.customerId);
     assert.equal(loaded.couponCode, "SAVE5-ABC123");
+  });
+
+  it("synchronously persists enqueued sales without duplicates and manages persistent dead-letter quarantine", () => {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+    };
+
+    const q1 = enqueueOfflineSale(sampleSale, mockStorage);
+    assert.equal(q1.length, 1);
+    // Synchronous persistence already written to storage before any async React effect
+    assert.equal(loadOfflineQueue(mockStorage).length, 1);
+    // Re-enqueuing same UUIDv7 sale ID is idempotent
+    const q2 = enqueueOfflineSale(sampleSale, mockStorage);
+    assert.equal(q2.length, 1);
+
+    const dlq1 = appendDeadLetterSale(
+      {
+        sale: sampleSale,
+        error: "Coupon already redeemed",
+        status: 409,
+        failedAt: "2026-11-25T10:05:00.000Z",
+      },
+      mockStorage
+    );
+    assert.equal(dlq1.length, 1);
+    assert.equal(loadDeadLetterQueue(mockStorage)[0].status, 409);
+
+    // Corrupt dead-letter entries are filtered cleanly
+    store.set(DEAD_LETTER_QUEUE_KEY, JSON.stringify([dlq1[0], { bad: true }]));
+    assert.equal(loadDeadLetterQueue(mockStorage).length, 1);
+
+    const dlqAfterRemove = removeDeadLetterSale(sampleSale.id, mockStorage);
+    assert.equal(dlqAfterRemove.length, 0);
+    assert.equal(loadDeadLetterQueue(mockStorage).length, 0);
   });
 });
 
