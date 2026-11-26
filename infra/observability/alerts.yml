@@ -1,0 +1,80 @@
+groups:
+  - name: supermarket_os_api_and_pipeline
+    interval: 30s
+    rules:
+      - alert: SupermarketOsApiDown
+        expr: up{job="supermarket-os-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SupermarketOS API is unreachable"
+          description: "Prometheus cannot scrape /api/metrics from SupermarketOS API for over 1 minute."
+
+      - alert: SupermarketOsHigh5xxErrorRate
+        expr: |
+          sum(rate(http_requests_total{status_class="5xx"}[5m]))
+          /
+          clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+          > 0.02
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SupermarketOS API 5xx error rate exceeds 2%"
+          description: "More than 2% of HTTP requests returned 5xx over the last 5 minutes."
+
+      - alert: SupermarketOsHighP95Latency
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_ms_bucket[5m])) by (le)) > 750
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SupermarketOS API p95 latency above 750ms"
+          description: "Checkout and back-office API p95 latency exceeded 750ms for 5 consecutive minutes."
+
+      - alert: SupermarketOsPostgresPoolSaturated
+        expr: pg_pool_connections{state="waiting"} > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL connection pool has waiting queries"
+          description: "One or more queries have been waiting for a free PostgreSQL pool connection for 2+ minutes."
+
+      - alert: SupermarketOsAuthLockoutSpike
+        expr: increase(supermarket_auth_lockouts_total[15m]) >= 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spike in staff PIN brute-force lockouts"
+          description: "5 or more staff PIN lockout events occurred within 15 minutes."
+
+      - alert: SupermarketOsAnalyticsPipelineStale
+        expr: supermarket_analytics_last_run_age_seconds > 93600 or supermarket_analytics_last_run_age_seconds < 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Nightly Python analytics pipeline is stale (>26h)"
+          description: "ABC-XYZ, forecasts, phantom stock, and shift diagnostics have not completed in over 26 hours."
+
+      - alert: SupermarketOsAnalyticsDataQualityFailed
+        expr: supermarket_analytics_dq_passed == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Analytics pipeline data quality contracts failed"
+          description: "The latest Python analytics run failed one or more data quality contracts."
+
+      - alert: SupermarketOsHighActiveSseStreams
+        expr: supermarket_sse_active_streams > 25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High number of concurrent AI Copilot SSE streams"
+          description: "More than 25 concurrent SSE streams have remained open for 5+ minutes."

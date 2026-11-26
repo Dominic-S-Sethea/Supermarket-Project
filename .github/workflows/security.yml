@@ -6,10 +6,26 @@ on:
   pull_request:
   schedule:
     - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  secret-scan:
+    name: Gitleaks Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   dependency-audit:
-    name: Dependency & Rust Security Audit
+    name: Node, Python & Rust Security Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,22 +36,60 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
       - run: pnpm install --frozen-lockfile
-      - name: Check high/critical npm advisories
-        run: pnpm audit --audit-level=high || true
+      - name: Enforce zero lint warnings
+        run: pnpm lint
+      - name: Fail on high/critical npm advisories (H-23)
+        run: pnpm audit --audit-level=high
+      - name: Audit Python analytics dependencies with pip-audit
+        run: |
+          uv --directory services/analytics export --frozen --no-dev --no-hashes -o /tmp/analytics-reqs.txt
+          uvx pip-audit -r /tmp/analytics-reqs.txt
       - name: Rust Clippy (-D warnings) & ESC/POS unit tests
         run: |
           cargo clippy --manifest-path apps/pos/src-tauri/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path apps/pos/src-tauri/Cargo.toml
+      - name: Audit Rust Cargo.lock advisories (cargo-audit)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          lockfile-path: apps/pos/src-tauri/Cargo.lock
 
-  docker-build-verify:
-    name: Production Multi-Stage Docker Builds
+  docker-build-and-trivy:
+    name: Production Docker Builds & Trivy Vulnerability Scans
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build API production image
         run: docker build -f infra/Dockerfile.api -t supermarket-os-api:ci .
-      - name: Build Web (Nginx) production image
+      - name: Build Web (unprivileged Nginx) production image
         run: docker build -f infra/Dockerfile.web -t supermarket-os-web:ci .
       - name: Build Python Analytics worker image
         run: docker build -f infra/Dockerfile.analytics -t supermarket-os-analytics:ci .
+      - name: Trivy scan API image (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: supermarket-os-api:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+      - name: Trivy scan Web image (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: supermarket-os-web:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+      - name: Trivy scan Analytics image (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: supermarket-os-analytics:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1

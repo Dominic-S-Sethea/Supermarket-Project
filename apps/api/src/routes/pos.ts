@@ -10,6 +10,7 @@ import {
 } from "@supermarket/shared";
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
+import { recordPosSaleMetric } from "../plugins/metrics.js";
 import {
   analyticsBasketRules,
   auditLogs,
@@ -946,6 +947,10 @@ export async function posRoutes(app: FastifyInstance) {
       if (txRejection) {
         const rej = txRejection as { status: 400 | 404 | 409; message: string };
         return reply.status(rej.status).send({ error: rej.message });
+      }
+
+      if (!duplicate) {
+        recordPosSaleMetric(payload.kind);
       }
 
       return reply.status(duplicate ? 200 : 201).send({

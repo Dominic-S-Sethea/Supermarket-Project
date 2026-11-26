@@ -6,6 +6,10 @@ const executablePath =
   process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
   (fs.existsSync(systemChrome) ? systemChrome : undefined);
 
+const e2eNodeEnv = process.env.E2E_NODE_ENV ?? "production";
+const e2eAuthSecret =
+  process.env.AUTH_SECRET || "e2e-test-auth-secret-minimum-thirty-two-characters-long";
+
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: false,
@@ -30,7 +34,9 @@ export default defineConfig({
       timeout: 30_000,
       env: {
         ...process.env,
-        NODE_ENV: process.env.E2E_NODE_ENV ?? "development",
+        NODE_ENV: e2eNodeEnv,
+        AUTH_SECRET: e2eAuthSecret,
+        COOKIE_SECURE: process.env.E2E_COOKIE_SECURE ?? "false",
         PORT: "4000",
         HOST: "127.0.0.1",
         CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173",

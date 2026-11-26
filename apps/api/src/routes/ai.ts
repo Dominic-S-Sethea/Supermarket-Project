@@ -8,6 +8,7 @@ import {
 import { and, asc, desc, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { registerActiveSseResponse } from "../plugins/metrics.js";
 import { getOrCreateDailyBriefing } from "../ai/briefing.js";
 import { isGeminiConfigured, runCopilotTurn, runCopilotTurnStream } from "../ai/copilot.js";
 import { parseSupplierInvoice } from "../ai/invoice.js";
@@ -341,10 +342,15 @@ export async function aiRoutes(app: FastifyInstance) {
       headers.Vary = "Origin";
     }
     rawRes.writeHead(200, headers);
+    const finishSseMetric = registerActiveSseResponse(rawRes);
 
     let clientClosed = false;
+    let streamOutcome: "completed" | "error" | "aborted" = "completed";
     req.raw.on("close", () => {
       clientClosed = true;
+      if (!rawRes.writableEnded) {
+        streamOutcome = "aborted";
+      }
     });
 
     const sendSse = (payload: unknown) => {
@@ -398,12 +404,14 @@ export async function aiRoutes(app: FastifyInstance) {
         actions,
       });
     } catch (err) {
+      streamOutcome = "error";
       req.log.error({ err }, "SSE copilot streaming error");
       sendSse({
         type: "error",
         error: "Copilot streaming failed. Please retry.",
       });
     } finally {
+      finishSseMetric(clientClosed && streamOutcome === "completed" ? "aborted" : streamOutcome);
       if (!rawRes.writableEnded) {
         rawRes.end();
       }

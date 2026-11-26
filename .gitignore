@@ -9,3 +9,5 @@ __pycache__/
 target/
 playwright-report/
 test-results/
+coverage/
+.pytest_cache/

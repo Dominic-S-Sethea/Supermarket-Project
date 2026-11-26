@@ -103,13 +103,18 @@ function buildSalePayload({ product, barcode, taxRate, couponCode = null, coupon
 
 async function main() {
   const pool = new Pool({ connectionString: DATABASE_URL, max: 10 });
+  const stressNodeEnv = process.env.STRESS_NODE_ENV ?? "production";
+  const stressAuthSecret =
+    process.env.AUTH_SECRET || "stress-test-auth-secret-minimum-thirty-two-characters-long";
   const serverProc = spawn("node", [path.join(repoRoot, "apps/api/dist/server.js")], {
     cwd: path.join(repoRoot, "apps/api"),
     env: {
       ...process.env,
       PORT: String(PORT),
       HOST: "127.0.0.1",
-      NODE_ENV: "test",
+      NODE_ENV: stressNodeEnv,
+      AUTH_SECRET: stressAuthSecret,
+      COOKIE_SECURE: "false",
       DATABASE_URL,
       LOG_LEVEL: "warn",
     },
@@ -368,6 +373,9 @@ async function main() {
       }
       if (createdSaleIds.length > 0) {
         await pool.query("DELETE FROM stock_movements WHERE ref_id = ANY($1::uuid[])", [createdSaleIds]);
+        await pool.query("DELETE FROM loyalty_ledger WHERE sale_id = ANY($1::uuid[])", [createdSaleIds]);
+        await pool.query("DELETE FROM sale_payments WHERE sale_id = ANY($1::uuid[])", [createdSaleIds]);
+        await pool.query("DELETE FROM sale_lines WHERE sale_id = ANY($1::uuid[])", [createdSaleIds]);
         await pool.query("DELETE FROM sales WHERE id = ANY($1::uuid[])", [createdSaleIds]);
       }
       if (syntheticBatchId) {

@@ -2533,4 +2533,28 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       await db.delete(posShifts).where(eq(posShifts.id, openedShift.id));
     }
   });
+
+  it("Wave 2E: bounds Prometheus cardinality (__unmatched__), emits per-route histograms, reversals, SSE & analytics freshness gauges", async () => {
+    const randomProbe = `/api/probe-scanner-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const notFoundRes = await app.inject({ method: "GET", url: randomProbe });
+    expect(notFoundRes.statusCode).toBe(404);
+
+    const metricsRes = await app.inject({
+      method: "GET",
+      url: "/api/metrics",
+      headers: authHeaders(),
+    });
+    expect(metricsRes.statusCode).toBe(200);
+    const body = metricsRes.body;
+    // Random 404 path must NEVER appear as a Prometheus label (cardinality protection)
+    expect(body).not.toContain(randomProbe);
+    expect(body).toContain('route="__unmatched__"');
+    expect(body).toContain("http_route_request_duration_ms_bucket{");
+    expect(body).toContain('supermarket_pos_reversals_total{kind="void"}');
+    expect(body).toContain('supermarket_pos_reversals_total{kind="refund"}');
+    expect(body).toContain("supermarket_sse_active_streams");
+    expect(body).toContain("supermarket_analytics_last_run_age_seconds");
+    expect(body).toContain("supermarket_analytics_dq_passed");
+  });
 });
+

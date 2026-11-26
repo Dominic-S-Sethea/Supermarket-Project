@@ -4,7 +4,7 @@ RUN corepack enable && corepack prepare pnpm@12.21.0 --activate
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
-COPY packages/shared/package.json packages/shared/tsconfig.json ./packages/shared/
+COPY packages/shared/package.json packages/shared/tsconfig.json packages/shared/tsconfig.build.json ./packages/shared/
 COPY apps/web/package.json apps/web/tsconfig.json apps/web/tsconfig.app.json apps/web/tsconfig.node.json ./apps/web/
 RUN pnpm install --frozen-lockfile --filter @supermarket/shared... --filter @supermarket/web...
 

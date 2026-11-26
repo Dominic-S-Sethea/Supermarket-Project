@@ -27,7 +27,7 @@ export async function authRoutes(app: FastifyInstance) {
   const loginLimiter = createRateLimiter({
     keyPrefix: "auth_login",
     windowMs: 60_000,
-    max: env.isTest ? 200 : 12,
+    max: env.isTest ? 200 : 30,
   });
 
   const changePinLimiter = createRateLimiter({
