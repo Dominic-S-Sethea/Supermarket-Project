@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { formatMoney } from "@supermarket/shared";
+import type { UserRole } from "@supermarket/shared/dtos";
+import { formatMoney } from "@supermarket/shared/money";
 import { ArrowRight, ClipboardList, Sparkles, Truck } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
 
@@ -57,42 +58,91 @@ interface SupplierOption {
   name: string;
 }
 
-export function ForecastingBasketView() {
+export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserRole }) {
+  const canManage = userRole === "owner" || userRole === "manager";
+
   const [urgency, setUrgency] = useState("");
   const [draftPos, setDraftPos] = useState<DraftPo[]>([]);
   const [forecasts, setForecasts] = useState<ForecastRow[]>([]);
   const [basketRules, setBasketRules] = useState<BasketRule[]>([]);
   const [orders, setOrders] = useState<PersistedPo[]>([]);
   const [suppliers, setSuppliers] = useState<SupplierOption[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [ordersWarning, setOrdersWarning] = useState<string | null>(null);
 
-  const loadData = async (u = urgency) => {
+  const loadForecasts = async (u = urgency, signal?: AbortSignal) => {
+    setLoading(true);
+    setErrorMsg(null);
     try {
-      const qs = u ? `?urgency=${u}` : "";
-      const [fc, br, poRes, metaRes] = await Promise.all([
-        apiGet<{ supplierDraftPos: DraftPo[]; items: ForecastRow[] }>(
-          `/api/analytics/forecasts${qs}`
-        ),
-        apiGet<{ rules: BasketRule[] }>("/api/analytics/basket-rules"),
-        apiGet<{ orders: PersistedPo[] }>("/api/purchasing/orders").catch(() => ({ orders: [] })),
-        apiGet<{ suppliers: SupplierOption[] }>("/api/meta"),
-      ]);
+      const qs = u ? `?urgency=${encodeURIComponent(u)}` : "";
+      const fc = await apiGet<{ supplierDraftPos: DraftPo[]; items: ForecastRow[] }>(
+        `/api/analytics/forecasts${qs}`,
+        signal
+      );
+      if (signal?.aborted) return;
       setDraftPos(fc.supplierDraftPos);
       setForecasts(fc.items);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading forecasts");
+      }
+    } finally {
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
+    }
+  };
+
+  const loadOrders = async (signal?: AbortSignal) => {
+    setOrdersWarning(null);
+    try {
+      const poRes = await apiGet<{ orders: PersistedPo[] }>("/api/purchasing/orders", signal);
+      if (!signal?.aborted) setOrders(poRes.orders);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setOrdersWarning(
+          err instanceof Error
+            ? `Saved purchase orders could not be loaded: ${err.message}`
+            : "Saved purchase orders could not be loaded."
+        );
+      }
+    }
+  };
+
+  const loadBasketAndMeta = async (signal?: AbortSignal) => {
+    try {
+      const [br, metaRes] = await Promise.all([
+        apiGet<{ rules: BasketRule[] }>("/api/analytics/basket-rules", signal),
+        apiGet<{ suppliers: SupplierOption[] }>("/api/meta", signal),
+      ]);
+      if (signal?.aborted) return;
       setBasketRules(br.rules);
-      setOrders(poRes.orders);
       setSuppliers(metaRes.suppliers);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed loading forecasts");
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading market basket rules");
+      }
     }
   };
 
   useEffect(() => {
-    void loadData(urgency);
+    const controller = new AbortController();
+    void loadForecasts(urgency, controller.signal);
+    return () => controller.abort();
   }, [urgency]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadBasketAndMeta(controller.signal);
+    void loadOrders(controller.signal);
+    return () => controller.abort();
+  }, []);
+
   const handleApproveDraftPo = async (po: DraftPo) => {
+    if (!canManage || busyKey) return;
     setErrorMsg(null);
     const sup = suppliers.find((s) => s.name === po.supplierName);
     if (!sup) {
@@ -104,6 +154,7 @@ export function ForecastingBasketView() {
     );
     if (matchingLines.length === 0) return;
 
+    setBusyKey(`draft-${po.supplierName}`);
     try {
       const created = await apiPost<PersistedPo>("/api/purchasing/orders", {
         supplierId: sup.id,
@@ -117,19 +168,25 @@ export function ForecastingBasketView() {
         })),
       });
       setFeedback(`Persisted PO ${created.poNumber} for ${po.supplierName} (${po.totalCases} cases).`);
-      await loadData(urgency);
+      await loadOrders();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed saving Purchase Order");
+    } finally {
+      setBusyKey(null);
     }
   };
 
   const handleStatusChange = async (poId: string, status: "sent" | "cancelled") => {
+    if (!canManage || busyKey) return;
     setErrorMsg(null);
+    setBusyKey(`po-${poId}-${status}`);
     try {
       await apiPatch(`/api/purchasing/orders/${poId}/status`, { status });
-      await loadData(urgency);
+      await loadOrders();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating PO status");
+    } finally {
+      setBusyKey(null);
     }
   };
 
@@ -145,14 +202,26 @@ export function ForecastingBasketView() {
       </header>
 
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 14 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
           <span>{errorMsg}</span>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {ordersWarning && (
+        <div className="banner banner-amber" role="status" style={{ marginBottom: 14 }}>
+          <span>{ordersWarning}</span>
+          <button type="button" className="btn btn-sm" onClick={() => void loadOrders()}>
+            Retry POs
+          </button>
         </div>
       )}
       {feedback && (
         <div className="banner banner-green" style={{ marginBottom: 14 }}>
           <span>{feedback}</span>
-          <button className="btn btn-sm" onClick={() => setFeedback(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setFeedback(null)}>
             Dismiss
           </button>
         </div>
@@ -172,27 +241,43 @@ export function ForecastingBasketView() {
           </div>
         </div>
 
-        <div className="kpi-strip" style={{ marginBottom: 0 }}>
-          {draftPos.map((po) => (
-            <div key={po.supplierName} className="kpi-tile">
-              <div style={{ fontWeight: 700, fontSize: 13.5 }}>{po.supplierName}</div>
-              <div className="kpi-value" style={{ fontSize: 21 }}>
-                {formatMoney(po.estimatedCostCents)}
+        {loading && draftPos.length === 0 ? (
+          <div style={{ color: "var(--ink-muted)", padding: "12px 0" }}>
+            Loading supplier replenishment recommendations...
+          </div>
+        ) : draftPos.length === 0 ? (
+          <div style={{ color: "var(--ink-muted)", padding: "12px 0" }}>
+            No supplier draft POs required for the selected urgency filter.
+          </div>
+        ) : (
+          <div className="kpi-strip" style={{ marginBottom: 0 }}>
+            {draftPos.map((po) => (
+              <div key={po.supplierName} className="kpi-tile">
+                <div style={{ fontWeight: 700, fontSize: 13.5 }}>{po.supplierName}</div>
+                <div className="kpi-value" style={{ fontSize: 21 }}>
+                  {formatMoney(po.estimatedCostCents)}
+                </div>
+                <div className="kpi-meta" style={{ marginBottom: 10 }}>
+                  <span className="mono">{po.skuCount}</span> SKUs ·{" "}
+                  <strong className="mono">{po.totalCases}</strong> cases to order
+                </div>
+                {canManage && (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    style={{ width: "100%" }}
+                    disabled={busyKey !== null}
+                    onClick={() => void handleApproveDraftPo(po)}
+                  >
+                    {busyKey === `draft-${po.supplierName}`
+                      ? "Saving PO..."
+                      : "Approve & Persist PO"}
+                  </button>
+                )}
               </div>
-              <div className="kpi-meta" style={{ marginBottom: 10 }}>
-                <span className="mono">{po.skuCount}</span> SKUs ·{" "}
-                <strong className="mono">{po.totalCases}</strong> cases to order
-              </div>
-              <button
-                className="btn btn-sm btn-primary"
-                style={{ width: "100%" }}
-                onClick={() => void handleApproveDraftPo(po)}
-              >
-                Approve &amp; Persist PO
-              </button>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* Persisted Purchase Orders */}
@@ -207,7 +292,7 @@ export function ForecastingBasketView() {
               <p className="panel-desc">Stored in PostgreSQL with full audit trail.</p>
             </div>
           </div>
-          <div className="table-wrap">
+          <div className="table-wrap" role="region" aria-label="Reorder recommendations" tabIndex={0}>
             <table className="data-table">
               <thead>
                 <tr>
@@ -217,7 +302,7 @@ export function ForecastingBasketView() {
                   <th className="text-right">Cases</th>
                   <th className="text-right">Est. Cost</th>
                   <th>Created By</th>
-                  <th className="text-right">Action</th>
+                  {canManage && <th className="text-right">Action</th>}
                 </tr>
               </thead>
               <tbody>
@@ -241,24 +326,30 @@ export function ForecastingBasketView() {
                     <td className="text-right mono">{o.totalCases}</td>
                     <td className="text-right mono">{formatMoney(o.estimatedCostCents)}</td>
                     <td>{o.createdBy}</td>
-                    <td className="text-right">
-                      {o.status === "approved" && (
-                        <div style={{ display: "inline-flex", gap: 6 }}>
-                          <button
-                            className="btn btn-sm btn-primary"
-                            onClick={() => void handleStatusChange(o.id, "sent")}
-                          >
-                            Mark Sent
-                          </button>
-                          <button
-                            className="btn btn-sm"
-                            onClick={() => void handleStatusChange(o.id, "cancelled")}
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      )}
-                    </td>
+                    {canManage && (
+                      <td className="text-right">
+                        {o.status === "approved" && (
+                          <div style={{ display: "inline-flex", gap: 6 }}>
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-primary"
+                              disabled={busyKey !== null}
+                              onClick={() => void handleStatusChange(o.id, "sent")}
+                            >
+                              Mark Sent
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              disabled={busyKey !== null}
+                              onClick={() => void handleStatusChange(o.id, "cancelled")}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -277,6 +368,7 @@ export function ForecastingBasketView() {
             </p>
           </div>
           <select
+            aria-label="Filter forecasts by reorder urgency"
             className="select"
             value={urgency}
             onChange={(e) => setUrgency(e.target.value)}
@@ -288,7 +380,7 @@ export function ForecastingBasketView() {
           </select>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="14-day demand forecast table" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -303,56 +395,68 @@ export function ForecastingBasketView() {
               </tr>
             </thead>
             <tbody>
-              {forecasts.slice(0, 30).map((f) => (
-                <tr key={f.productId}>
-                  <td>
-                    <span
-                      className={`tag ${
-                        f.urgency === "critical"
-                          ? "tag-red"
-                          : f.urgency === "reorder_now"
-                            ? "tag-amber"
-                            : "tag-blue"
-                      }`}
-                    >
-                      {f.urgency.replace("_", " ").toUpperCase()}
-                    </span>
-                  </td>
-                  <td>
-                    <div style={{ fontWeight: 600 }}>{f.name}</div>
-                    <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                      {f.sku} · {f.supplierName}
-                    </div>
-                  </td>
-                  <td>
-                    <span className="tag tag-neutral mono">{f.modelUsed}</span>
-                  </td>
-                  <td className="text-right mono">
-                    {f.forecast7dUnits} / {f.forecast14dUnits}
-                  </td>
-                  <td className="text-right mono">
-                    <strong
-                      style={{
-                        color:
-                          f.currentStockUnits <= f.reorderPointUnits
-                            ? "var(--accent-crimson)"
-                            : "inherit",
-                      }}
-                    >
-                      {f.currentStockUnits}
-                    </strong>{" "}
-                    <span style={{ color: "var(--ink-muted)" }}>/ ROP {f.reorderPointUnits}</span>
-                  </td>
-                  <td className="text-right mono">
-                    <strong>{f.suggestedOrderCases} cs</strong>{" "}
-                    <span style={{ fontSize: 11, color: "var(--ink-muted)" }}>
-                      (×{f.caseQty})
-                    </span>
-                  </td>
-                  <td className="text-right mono">{formatMoney(f.estimatedOrderCostCents)}</td>
-                  <td className="text-right mono">{f.wmapePct.toFixed(1)}%</td>
+              {loading && forecasts.length === 0 ? (
+                <tr>
+                  <td colSpan={8}>Loading demand forecasts...</td>
                 </tr>
-              ))}
+              ) : forecasts.length === 0 ? (
+                <tr>
+                  <td colSpan={8} style={{ textAlign: "center", color: "var(--ink-muted)", padding: "20px 12px" }}>
+                    No SKUs match the selected replenishment urgency filter.
+                  </td>
+                </tr>
+              ) : (
+                forecasts.slice(0, 30).map((f) => (
+                  <tr key={f.productId}>
+                    <td>
+                      <span
+                        className={`tag ${
+                          f.urgency === "critical"
+                            ? "tag-red"
+                            : f.urgency === "reorder_now"
+                              ? "tag-amber"
+                              : "tag-blue"
+                        }`}
+                      >
+                        {f.urgency.replace("_", " ").toUpperCase()}
+                      </span>
+                    </td>
+                    <td>
+                      <div style={{ fontWeight: 600 }}>{f.name}</div>
+                      <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                        {f.sku} · {f.supplierName}
+                      </div>
+                    </td>
+                    <td>
+                      <span className="tag tag-neutral mono">{f.modelUsed}</span>
+                    </td>
+                    <td className="text-right mono">
+                      {f.forecast7dUnits} / {f.forecast14dUnits}
+                    </td>
+                    <td className="text-right mono">
+                      <strong
+                        style={{
+                          color:
+                            f.currentStockUnits <= f.reorderPointUnits
+                              ? "var(--accent-crimson)"
+                              : "inherit",
+                        }}
+                      >
+                        {f.currentStockUnits}
+                      </strong>{" "}
+                      <span style={{ color: "var(--ink-muted)" }}>/ ROP {f.reorderPointUnits}</span>
+                    </td>
+                    <td className="text-right mono">
+                      <strong>{f.suggestedOrderCases} cs</strong>{" "}
+                      <span style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                        (×{f.caseQty})
+                      </span>
+                    </td>
+                    <td className="text-right mono">{formatMoney(f.estimatedOrderCostCents)}</td>
+                    <td className="text-right mono">{f.wmapePct.toFixed(1)}%</td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>
@@ -363,7 +467,7 @@ export function ForecastingBasketView() {
         <div className="panel-header">
           <div>
             <h2 className="panel-title">
-              <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
+              <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
               Market Basket Association Rules (High-Lift Co-Purchase Mining)
             </h2>
             <p className="panel-desc">
@@ -371,12 +475,14 @@ export function ForecastingBasketView() {
             </p>
           </div>
         </div>
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="Market basket association rules" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
                 <th>If Customer Buys (Antecedent)</th>
-                <th />
+                <th>
+                  <span className="sr-only">Direction</span>
+                </th>
                 <th>They Frequently Also Buy (Consequent)</th>
                 <th className="text-right">Co-Baskets</th>
                 <th className="text-right">Confidence</th>
@@ -385,27 +491,39 @@ export function ForecastingBasketView() {
               </tr>
             </thead>
             <tbody>
-              {basketRules.slice(0, 18).map((r) => (
-                <tr key={r.id}>
-                  <td style={{ fontWeight: 600 }}>{r.antecedentName}</td>
-                  <td style={{ color: "var(--ink-muted)" }}>
-                    <ArrowRight size={14} />
-                  </td>
-                  <td style={{ fontWeight: 600 }}>{r.consequentName}</td>
-                  <td className="text-right mono">{r.coOccurrences}</td>
-                  <td className="text-right mono">{(r.confidence * 100).toFixed(1)}%</td>
-                  <td className="text-right">
-                    <span className={`tag mono ${r.lift >= 5 ? "tag-green" : "tag-blue"}`}>
-                      {r.lift.toFixed(2)}×
-                    </span>
-                  </td>
-                  <td style={{ fontSize: 12, color: "var(--ink-secondary)" }}>
-                    {r.lift >= 6
-                      ? "Place on shared weekend end-cap or combo bundle"
-                      : "Cross-merchandise in adjacent aisle clip-strip"}
+              {loading && basketRules.length === 0 ? (
+                <tr>
+                  <td colSpan={7}>Loading association rules...</td>
+                </tr>
+              ) : basketRules.length === 0 ? (
+                <tr>
+                  <td colSpan={7} style={{ textAlign: "center", color: "var(--ink-muted)", padding: "20px 12px" }}>
+                    No high-lift market basket pairs computed yet.
                   </td>
                 </tr>
-              ))}
+              ) : (
+                basketRules.slice(0, 18).map((r) => (
+                  <tr key={r.id}>
+                    <td style={{ fontWeight: 600 }}>{r.antecedentName}</td>
+                    <td style={{ color: "var(--ink-muted)" }}>
+                      <ArrowRight size={14} />
+                    </td>
+                    <td style={{ fontWeight: 600 }}>{r.consequentName}</td>
+                    <td className="text-right mono">{r.coOccurrences}</td>
+                    <td className="text-right mono">{(r.confidence * 100).toFixed(1)}%</td>
+                    <td className="text-right">
+                      <span className={`tag mono ${r.lift >= 5 ? "tag-green" : "tag-blue"}`}>
+                        {r.lift.toFixed(2)}×
+                      </span>
+                    </td>
+                    <td style={{ fontSize: 12, color: "var(--ink-secondary)" }}>
+                      {r.lift >= 6
+                        ? "Place on shared weekend end-cap or combo bundle"
+                        : "Cross-merchandise in adjacent aisle clip-strip"}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

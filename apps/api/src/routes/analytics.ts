@@ -14,6 +14,7 @@ import {
   analyticsBasketRules,
   analyticsDemandForecasts,
   analyticsLpAnomalies,
+  analyticsPromoRoi,
   analyticsShiftDiagnostics,
   auditLogs,
   categories,
@@ -25,16 +26,23 @@ import {
   shiftExperiments,
   storeFootfall,
 } from "../db/index.js";
+import { env } from "../config/env.js";
+import { buildCsvDocument } from "../lib/helpers.js";
 import { evaluateShiftExperiment } from "../lib/shiftDid.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
 
 const execFileAsync = promisify(execFile);
 
 export async function analyticsRoutes(app: FastifyInstance) {
+  const analyticsReadOnly = [requireRole(["owner", "manager", "accountant"])];
+
   // Executive Overview KPIs, Daily Trend & Hourly Traffic Heatmap
-  app.get("/api/analytics/overview", { preHandler: [requireAuth] }, async (req) => {
+  app.get("/api/analytics/overview", { preHandler: analyticsReadOnly }, async (req) => {
     const q = req.query as { days?: string };
-    const days = Math.min(90, Math.max(7, Number(q.days ?? 30)));
+    const rawDays = Number(q.days);
+    const days = Number.isFinite(rawDays)
+      ? Math.min(90, Math.max(7, Math.trunc(rawDays)))
+      : 30;
 
     const [kpiRes, dailyRes, hourlyRes, payRes, shrinkRes, skuCountRes] =
       await Promise.all([
@@ -156,7 +164,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // Department Profitability, GMROII & Stock Value (uses live unfolded stock)
-  app.get("/api/analytics/departments", { preHandler: [requireAuth] }, async () => {
+  app.get("/api/analytics/departments", { preHandler: analyticsReadOnly }, async () => {
     const res = await db.execute(sql`
       WITH unfolded AS (
         SELECT product_id, COALESCE(SUM(qty_delta), 0)::int AS delta
@@ -232,7 +240,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // ABC-XYZ 3x3 Matrix + SKU Detail
-  app.get("/api/analytics/abc-xyz", { preHandler: [requireAuth] }, async (req) => {
+  app.get("/api/analytics/abc-xyz", { preHandler: analyticsReadOnly }, async (req) => {
     const q = req.query as { segment?: string };
     const matrixRes = await db.execute(sql`
       SELECT
@@ -287,7 +295,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // Demand Forecasting & Auto-Replenishment Draft PO Suggestions
-  app.get("/api/analytics/forecasts", { preHandler: [requireAuth] }, async (req) => {
+  app.get("/api/analytics/forecasts", { preHandler: analyticsReadOnly }, async (req) => {
     const q = req.query as { urgency?: string };
     const rows = await db
       .select({
@@ -365,7 +373,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   });
 
   // Shift Diagnostics, Footfall Funnel, Morning OOS, Shopper Missions & DiD Experiments
-  app.get("/api/analytics/shift-diagnostics", { preHandler: [requireAuth] }, async () => {
+  app.get("/api/analytics/shift-diagnostics", { preHandler: analyticsReadOnly }, async () => {
     const [diagRows, morningRules, daypartPromos, experiments] = await Promise.all([
       db
         .select()
@@ -425,30 +433,36 @@ export async function analyticsRoutes(app: FastifyInstance) {
       }
       const buckets = parsed.data.buckets;
 
+      // Deduplicate buckets by normalized timestamp so single multi-row ON CONFLICT succeeds
+      const dedupByTs = new Map<string, (typeof buckets)[number]>();
+      for (const b of buckets) {
+        dedupByTs.set(new Date(b.bucketStart).toISOString(), b);
+      }
+      const upsertValues = Array.from(dedupByTs.entries()).map(([iso, b]) => ({
+        id: generateUuidV7(),
+        bucketStart: new Date(iso),
+        entries: b.entries,
+        exits: b.exits ?? b.entries,
+        avgDwellSec: b.avgDwellSec,
+        openLanes: b.openLanes,
+        weatherRain: b.weatherRain,
+        source: b.source,
+      }));
+
       await db.transaction(async (tx) => {
-        for (const b of buckets) {
-          const ts = new Date(b.bucketStart);
+        if (upsertValues.length > 0) {
           await tx
             .insert(storeFootfall)
-            .values({
-              id: generateUuidV7(),
-              bucketStart: ts,
-              entries: b.entries,
-              exits: b.exits ?? b.entries,
-              avgDwellSec: b.avgDwellSec,
-              openLanes: b.openLanes,
-              weatherRain: b.weatherRain,
-              source: b.source,
-            })
+            .values(upsertValues)
             .onConflictDoUpdate({
               target: storeFootfall.bucketStart,
               set: {
-                entries: b.entries,
-                exits: b.exits ?? b.entries,
-                avgDwellSec: b.avgDwellSec,
-                openLanes: b.openLanes,
-                weatherRain: b.weatherRain,
-                source: b.source,
+                entries: sql`EXCLUDED.entries`,
+                exits: sql`EXCLUDED.exits`,
+                avgDwellSec: sql`EXCLUDED.avg_dwell_sec`,
+                openLanes: sql`EXCLUDED.open_lanes`,
+                weatherRain: sql`EXCLUDED.weather_rain`,
+                source: sql`EXCLUDED.source`,
               },
             });
         }
@@ -456,11 +470,11 @@ export async function analyticsRoutes(app: FastifyInstance) {
           actor: req.authUser!.fullName,
           action: "footfall_ingest",
           entityType: "store_footfall",
-          detailsJson: { bucketCount: buckets.length },
+          detailsJson: { bucketCount: upsertValues.length },
         });
       });
 
-      return reply.status(201).send({ ingestedCount: buckets.length });
+      return reply.status(201).send({ ingestedCount: upsertValues.length });
     }
   );
 
@@ -508,22 +522,20 @@ export async function analyticsRoutes(app: FastifyInstance) {
 
       if (rows.length > 0) {
         await db.transaction(async (tx) => {
-          for (const row of rows) {
-            await tx
-              .insert(hourlyStockSnapshots)
-              .values(row)
-              .onConflictDoUpdate({
-                target: [
-                  hourlyStockSnapshots.snapshotDate,
-                  hourlyStockSnapshots.snapshotHour,
-                  hourlyStockSnapshots.productId,
-                ],
-                set: {
-                  onHandUnits: row.onHandUnits,
-                  isOos: row.isOos,
-                },
-              });
-          }
+          await tx
+            .insert(hourlyStockSnapshots)
+            .values(rows)
+            .onConflictDoUpdate({
+              target: [
+                hourlyStockSnapshots.snapshotDate,
+                hourlyStockSnapshots.snapshotHour,
+                hourlyStockSnapshots.productId,
+              ],
+              set: {
+                onHandUnits: sql`EXCLUDED.on_hand_units`,
+                isOos: sql`EXCLUDED.is_oos`,
+              },
+            });
           await tx.insert(auditLogs).values({
             actor: req.authUser!.fullName,
             action: "stock_snapshot_capture",
@@ -543,7 +555,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   );
 
   // Difference-in-Differences Shift Intervention Experiments
-  app.get("/api/analytics/shift-experiments", { preHandler: [requireAuth] }, async () => {
+  app.get("/api/analytics/shift-experiments", { preHandler: analyticsReadOnly }, async () => {
     const experiments = await db
       .select()
       .from(shiftExperiments)
@@ -586,20 +598,77 @@ export async function analyticsRoutes(app: FastifyInstance) {
     }
   );
 
-  // Recompute Python Shift Diagnostics & ML Worker on Demand
+  // Recompute Python Shift Diagnostics & ML Worker on Demand (decoupled HTTP worker or local dev fallback - H-02)
   app.post(
     "/api/analytics/shift-diagnostics/recompute",
     { preHandler: [requireRole(["owner", "manager"])] },
-    async (_req, reply) => {
+    async (req, reply) => {
+      const workerBaseUrl = (process.env.ANALYTICS_WORKER_URL?.trim() || env.analyticsWorkerUrl)?.replace(
+        /\/+$/,
+        ""
+      );
+      if (workerBaseUrl) {
+        try {
+          const workerToken =
+            process.env.ANALYTICS_WORKER_TOKEN?.trim() || env.analyticsWorkerToken;
+          const headers: Record<string, string> = { "Content-Type": "application/json" };
+          if (workerToken) headers.Authorization = `Bearer ${workerToken}`;
+          const res = await fetch(`${workerBaseUrl}/recompute`, {
+            method: "POST",
+            headers,
+            signal: AbortSignal.timeout(95_000),
+          });
+          if (res.status === 409) {
+            return reply.status(409).send({
+              error: "An analytics recompute is already running on the worker.",
+            });
+          }
+          if (!res.ok) {
+            req.log.error({ status: res.status }, "Analytics HTTP worker returned error");
+            return reply.status(502).send({
+              error: "Analytics worker failed to recompute diagnostics.",
+            });
+          }
+          const payload = (await res.json()) as {
+            ok?: boolean;
+            elapsed_s?: number;
+            finished_at?: string;
+          };
+          const [diag] = await db
+            .select()
+            .from(analyticsShiftDiagnostics)
+            .where(eq(analyticsShiftDiagnostics.id, "latest_60d"))
+            .limit(1);
+          return {
+            ok: Boolean(payload.ok ?? true),
+            mode: "http_worker",
+            log: `Worker recomputed in ${payload.elapsed_s ?? 0}s`,
+            computedAt: diag?.computedAt ?? payload.finished_at ?? null,
+          };
+        } catch (err) {
+          req.log.error({ err, workerBaseUrl }, "Analytics HTTP worker unreachable");
+          return reply.status(503).send({
+            error: "Analytics worker service is temporarily unavailable.",
+          });
+        }
+      }
+
+      // Local monorepo development fallback when ANALYTICS_WORKER_URL is not configured
       const repoRoot = path.resolve(process.cwd(), "../..");
       const scriptPath = path.join(repoRoot, "services", "analytics", "run_all.py");
+      if (!fs.existsSync(scriptPath)) {
+        return reply.status(503).send({
+          error:
+            "Analytics recompute service is not configured. Set ANALYTICS_WORKER_URL in production.",
+        });
+      }
       const winPy = path.join(repoRoot, "services", "analytics", ".venv", "Scripts", "python.exe");
       const posixPy = path.join(repoRoot, "services", "analytics", ".venv", "bin", "python");
       const pyBin = fs.existsSync(winPy)
         ? winPy
         : fs.existsSync(posixPy)
           ? posixPy
-          : "python";
+          : "python3";
 
       try {
         const { stdout } = await execFileAsync(pyBin, [scriptPath], {
@@ -611,10 +680,16 @@ export async function analyticsRoutes(app: FastifyInstance) {
           .from(analyticsShiftDiagnostics)
           .where(eq(analyticsShiftDiagnostics.id, "latest_60d"))
           .limit(1);
-        return { ok: true, log: stdout.trim(), computedAt: diag?.computedAt ?? null };
+        return {
+          ok: true,
+          mode: "local_dev_subprocess",
+          log: stdout.trim(),
+          computedAt: diag?.computedAt ?? null,
+        };
       } catch (err) {
+        req.log.error({ err }, "Python analytics recompute failed");
         return reply.status(500).send({
-          error: `Python worker failed: ${err instanceof Error ? err.message : String(err)}`,
+          error: "Analytics worker recompute failed. Check server logs for details.",
         });
       }
     }
@@ -623,7 +698,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   // Loss Prevention (Cashier Anomalies + Live-Stock Dead-Stock Cash Traps + Negative Stock)
   app.get(
     "/api/analytics/loss-prevention",
-    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    { preHandler: analyticsReadOnly },
     async () => {
       const [cashiers, deadStock, negativeStock] = await Promise.all([
         db.select().from(analyticsLpAnomalies).orderBy(desc(analyticsLpAnomalies.zScore)),
@@ -705,10 +780,14 @@ export async function analyticsRoutes(app: FastifyInstance) {
   // Accounting Journal Export (supports ?days=7|30|60|all)
   app.get(
     "/api/exports/accounting.csv",
-    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
+    { preHandler: analyticsReadOnly },
     async (req, reply) => {
       const q = req.query as { days?: string };
-      const parsedDays = q.days && q.days !== "all" ? Math.min(365, Math.max(1, Number(q.days))) : null;
+      let parsedDays: number | null = null;
+      if (q.days && q.days !== "all") {
+        const raw = Number(q.days);
+        parsedDays = Number.isFinite(raw) ? Math.min(365, Math.max(1, Math.trunc(raw))) : 30;
+      }
 
       const res = parsedDays
         ? await db.execute(sql`
@@ -739,30 +818,64 @@ export async function analyticsRoutes(app: FastifyInstance) {
             ORDER BY 1 DESC
           `);
 
-      const header =
-        "Date,Receipts,GrossSalesUSD,DiscountsUSD,VATCollectedUSD,NetRevenueUSD,COGS_USD,GrossProfitUSD";
-      const lines = res.rows.map((r: Record<string, unknown>) => {
-        const toUsd = (v: unknown) => (Number(v ?? 0) / 100).toFixed(2);
-        const net = Number(r.net_revenue_cents ?? 0);
-        const cogs = Number(r.cogs_cents ?? 0);
-        return [
-          r.date,
-          r.receipts,
-          toUsd(r.gross_sales_cents),
-          toUsd(r.discounts_cents),
-          toUsd(r.vat_collected_cents),
-          toUsd(net),
-          toUsd(cogs),
-          toUsd(net - cogs),
-        ].join(",");
-      });
+      const toUsd = (v: unknown) => (Number(v ?? 0) / 100).toFixed(2);
+      const csv = buildCsvDocument(
+        [
+          "Date",
+          "Receipts",
+          "GrossSalesUSD",
+          "DiscountsUSD",
+          "VATCollectedUSD",
+          "NetRevenueUSD",
+          "COGS_USD",
+          "GrossProfitUSD",
+        ],
+        (res.rows as Record<string, unknown>[]).map((r) => {
+          const net = Number(r.net_revenue_cents ?? 0);
+          const cogs = Number(r.cogs_cents ?? 0);
+          return [
+            r.date,
+            Number(r.receipts ?? 0),
+            toUsd(r.gross_sales_cents),
+            toUsd(r.discounts_cents),
+            toUsd(r.vat_collected_cents),
+            toUsd(net),
+            toUsd(cogs),
+            toUsd(net - cogs),
+          ];
+        })
+      );
 
       reply.header("Content-Type", "text/csv; charset=utf-8");
       reply.header(
         "Content-Disposition",
         `attachment; filename="supermarket-os-accounting-journal-${parsedDays ? `${parsedDays}d` : "all"}.csv"`
       );
-      return [header, ...lines].join("\n");
+      return csv;
     }
   );
+
+  // Wave 2 Phase 3: Promotion ROI & Margin Attribution
+  app.get("/api/analytics/promo-roi", { preHandler: analyticsReadOnly }, async () => {
+    const rows = await db
+      .select()
+      .from(analyticsPromoRoi)
+      .orderBy(desc(analyticsPromoRoi.estimatedProfitDeltaCents));
+
+    const totalDiscountGivenCents = rows.reduce((s, r) => s + r.discountGivenCents, 0);
+    const totalProfitDeltaCents = rows.reduce((s, r) => s + r.estimatedProfitDeltaCents, 0);
+    const accretiveCount = rows.filter((r) => r.verdict === "profit_accretive").length;
+    const dilutiveCount = rows.filter((r) => r.verdict === "margin_dilutive").length;
+
+    return {
+      summary: {
+        promotionsEvaluated: rows.length,
+        accretiveCount,
+        dilutiveCount,
+        totalDiscountGivenCents,
+        totalProfitDeltaCents,
+      },
+      items: rows,
+    };
+  });
 }

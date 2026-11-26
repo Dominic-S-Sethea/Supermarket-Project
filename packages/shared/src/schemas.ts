@@ -1,15 +1,15 @@
 import { z } from "zod";
+import type { StockMovementReason, UserRole } from "./dtos.js";
 
-export const UserRoleSchema = z.enum([
+export const UserRoleSchema: z.ZodType<UserRole> = z.enum([
   "owner",
   "manager",
   "stock_clerk",
   "cashier",
   "accountant",
 ]);
-export type UserRole = z.infer<typeof UserRoleSchema>;
 
-export const StockMovementReasonSchema = z.enum([
+export const StockMovementReasonSchema: z.ZodType<StockMovementReason> = z.enum([
   "sale",
   "refund",
   "void",
@@ -21,7 +21,6 @@ export const StockMovementReasonSchema = z.enum([
   "clearance",
   "opening_stock",
 ]);
-export type StockMovementReason = z.infer<typeof StockMovementReasonSchema>;
 
 export const CreateProductSchema = z.object({
   sku: z.string().min(2).max(64),
@@ -72,7 +71,7 @@ export const PosSaleUploadSchema = z.object({
         packQty: z.number().int().min(1),
         qtyPacks: z.number().int().min(1),
         unitPriceCents: z.number().int().min(0),
-        unitCostCents: z.number().int().min(0),
+        unitCostCents: z.number().int().min(0).optional().default(0),
         discountCents: z.number().int().min(0),
         taxRateBp: z.number().int().min(0),
         taxCents: z.number().int().min(0),
@@ -99,24 +98,30 @@ export const CreateGrnSchema = z.object({
   invoiceNumber: z.string().min(1).max(80),
   receivedBy: z.string().min(1).max(120).default("Store Manager"),
   notes: z.string().max(500).optional(),
+  partialDelivery: z.boolean().optional().default(false),
   lines: z
     .array(
-      z.object({
-        productId: z.string().uuid(),
-        caseQty: z.number().int().min(1),
-        paidCases: z.number().int().min(0),
-        freeBonusCases: z.number().int().min(0).default(0),
-        invoiceLineTotalCents: z.number().int().min(0),
-        lotCode: z.string().max(64).optional(),
-        bestBeforeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-      })
+      z
+        .object({
+          productId: z.string().uuid(),
+          caseQty: z.number().int().min(1),
+          paidCases: z.number().int().min(0),
+          freeBonusCases: z.number().int().min(0).default(0),
+          invoiceLineTotalCents: z.number().int().min(0),
+          lotCode: z.string().max(64).optional(),
+          bestBeforeDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        })
+        .refine((l) => l.paidCases + l.freeBonusCases >= 1, {
+          message: "Each GRN line must receive at least 1 paid or bonus case",
+        })
     )
     .min(1),
 });
 
 export const LoginSchema = z.object({
   username: z.string().min(1).max(64),
-  pin: z.string().min(4).max(12),
+  pin: z.string().min(4).max(64),
+  includeToken: z.boolean().optional(),
 });
 
 export const CreatePurchaseOrderSchema = z.object({
@@ -139,18 +144,33 @@ export const UpdatePoStatusSchema = z.object({
   status: z.enum(["draft", "approved", "sent", "partially_received", "received", "cancelled"]),
 });
 
-export const CreatePromotionSchema = z.object({
-  name: z.string().min(2).max(160),
-  promoType: z.enum(["mix_and_match", "bogo", "tier_price", "clearance", "basket_threshold"]),
-  priority: z.number().int().min(1).max(1000).default(15),
-  combinable: z.boolean().default(false),
-  minMarginGuardBp: z.number().int().min(0).max(9500).nullable().default(800),
-  startsAt: z.string().datetime().optional(),
-  endsAt: z.string().datetime().optional(),
-  daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
-  daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
-  rulesJson: z.record(z.unknown()),
-});
+export const CreatePromotionSchema = z
+  .object({
+    name: z.string().min(2).max(160),
+    promoType: z.enum(["mix_and_match", "bogo", "tier_price", "clearance", "basket_threshold"]),
+    priority: z.number().int().min(1).max(1000).default(15),
+    combinable: z.boolean().default(false),
+    minMarginGuardBp: z.number().int().min(0).max(9500).nullable().default(800),
+    startsAt: z.string().datetime().optional(),
+    endsAt: z.string().datetime().optional(),
+    daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
+    daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
+    rulesJson: z.record(z.string(), z.unknown()),
+  })
+  .refine(
+    (d) =>
+      (d.daypartStartHour == null && d.daypartEndHour == null) ||
+      (d.daypartStartHour != null && d.daypartEndHour != null),
+    {
+      message: "Both daypartStartHour and daypartEndHour must be provided together or both omitted",
+    }
+  )
+  .refine(
+    (d) => !d.startsAt || !d.endsAt || Date.parse(d.startsAt) <= Date.parse(d.endsAt),
+    {
+      message: "Promotion startsAt must be earlier than or equal to endsAt",
+    }
+  );
 
 export const IngestFootfallSchema = z.object({
   buckets: z
@@ -221,7 +241,7 @@ export const ParseInvoiceSchema = z
 export const AiTriageRequestSchema = z.object({
   targetType: z.enum(["cashier_anomaly", "invoice_discrepancy", "expiry_batch"]),
   subjectId: z.string().optional(),
-  metrics: z.record(z.unknown()),
+  metrics: z.record(z.string(), z.unknown()),
 });
 
 export const ApplyDynamicMarkdownSchema = z.object({
@@ -269,3 +289,89 @@ export const CompleteFloorTaskSchema = z.object({
   note: z.string().max(300).optional(),
   actualQty: z.number().int().min(0).max(100_000).optional(),
 });
+
+export const WEAK_CREDENTIALS = new Set([
+  "0000",
+  "1111",
+  "2222",
+  "3333",
+  "4444",
+  "5555",
+  "6666",
+  "7777",
+  "8888",
+  "9999",
+  "1234",
+  "4321",
+  "000000",
+  "111111",
+  "123456",
+  "654321",
+  "password",
+  "admin123",
+  "supermarket",
+]);
+
+export const PRIVILEGED_ROLES = new Set<UserRole>(["owner", "manager", "accountant"]);
+
+export function validateCredentialStrength(pin: string, role?: UserRole): string | null {
+  const clean = pin.trim();
+  const lower = clean.toLowerCase();
+  if (WEAK_CREDENTIALS.has(lower) || /^(.)\1+$/.test(clean)) {
+    return "PIN/password is too predictable. Avoid repeated digits or trivial sequences.";
+  }
+  if (role && PRIVILEGED_ROLES.has(role) && clean.length < 8) {
+    return `Role "${role}" requires a PIN or password of at least 8 characters.`;
+  }
+  if (clean.length < 4 || clean.length > 64) {
+    return "PIN or password must be 4 to 64 characters.";
+  }
+  return null;
+}
+
+export const CreateUserSchema = z
+  .object({
+    username: z
+      .string()
+      .trim()
+      .min(3)
+      .max(40)
+      .regex(/^[a-z0-9._-]+$/i, "Username may only contain letters, digits, dots, underscores, and hyphens"),
+    fullName: z.string().trim().min(2).max(120),
+    role: UserRoleSchema,
+    pin: z.string().trim().min(4).max(64),
+  })
+  .superRefine((d, ctx) => {
+    const err = validateCredentialStrength(d.pin, d.role);
+    if (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["pin"], message: err });
+    }
+  });
+
+export const UpdateUserSchema = z
+  .object({
+    fullName: z.string().trim().min(2).max(120).optional(),
+    role: UserRoleSchema.optional(),
+    active: z.boolean().optional(),
+    pin: z.string().trim().min(4).max(64).optional(),
+  })
+  .superRefine((d, ctx) => {
+    if (d.pin !== undefined) {
+      const err = validateCredentialStrength(d.pin, d.role);
+      if (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["pin"], message: err });
+      }
+    }
+  });
+
+export const ChangePinSchema = z
+  .object({
+    currentPin: z.string().trim().min(4).max(64),
+    newPin: z.string().trim().min(4).max(64),
+  })
+  .superRefine((d, ctx) => {
+    const err = validateCredentialStrength(d.newPin);
+    if (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["newPin"], message: err });
+    }
+  });

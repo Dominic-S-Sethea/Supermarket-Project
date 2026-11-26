@@ -5,23 +5,26 @@
  */
 
 export function formatMoney(cents: number, currencySymbol = "$"): string {
-  const neg = cents < 0;
-  const abs = Math.abs(Math.round(cents));
+  const safe = Number.isFinite(cents) ? Math.round(cents) : 0;
+  const neg = safe < 0;
+  const abs = Math.abs(safe);
   const major = Math.floor(abs / 100);
   const minor = String(abs % 100).padStart(2, "0");
   return `${neg ? "-" : ""}${currencySymbol}${major.toLocaleString("en-US")}.${minor}`;
 }
 
 export function formatBp(bp: number): string {
-  return `${(bp / 100).toFixed(2)}%`;
+  const safe = Number.isFinite(bp) ? bp : 0;
+  return `${(safe / 100).toFixed(2)}%`;
 }
 
 /**
  * Compute gross margin in basis points: ((sellPrice - cost) / sellPrice) * 10000
  */
 export function computeMarginBp(sellPriceCents: number, costCents: number): number {
-  if (sellPriceCents <= 0) return 0;
-  return Math.round(((sellPriceCents - costCents) * 10000) / sellPriceCents);
+  if (!Number.isFinite(sellPriceCents) || sellPriceCents <= 0) return 0;
+  const safeCost = Number.isFinite(costCents) ? costCents : 0;
+  return Math.round(((sellPriceCents - safeCost) * 10000) / sellPriceCents);
 }
 
 /**
@@ -34,7 +37,7 @@ export function computeNetMarginBp(
   taxRateBp: number,
   isInclusive: boolean
 ): number {
-  if (sellPriceCents <= 0) return 0;
+  if (!Number.isFinite(sellPriceCents) || sellPriceCents <= 0) return 0;
   const { netCents } = computeTaxCents(sellPriceCents, taxRateBp, isInclusive);
   return computeMarginBp(netCents, costCents);
 }
@@ -50,14 +53,17 @@ export function computeSuggestedSellPriceCents(
   isInclusive: boolean,
   roundStep = 5
 ): number {
-  if (costCents <= 0) return Math.max(1, roundStep);
-  const clampedMarginBp = Math.min(9500, Math.max(0, minMarginBp));
+  const step = Number.isFinite(roundStep) ? Math.max(1, Math.round(roundStep)) : 5;
+  if (!Number.isFinite(costCents) || costCents <= 0) return step;
+  const safeMarginBp = Number.isFinite(minMarginBp) ? minMarginBp : 0;
+  const safeTaxBp = Number.isFinite(taxRateBp) ? Math.max(0, taxRateBp) : 0;
+  const clampedMarginBp = Math.min(9500, Math.max(0, safeMarginBp));
   const minNetCents = Math.ceil((costCents * 10000) / Math.max(500, 10000 - clampedMarginBp));
   const grossBeforeRound =
-    isInclusive && taxRateBp > 0
-      ? Math.ceil((minNetCents * (10000 + taxRateBp)) / 10000)
+    isInclusive && safeTaxBp > 0
+      ? Math.ceil((minNetCents * (10000 + safeTaxBp)) / 10000)
       : minNetCents;
-  return Math.ceil(grossBeforeRound / roundStep) * roundStep;
+  return Math.ceil(grossBeforeRound / step) * step;
 }
 
 /**
@@ -68,9 +74,12 @@ export function computeEffectiveUnitCostCents(
   paidBaseUnits: number,
   freeBonusBaseUnits: number
 ): number {
-  const totalUnits = paidBaseUnits + freeBonusBaseUnits;
+  const safePaid = Number.isFinite(paidBaseUnits) ? Math.max(0, paidBaseUnits) : 0;
+  const safeFree = Number.isFinite(freeBonusBaseUnits) ? Math.max(0, freeBonusBaseUnits) : 0;
+  const totalUnits = safePaid + safeFree;
   if (totalUnits <= 0) return 0;
-  return Math.round(invoiceLineTotalCents / totalUnits);
+  const safeInvoice = Number.isFinite(invoiceLineTotalCents) ? Math.max(0, invoiceLineTotalCents) : 0;
+  return Math.round(safeInvoice / totalUnits);
 }
 
 /**
@@ -82,11 +91,17 @@ export function computeMovingWeightedAvgCostCents(
   incomingUnits: number,
   incomingUnitCostCents: number
 ): number {
-  const effectiveCurrentStock = Math.max(0, currentStockUnits);
-  const totalUnits = effectiveCurrentStock + incomingUnits;
-  if (totalUnits <= 0) return incomingUnitCostCents;
+  const safeCurrentCost = Number.isFinite(currentAvgCostCents) ? Math.max(0, currentAvgCostCents) : 0;
+  const safeIncomingCost = Number.isFinite(incomingUnitCostCents)
+    ? Math.max(0, incomingUnitCostCents)
+    : 0;
+  const safeIncoming = Number.isFinite(incomingUnits) ? Math.max(0, incomingUnits) : 0;
+  if (safeIncoming <= 0) return Math.round(safeCurrentCost);
+  const effectiveCurrentStock = Number.isFinite(currentStockUnits) ? Math.max(0, currentStockUnits) : 0;
+  const totalUnits = effectiveCurrentStock + safeIncoming;
+  if (totalUnits <= 0) return Math.round(safeIncomingCost);
   const totalValue =
-    effectiveCurrentStock * currentAvgCostCents + incomingUnits * incomingUnitCostCents;
+    effectiveCurrentStock * safeCurrentCost + safeIncoming * safeIncomingCost;
   return Math.round(totalValue / totalUnits);
 }
 
@@ -99,17 +114,19 @@ export function computeTaxCents(
   taxRateBp: number,
   isInclusive: boolean
 ): { netCents: number; taxCents: number; grossCents: number } {
-  if (taxRateBp <= 0 || amountCents <= 0) {
-    return { netCents: amountCents, taxCents: 0, grossCents: amountCents };
+  const safeAmount = Number.isFinite(amountCents) ? Math.round(amountCents) : 0;
+  const safeRate = Number.isFinite(taxRateBp) ? Math.max(0, taxRateBp) : 0;
+  if (safeRate <= 0 || safeAmount <= 0) {
+    return { netCents: safeAmount, taxCents: 0, grossCents: safeAmount };
   }
   if (isInclusive) {
     // gross = net * (1 + r) => tax = gross - round(gross * 10000 / (10000 + bp))
-    const netCents = Math.round((amountCents * 10000) / (10000 + taxRateBp));
-    const taxCents = amountCents - netCents;
-    return { netCents, taxCents, grossCents: amountCents };
+    const netCents = Math.round((safeAmount * 10000) / (10000 + safeRate));
+    const taxCents = safeAmount - netCents;
+    return { netCents, taxCents, grossCents: safeAmount };
   }
-  const taxCents = Math.round((amountCents * taxRateBp) / 10000);
-  return { netCents: amountCents, taxCents, grossCents: amountCents + taxCents };
+  const taxCents = Math.round((safeAmount * safeRate) / 10000);
+  return { netCents: safeAmount, taxCents, grossCents: safeAmount + taxCents };
 }
 
 /**

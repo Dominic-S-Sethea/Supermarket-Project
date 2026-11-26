@@ -1,8 +1,33 @@
+import { generateUuidV7 } from "@supermarket/shared";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { env } from "../config/env.js";
 import { SESSION_COOKIE_NAME } from "./auth.js";
 
+declare module "fastify" {
+  interface FastifyRequest {
+    correlationId: string;
+  }
+}
+
+const VALID_REQUEST_ID = /^[a-zA-Z0-9._-]{4,64}$/;
+
+export function resolveCorrelationId(headerVal: string | string[] | undefined): string {
+  const raw = Array.isArray(headerVal) ? headerVal[0] : headerVal;
+  return raw && VALID_REQUEST_ID.test(raw.trim()) ? raw.trim() : generateUuidV7();
+}
+
 export function registerSecurityHeaders(app: FastifyInstance) {
-  app.addHook("onSend", async (_req, reply, payload) => {
+  app.decorateRequest("correlationId", "");
+
+  app.addHook("onRequest", async (req) => {
+    req.correlationId =
+      typeof req.id === "string" && VALID_REQUEST_ID.test(req.id)
+        ? req.id
+        : resolveCorrelationId(req.headers["x-request-id"]);
+  });
+
+  app.addHook("onSend", async (req, reply, payload) => {
+    reply.header("X-Request-Id", req.correlationId || req.id || generateUuidV7());
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("X-Frame-Options", "DENY");
     reply.header("Referrer-Policy", "same-origin");
@@ -10,11 +35,21 @@ export function registerSecurityHeaders(app: FastifyInstance) {
     if (!reply.hasHeader("Content-Security-Policy")) {
       reply.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
     }
+    if (env.cookieSecure || env.isProduction || req.protocol === "https") {
+      reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+    if (
+      req.url.startsWith("/api/") &&
+      req.authUser &&
+      !reply.hasHeader("Cache-Control")
+    ) {
+      reply.header("Cache-Control", "no-store, private");
+    }
     return payload;
   });
 }
 
-function parseCookies(header: string | undefined): Record<string, string> {
+export function parseCookies(header: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   if (!header) return out;
   for (const part of header.split(";")) {
@@ -22,7 +57,12 @@ function parseCookies(header: string | undefined): Record<string, string> {
     if (idx <= 0) continue;
     const key = part.slice(0, idx).trim();
     const val = part.slice(idx + 1).trim();
-    if (key) out[key] = decodeURIComponent(val);
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
   }
   return out;
 }
@@ -94,4 +134,97 @@ export function createRateLimiter(opts: { keyPrefix: string; windowMs: number; m
       });
     }
   };
+}
+
+// =========================================================================
+// PER-USERNAME SLIDING-WINDOW BRUTE-FORCE PIN LOCKOUT (IP-INDEPENDENT)
+// =========================================================================
+interface LockoutRecord {
+  failures: number[];
+  lockedUntil: number;
+}
+
+const LOCKOUT_WINDOW_MS = 15 * 60_000;
+const LOCKOUT_DURATION_MS = 15 * 60_000;
+const MAX_FAILED_PIN_ATTEMPTS = 5;
+
+const loginLockouts = new Map<string, LockoutRecord>();
+let authLockoutsTotal = 0;
+
+export function resetLoginLockouts() {
+  loginLockouts.clear();
+}
+
+export function getAuthLockoutTotal(): number {
+  return authLockoutsTotal;
+}
+
+export function checkLoginLockout(username: string): { locked: boolean; retryAfterSec: number } {
+  const key = username.trim().toLowerCase();
+  const now = Date.now();
+  const rec = loginLockouts.get(key);
+  if (!rec) return { locked: false, retryAfterSec: 0 };
+  if (rec.lockedUntil > now) {
+    return {
+      locked: true,
+      retryAfterSec: Math.max(1, Math.ceil((rec.lockedUntil - now) / 1000)),
+    };
+  }
+  return { locked: false, retryAfterSec: 0 };
+}
+
+export function recordFailedLogin(username: string): {
+  locked: boolean;
+  newlyLocked: boolean;
+  retryAfterSec: number;
+  failures: number;
+} {
+  const key = username.trim().toLowerCase();
+  const now = Date.now();
+
+  if (loginLockouts.size > 5000) {
+    for (const [k, v] of loginLockouts) {
+      if (v.lockedUntil <= now && v.failures.every((ts) => now - ts > LOCKOUT_WINDOW_MS)) {
+        loginLockouts.delete(k);
+      }
+    }
+  }
+
+  const rec = loginLockouts.get(key) ?? { failures: [], lockedUntil: 0 };
+  if (rec.lockedUntil > now) {
+    return {
+      locked: true,
+      newlyLocked: false,
+      retryAfterSec: Math.max(1, Math.ceil((rec.lockedUntil - now) / 1000)),
+      failures: rec.failures.length,
+    };
+  }
+
+  const recent = rec.failures.filter((ts) => now - ts <= LOCKOUT_WINDOW_MS);
+  recent.push(now);
+  rec.failures = recent;
+
+  if (recent.length >= MAX_FAILED_PIN_ATTEMPTS) {
+    rec.lockedUntil = now + LOCKOUT_DURATION_MS;
+    loginLockouts.set(key, rec);
+    authLockoutsTotal += 1;
+    return {
+      locked: true,
+      newlyLocked: true,
+      retryAfterSec: Math.ceil(LOCKOUT_DURATION_MS / 1000),
+      failures: recent.length,
+    };
+  }
+
+  loginLockouts.set(key, rec);
+  return {
+    locked: false,
+    newlyLocked: false,
+    retryAfterSec: 0,
+    failures: recent.length,
+  };
+}
+
+export function clearLoginFailures(username: string): void {
+  loginLockouts.delete(username.trim().toLowerCase());
 }

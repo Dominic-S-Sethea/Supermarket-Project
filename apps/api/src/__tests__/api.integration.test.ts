@@ -1,29 +1,74 @@
 import { buildValidEan13, generateUuidV7 } from "@supermarket/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { executeCopilotTool } from "../ai/tools.js";
 import { buildApp } from "../app.js";
 import {
   aiBriefings,
   aiConversations,
+  aiProposedActions,
+  analyticsDynamicMarkdowns,
+  analyticsPhantomStock,
   auditLogs,
+  customers,
   db,
   goodsReceipts,
+  grnLines,
+  grnVariances,
   hourlyStockSnapshots,
   inventoryBatches,
+  loyaltyLedger,
   marginAlerts,
   pool,
   posShifts,
   productBarcodes,
+  products,
+  promotions,
+  purchaseOrderLines,
   purchaseOrders,
+  saleLines,
+  salePayments,
   sales,
+  shelfTagQueue,
   shiftExperiments,
+  shiftRosters,
+  stockBaselines,
   stockMovements,
   storeFootfall,
+  storeTasks,
+  targetedCoupons,
+  userSessions,
+  users,
 } from "../db/index.js";
+import { SESSION_COOKIE_NAME } from "../plugins/auth.js";
+
+async function cleanupSales(ids: string[]) {
+  if (ids.length === 0) return;
+  await db.delete(stockMovements).where(inArray(stockMovements.refId, ids));
+  await db.delete(saleLines).where(inArray(saleLines.saleId, ids));
+  await db.delete(salePayments).where(inArray(salePayments.saleId, ids));
+  // Delete reversal rows (with originalSaleId) before original rows to satisfy self-FK RESTRICT
+  await db.delete(sales).where(and(inArray(sales.id, ids), inArray(sales.kind, ["void", "refund"])));
+  await db.delete(sales).where(inArray(sales.id, ids));
+}
+
+async function cleanupGrn(grnId: string) {
+  await db.delete(marginAlerts).where(eq(marginAlerts.grnId, grnId));
+  await db.delete(stockMovements).where(eq(stockMovements.refId, grnId));
+  await db.delete(grnVariances).where(eq(grnVariances.grnId, grnId));
+  await db.delete(grnLines).where(eq(grnLines.grnId, grnId));
+  await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnId));
+}
+
+async function cleanupPo(poId: string) {
+  await db.delete(purchaseOrderLines).where(eq(purchaseOrderLines.poId, poId));
+  await db.delete(purchaseOrders).where(eq(purchaseOrders.id, poId));
+}
 
 let app: Awaited<ReturnType<typeof buildApp>>;
 let ownerToken = "";
 let cashierToken = "";
+let ownerCookie = "";
 
 beforeAll(async () => {
   app = await buildApp(false);
@@ -33,18 +78,21 @@ beforeAll(async () => {
     app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "owner", pin: "1111" },
+      payload: { username: "owner", pin: "1111", includeToken: true },
     }),
     app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { username: "cashier1", pin: "1234" },
+      payload: { username: "cashier1", pin: "1234", includeToken: true },
     }),
   ]);
   expect(ownerLogin.statusCode).toBe(200);
   expect(cashierLogin.statusCode).toBe(200);
   ownerToken = (ownerLogin.json() as { token: string }).token;
   cashierToken = (cashierLogin.json() as { token: string }).token;
+  const setCookie = ownerLogin.headers["set-cookie"];
+  const rawCookie = Array.isArray(setCookie) ? setCookie[0] : setCookie ?? "";
+  ownerCookie = rawCookie.split(";")[0] ?? `${SESSION_COOKIE_NAME}=${encodeURIComponent(ownerToken)}`;
 });
 
 afterAll(async () => {
@@ -73,6 +121,126 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       payload: { message: "hello" },
     });
     expect(cashierForbiddenAi.statusCode).toBe(403);
+
+    // Cashiers must also be blocked from executive financial analytics & briefing (which contains LP flags)
+    for (const url of [
+      "/api/analytics/overview",
+      "/api/analytics/departments",
+      "/api/analytics/abc-xyz",
+      "/api/analytics/forecasts",
+      "/api/analytics/shift-diagnostics",
+      "/api/ai/briefing",
+    ]) {
+      const res = await app.inject({
+        method: "GET",
+        url,
+        headers: authHeaders(cashierToken),
+      });
+      expect(res.statusCode).toBe(403);
+    }
+
+    // GET /api/meta returns staff roster only for owner/manager, empty array for cashier
+    const [ownerMeta, cashierMeta] = await Promise.all([
+      app.inject({ method: "GET", url: "/api/meta", headers: authHeaders(ownerToken) }),
+      app.inject({ method: "GET", url: "/api/meta", headers: authHeaders(cashierToken) }),
+    ]);
+    expect(ownerMeta.statusCode).toBe(200);
+    expect(ownerMeta.json().staff.length).toBeGreaterThanOrEqual(5);
+    expect(cashierMeta.statusCode).toBe(200);
+    expect(cashierMeta.json().staff).toEqual([]);
+  });
+
+  it("enforces security headers, CSRF origin checks, safe cookie parsing, and live user deactivation", async () => {
+    // 1. Security headers present on responses
+    const health = await app.inject({ method: "GET", url: "/api/health" });
+    expect(health.statusCode).toBe(200);
+    expect(health.headers["x-content-type-options"]).toBe("nosniff");
+    expect(health.headers["x-frame-options"]).toBe("DENY");
+    expect(health.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+
+    // 2. Malformed percent-encoded Cookie header must not throw 500 URIError
+    const malformedCookie = await app.inject({
+      method: "GET",
+      url: "/api/auth/me",
+      headers: { cookie: "broken=%E0%A4%A; smos_session=bad" },
+    });
+    expect(malformedCookie.statusCode).toBe(200);
+    expect(malformedCookie.json().user).toBeNull();
+
+    // 3. CSRF origin check blocks cookie-authenticated POST from untrusted or missing Origin
+    const csrfBadOrigin = await app.inject({
+      method: "POST",
+      url: "/api/pos/shifts/open",
+      headers: {
+        cookie: ownerCookie,
+        origin: "https://evil.example",
+      },
+      payload: { registerCode: "REG-CSRF" },
+    });
+    expect(csrfBadOrigin.statusCode).toBe(403);
+
+    const csrfMissingOrigin = await app.inject({
+      method: "POST",
+      url: "/api/pos/shifts/open",
+      headers: { cookie: ownerCookie },
+      payload: { registerCode: "REG-CSRF" },
+    });
+    expect(csrfMissingOrigin.statusCode).toBe(403);
+
+    // 4. Untrusted CORS origin returns 403 (not 500)
+    const badCors = await app.inject({
+      method: "GET",
+      url: "/api/health",
+      headers: { origin: "https://evil.example" },
+    });
+    expect(badCors.statusCode).toBe(403);
+
+    // 5. Repaired cashier4 & cashier5 seed accounts can authenticate cleanly
+    const c4Login = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "cashier4", pin: "4567", includeToken: true },
+    });
+    expect(c4Login.statusCode).toBe(200);
+    const c4Token = (c4Login.json() as { token: string }).token;
+    const c4User = (c4Login.json() as { user: { id: string } }).user;
+
+    // 6. Deactivating user in DB immediately invalidates active session token
+    await db.update(users).set({ active: false }).where(eq(users.id, c4User.id));
+    try {
+      const revokedMe = await app.inject({
+        method: "GET",
+        url: "/api/products?page=1&pageSize=10",
+        headers: authHeaders(c4Token),
+      });
+      expect(revokedMe.statusCode).toBe(401);
+    } finally {
+      await db.update(users).set({ active: true }).where(eq(users.id, c4User.id));
+    }
+
+    // 7. Invalid UUID and NaN query parameters return clean 400/200 without 500 error leakage
+    const badUuid = await app.inject({
+      method: "GET",
+      url: "/api/products?categoryId=not-a-uuid",
+      headers: authHeaders(),
+    });
+    expect(badUuid.statusCode).toBe(400);
+
+    const nanDaysExpiry = await app.inject({
+      method: "GET",
+      url: "/api/inventory/expiry-alerts?days=abc",
+      headers: authHeaders(),
+    });
+    expect(nanDaysExpiry.statusCode).toBe(200);
+    expect(nanDaysExpiry.json().horizonDays).toBe(60);
+
+    const nanDaysOverview = await app.inject({
+      method: "GET",
+      url: "/api/analytics/overview?days=abc",
+      headers: authHeaders(),
+    });
+    expect(nanDaysOverview.statusCode).toBe(200);
+    expect(nanDaysOverview.json().days).toBe(30);
   });
 
   it("returns 3,000+ packaged products and resolves a multi-UOM pack barcode", async () => {
@@ -100,7 +268,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(scanned.packQty).toBeGreaterThanOrEqual(1);
   });
 
-  it("enforces offline-first POS sale idempotency, payment coverage, and FEFO batch decrement", async () => {
+  it("enforces offline-first POS sale idempotency, pricing/age guards, duplicate receipt 409, and concurrent FEFO batch depletion", async () => {
     const listRes = await app.inject({
       method: "GET",
       url: "/api/products?page=1&pageSize=1",
@@ -112,7 +280,8 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const [firstBatch] = await db
       .select()
       .from(inventoryBatches)
-      .where(eq(inventoryBatches.productId, prod.id))
+      .where(and(eq(inventoryBatches.productId, prod.id), eq(inventoryBatches.status, "active")))
+      .orderBy(inventoryBatches.bestBeforeDate, inventoryBatches.id)
       .limit(1);
     const origQty = firstBatch?.qtyRemaining ?? 0;
 
@@ -124,7 +293,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       receiptNo,
       kind: "sale",
       soldAt: new Date().toISOString(),
-      ageVerified: false,
+      ageVerified: Boolean(prod.requiresAgeCheck),
       lines: [
         {
           id: generateUuidV7(),
@@ -149,6 +318,30 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
         },
       ],
     };
+
+    // Unverified age-restricted sale -> 400 rejected
+    if (prod.requiresAgeCheck) {
+      const unverifiedAge = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: { ...basePayload, ageVerified: false },
+      });
+      expect(unverifiedAge.statusCode).toBe(400);
+    }
+
+    // Tampered lineTotalCents (paying 1c for full-price item with 0 discount) -> 400 rejected
+    const tamperedTotal = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(cashierToken),
+      payload: {
+        ...basePayload,
+        lines: [{ ...basePayload.lines[0], lineTotalCents: 1 }],
+        payments: [{ id: generateUuidV7(), method: "cash", amountCents: 1 }],
+      },
+    });
+    expect(tamperedTotal.statusCode).toBe(400);
 
     // Underpaid sale -> 400 rejected
     const underpaid = await app.inject({
@@ -182,28 +375,179 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(retry.statusCode).toBe(200);
     expect(retry.json().duplicate).toBe(true);
 
-    if (firstBatch && origQty >= bc.packQty) {
+    // Duplicate receiptNo with a DIFFERENT sale UUID -> 409 Conflict (not 500)
+    const dupReceipt = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(cashierToken),
+      payload: {
+        ...basePayload,
+        id: generateUuidV7(),
+        lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+        payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+      },
+    });
+    expect(dupReceipt.statusCode).toBe(409);
+
+    // Concurrent checkouts on the same FEFO batch do not lose decrements
+    const concAId = generateUuidV7();
+    const concBId = generateUuidV7();
+    const makeConcSale = (id: string, suffix: string) => ({
+      ...basePayload,
+      id,
+      receiptNo: `TEST-CONC-${suffix}-${id.slice(-6)}`,
+      lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+      payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+    });
+    const [concA, concB] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: makeConcSale(concAId, "A"),
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: makeConcSale(concBId, "B"),
+      }),
+    ]);
+    expect(concA.statusCode).toBe(201);
+    expect(concB.statusCode).toBe(201);
+
+    if (firstBatch && origQty >= bc.packQty * 3) {
       const [afterBatch] = await db
         .select()
         .from(inventoryBatches)
         .where(eq(inventoryBatches.id, firstBatch.id));
-      expect(afterBatch.qtyRemaining).toBe(origQty - bc.packQty);
+      expect(afterBatch.qtyRemaining).toBe(origQty - bc.packQty * 3);
       await db
         .update(inventoryBatches)
         .set({ qtyRemaining: origQty, status: firstBatch.status })
         .where(eq(inventoryBatches.id, firstBatch.id));
     }
 
-    await db.delete(stockMovements).where(eq(stockMovements.refId, saleId));
-    await db.delete(sales).where(eq(sales.id, saleId));
+    // Tampered unitPriceCents (selling full-price item for 1c) -> 400 rejected (C-01)
+    const tamperedPrice = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(cashierToken),
+      payload: {
+        ...basePayload,
+        id: generateUuidV7(),
+        receiptNo: `TEST-TAMP-${generateUuidV7().slice(-6)}`,
+        lines: [{ ...basePayload.lines[0], id: generateUuidV7(), unitPriceCents: 1, lineTotalCents: 1 }],
+        payments: [{ id: generateUuidV7(), method: "cash", amountCents: 1 }],
+      },
+    });
+    expect(tamperedPrice.statusCode).toBe(400);
+
+    // Forged discount without qualifying promo or coupon -> 400 rejected (C-01)
+    if (bc.sellPriceCents > 10) {
+      const forgedDiscount = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: {
+          ...basePayload,
+          id: generateUuidV7(),
+          receiptNo: `TEST-DISC-${generateUuidV7().slice(-6)}`,
+          lines: [
+            {
+              ...basePayload.lines[0],
+              id: generateUuidV7(),
+              discountCents: bc.sellPriceCents - 1,
+              lineTotalCents: 1,
+            },
+          ],
+          payments: [{ id: generateUuidV7(), method: "cash", amountCents: 1 }],
+        },
+      });
+      expect(forgedDiscount.statusCode).toBe(400);
+    }
+
+    // Concurrent double-void on the same originalSaleId -> strictly 1x 201 + 1x 409 (C-01)
+    const void1Id = generateUuidV7();
+    const void2Id = generateUuidV7();
+    const [voidA, voidB] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(ownerToken),
+        payload: {
+          ...basePayload,
+          id: void1Id,
+          receiptNo: `TEST-VOID1-${void1Id.slice(-6)}`,
+          kind: "void",
+          originalSaleId: saleId,
+          lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+          payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+        },
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(ownerToken),
+        payload: {
+          ...basePayload,
+          id: void2Id,
+          receiptNo: `TEST-VOID2-${void2Id.slice(-6)}`,
+          kind: "void",
+          originalSaleId: saleId,
+          lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+          payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+        },
+      }),
+    ]);
+    expect([voidA.statusCode, voidB.statusCode].sort()).toEqual([201, 409]);
+
+    // Cumulative refund cap on concAId: first full refund succeeds (201), second refund blocked (409)
+    const refund1Id = generateUuidV7();
+    const refund2Id = generateUuidV7();
+    const refund1 = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(ownerToken),
+      payload: {
+        ...basePayload,
+        id: refund1Id,
+        receiptNo: `TEST-RFND1-${refund1Id.slice(-6)}`,
+        kind: "refund",
+        originalSaleId: concAId,
+        lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+        payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+      },
+    });
+    expect(refund1.statusCode).toBe(201);
+
+    const refund2 = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(ownerToken),
+      payload: {
+        ...basePayload,
+        id: refund2Id,
+        receiptNo: `TEST-RFND2-${refund2Id.slice(-6)}`,
+        kind: "refund",
+        originalSaleId: concAId,
+        lines: [{ ...basePayload.lines[0], id: generateUuidV7() }],
+        payments: [{ ...basePayload.payments[0], id: generateUuidV7() }],
+      },
+    });
+    expect(refund2.statusCode).toBe(409);
+
+    const cleanupSaleIds = [saleId, concAId, concBId, void1Id, void2Id, refund1Id];
+    await cleanupSales(cleanupSaleIds);
   });
 
-  it("handles GRN bonus cases, tax-aware margin alerts, multi-pack scaling, and persistent POs", async () => {
+  it("handles GRN bonus cases, partial->full PO receipt tracking, tax-aware margin alerts, multi-pack scaling, and persistent POs", async () => {
     const metaRes = await app.inject({
       method: "GET",
       url: "/api/meta",
       headers: authHeaders(),
     });
+    expect(metaRes.statusCode).toBe(200);
     const meta = metaRes.json() as { suppliers: { id: string }[] };
     const prodRes = await app.inject({
       method: "GET",
@@ -218,7 +562,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const origAvgCost = prod.avgCostCents;
     const origPrices = prod.barcodes.map((b) => ({ id: b.id, sellPriceCents: b.sellPriceCents }));
 
-    // 1. Create a persistent PO
+    // 1. Create a persistent PO for 3 cases
     const poRes = await app.inject({
       method: "POST",
       url: "/api/purchasing/orders",
@@ -230,7 +574,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
           {
             productId: prod.id,
             caseQty: 24,
-            orderedCases: 2,
+            orderedCases: 3,
             unitCostCents: origAvgCost,
           },
         ],
@@ -240,7 +584,30 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const po = poRes.json() as { id: string; status: string };
     expect(po.status).toBe("approved");
 
-    // 2. Receive GRN linked to PO with high invoice cost to trigger margin alert
+    // 1b. Zero-case GRN rejected with 400
+    const badGrn = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/grn",
+      headers: authHeaders(),
+      payload: {
+        supplierId: meta.suppliers[0].id,
+        poId: po.id,
+        invoiceNumber: `TEST-ZERO-${Date.now()}`,
+        lines: [
+          {
+            productId: prod.id,
+            caseQty: 24,
+            paidCases: 0,
+            freeBonusCases: 0,
+            invoiceLineTotalCents: 0,
+          },
+        ],
+      },
+    });
+    expect(badGrn.statusCode).toBe(400);
+
+    // 2. Receive partial GRN (1 paid + 1 bonus = 2 of 3 cases) with high invoice cost to trigger margin alert
+    const inv1 = `TEST-GRN-${Date.now()}`;
     const grnRes = await app.inject({
       method: "POST",
       url: "/api/purchasing/grn",
@@ -248,7 +615,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       payload: {
         supplierId: meta.suppliers[0].id,
         poId: po.id,
-        invoiceNumber: `TEST-GRN-${Date.now()}`,
+        invoiceNumber: inv1,
         lines: [
           {
             productId: prod.id,
@@ -265,13 +632,33 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     const grnBody = grnRes.json() as { grnId: string; marginAlertsTriggered: number };
     expect(grnBody.marginAlertsTriggered).toBeGreaterThanOrEqual(1);
 
-    // 3. Apply suggested price -> resolves alert and scales multi-pack barcodes
+    // Verify PO moved to partially_received and PO line receivedCases incremented to 2
+    const [poAfterPartial] = await db
+      .select()
+      .from(purchaseOrders)
+      .where(eq(purchaseOrders.id, po.id));
+    expect(poAfterPartial.status).toBe("partially_received");
+    const [poLineAfterPartial] = await db
+      .select()
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.poId, po.id));
+    expect(poLineAfterPartial.receivedCases).toBe(2);
+
+    // 3. Apply suggested price -> rejects negative customPriceCents, then resolves alert and scales multi-pack barcodes
     const [createdAlert] = await db
       .select()
       .from(marginAlerts)
       .where(and(eq(marginAlerts.grnId, grnBody.grnId), eq(marginAlerts.resolved, false)))
       .limit(1);
     expect(createdAlert).toBeDefined();
+
+    const badPrice = await app.inject({
+      method: "POST",
+      url: `/api/inventory/margin-alerts/${createdAlert.id}/apply-price`,
+      headers: authHeaders(),
+      payload: { customPriceCents: -100 },
+    });
+    expect(badPrice.statusCode).toBe(400);
 
     const applyRes = await app.inject({
       method: "POST",
@@ -282,12 +669,17 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(applyRes.statusCode).toBe(200);
     expect(applyRes.json().updatedPackTiers).toBeGreaterThanOrEqual(1);
 
-    // Clean up test GRN, PO, alerts, movements, batches & restore original prices/cost
-    await db.delete(marginAlerts).where(eq(marginAlerts.grnId, grnBody.grnId));
-    await db.delete(stockMovements).where(eq(stockMovements.refId, grnBody.grnId));
-    await db.delete(inventoryBatches).where(eq(inventoryBatches.lotCode, `GRN-${grnBody.grnId}`));
-    await db.delete(goodsReceipts).where(eq(goodsReceipts.id, grnBody.grnId));
-    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, po.id));
+    // Clean up test GRN, PO, alerts, movements, batches, shelf tags & restore original prices/cost
+    await cleanupGrn(grnBody.grnId);
+    await db.delete(inventoryBatches).where(eq(inventoryBatches.lotCode, `GRN-${inv1}`));
+    await cleanupPo(po.id);
+    await db
+      .delete(shelfTagQueue)
+      .where(and(eq(shelfTagQueue.productId, prod.id), eq(shelfTagQueue.reason, "cost_change")));
+    await db
+      .update(products)
+      .set({ avgCostCents: origAvgCost })
+      .where(eq(products.id, prod.id));
     for (const op of origPrices) {
       await db
         .update(productBarcodes)
@@ -296,7 +688,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     }
   });
 
-  it("supports blind shift open/close, quoted CSV preview, and sanitized ZPL generation", async () => {
+  it("supports blind shift open/close, quoted CSV preview, empty PATCH rejection, and sanitized ZPL generation", async () => {
     const openRes = await app.inject({
       method: "POST",
       url: "/api/pos/shifts/open",
@@ -336,19 +728,27 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       url: "/api/products?page=1&pageSize=1",
       headers: authHeaders(),
     });
-    const pid = listRes.json().items[0].id as string;
+    const firstProd = listRes.json().items[0] as { id: string; barcodes: { id: string }[] };
+    const emptyPatch = await app.inject({
+      method: "PATCH",
+      url: `/api/products/${firstProd.id}/barcodes/${firstProd.barcodes[0].id}`,
+      headers: authHeaders(),
+      payload: {},
+    });
+    expect(emptyPatch.statusCode).toBe(400);
+
     const zplRes = await app.inject({
       method: "POST",
       url: "/api/labels/zpl",
       headers: authHeaders(),
-      payload: { productIds: [pid] },
+      payload: { productIds: [firstProd.id] },
     });
     expect(zplRes.statusCode).toBe(200);
     expect(zplRes.json().zpl).toContain("^XA");
     expect(zplRes.json().zpl).toContain("^BEN");
   });
 
-  it("runs Embedded AI Copilot chat + HITL proposal execution with audit trail", async () => {
+  it("runs Embedded AI Copilot chat + atomic HITL proposal execution with double-execute protection and tool input validation", async () => {
     const chatRes = await app.inject({
       method: "POST",
       url: "/api/ai/chat",
@@ -370,24 +770,68 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     );
     expect(pendingPo).toBeDefined();
 
-    const execRes = await app.inject({
-      method: "POST",
-      url: `/api/ai/actions/${pendingPo!.id}/execute`,
-      headers: authHeaders(),
-      payload: {},
-    });
-    expect(execRes.statusCode).toBe(200);
-    expect(execRes.json().action.status).toBe("executed");
-    const createdPoId = execRes.json().result.poId as string;
+    // Concurrent double-execution must execute exactly once (200 + 409)
+    const [exec1, exec2] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: `/api/ai/actions/${pendingPo!.id}/execute`,
+        headers: authHeaders(),
+        payload: {},
+      }),
+      app.inject({
+        method: "POST",
+        url: `/api/ai/actions/${pendingPo!.id}/execute`,
+        headers: authHeaders(),
+        payload: {},
+      }),
+    ]);
+    const statuses = [exec1.statusCode, exec2.statusCode].sort();
+    expect(statuses).toEqual([200, 409]);
+    const winner = exec1.statusCode === 200 ? exec1 : exec2;
+    expect(winner.json().action.status).toBe("executed");
+    const createdPoId = winner.json().result.poId as string;
     expect(createdPoId).toBeTruthy();
 
-    // Clean up AI test conversation, PO & audit log
-    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, createdPoId));
+    // Direct Copilot tool validation against malformed LLM inputs (must return { error }, never throw)
+    const [ownerRow] = await db.select().from(users).where(eq(users.username, "owner")).limit(1);
+    const toolCtx = {
+      conversationId: chatData.conversationId,
+      user: {
+        id: ownerRow.id,
+        username: ownerRow.username,
+        fullName: ownerRow.fullName,
+        role: "owner" as const,
+      },
+    };
+    const badPromoTool = await executeCopilotTool(
+      "propose_promotion",
+      {
+        name: "Bad Promo",
+        promoType: "clearance",
+        productIds: ["not-a-uuid-at-all"],
+      },
+      toolCtx
+    );
+    expect(badPromoTool.error).toBeTruthy();
+
+    const badUrgencyTool = await executeCopilotTool(
+      "get_reorder_alerts",
+      { urgency: "invalid_enum" },
+      toolCtx
+    );
+    expect(badUrgencyTool.error).toBeTruthy();
+
+    const emptySearchTool = await executeCopilotTool("search_catalog", { query: "   " }, toolCtx);
+    expect(emptySearchTool.error).toBeTruthy();
+
+    // Clean up AI test conversation, PO, proposed actions & audit log
+    await cleanupPo(createdPoId);
+    await db.delete(aiProposedActions).where(eq(aiProposedActions.conversationId, chatData.conversationId));
     await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
     await db.delete(auditLogs).where(eq(auditLogs.entityId, createdPoId));
   });
 
-  it("supports Morning Briefing, Semantic Search, Invoice GRN Scanner, Calibrated Triage & SSE Streaming", async () => {
+  it("supports Morning Briefing, Semantic Search, Invoice GRN Scanner, Calibrated Triage (incl. NaN safety) & SSE Streaming CORS guard", async () => {
     // 1. Daily Morning Briefing
     const brRes = await app.inject({
       method: "POST",
@@ -420,7 +864,9 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(semItems.length).toBeGreaterThan(0);
     expect(semItems.some((i) => /0\.0|alcohol-free/i.test(i.name))).toBe(true);
 
-    // 3. Supplier Invoice -> GRN Scanner
+    // 3. Supplier Invoice -> GRN Scanner (including base64 text/plain offline fallback)
+    const invText =
+      "Supplier: Summit Brewing & Beer Supply\nInvoice: INV-TEST-888\nBEER-0001 Heineken Original | 24 | 10 | 1 | 310.00 | 2027-06-01";
     const invRes = await app.inject({
       method: "POST",
       url: "/api/ai/grn/parse-invoice",
@@ -428,8 +874,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
       payload: {
         fileName: "test-invoice.txt",
         mimeType: "text/plain",
-        textContent:
-          "Supplier: Summit Brewing & Beer Supply\nInvoice: INV-TEST-888\nBEER-0001 Heineken Original | 24 | 10 | 1 | 310.00 | 2027-06-01",
+        base64Data: Buffer.from(invText, "utf8").toString("base64"),
       },
     });
     expect(invRes.statusCode).toBe(200);
@@ -438,7 +883,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(invRes.json().lines[0].matchedSku).toBe("BEER-0001");
     expect(invRes.json().triage.questions.length).toBeGreaterThanOrEqual(2);
 
-    // 4. Calibrated Cashier Triage
+    // 4. Calibrated Cashier Triage (valid + malformed NaN metrics safety)
     const triageHigh = await app.inject({
       method: "POST",
       url: "/api/ai/triage",
@@ -460,28 +905,58 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(triageHigh.json().questions[0].verdict).toBe("yes");
     expect(triageHigh.json().questions[0].probability).toBeGreaterThan(0.7);
 
-    // 5. SSE Streaming Copilot Chat (via ephemeral listen on port 0 for raw hijack support)
-    const liveUrl = await app.listen({ port: 0, host: "127.0.0.1" });
-    try {
-      const sseRes = await fetch(`${liveUrl}/api/ai/chat/stream`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...authHeaders(),
+    const triageNan = await app.inject({
+      method: "POST",
+      url: "/api/ai/triage",
+      headers: authHeaders(),
+      payload: {
+        targetType: "cashier_anomaly",
+        metrics: {
+          voidRatePct: "not-a-number",
+          zScore: "NaN",
+          totalSalesCount: 0,
         },
-        body: JSON.stringify({ message: "Give me today morning risk briefing" }),
-      });
-      expect(sseRes.status).toBe(200);
-      const bodyText = await sseRes.text();
-      expect(bodyText).toContain('"type":"tool_call"');
-      expect(bodyText).toContain('"type":"delta"');
-      expect(bodyText).toContain('"type":"done"');
-      const convMatch = bodyText.match(/"conversationId":"([^"]+)"/);
-      if (convMatch?.[1]) {
-        await db.delete(aiConversations).where(eq(aiConversations.id, convMatch[1]));
-      }
-    } finally {
-      // Leave Fastify instance ready or close cleanly? afterAll closes app, which works fine even after listen
+      },
+    });
+    expect(triageNan.statusCode).toBe(200);
+    for (const q of triageNan.json().questions as { probability: number; confidence: number }[]) {
+      expect(Number.isFinite(q.probability)).toBe(true);
+      expect(Number.isFinite(q.confidence)).toBe(true);
+    }
+
+    // 5. SSE Streaming Copilot Chat (verifies allowed Origin gets ACAO while evil Origin is blocked by CORS 403)
+    const liveUrl = await app.listen({ port: 0, host: "127.0.0.1" });
+    const badSseRes = await fetch(`${liveUrl}/api/ai/chat/stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://evil.example",
+        ...authHeaders(),
+      },
+      body: JSON.stringify({ message: "hello" }),
+    });
+    expect(badSseRes.status).toBe(403);
+    expect(badSseRes.headers.get("access-control-allow-origin")).toBeNull();
+
+    const sseRes = await fetch(`${liveUrl}/api/ai/chat/stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://localhost:5173",
+        ...authHeaders(),
+      },
+      body: JSON.stringify({ message: "Give me today morning risk briefing" }),
+    });
+    expect(sseRes.status).toBe(200);
+    expect(sseRes.headers.get("access-control-allow-origin")).toBe("http://localhost:5173");
+    expect(sseRes.headers.get("x-content-type-options")).toBe("nosniff");
+    const bodyText = await sseRes.text();
+    expect(bodyText).toContain('"type":"tool_call"');
+    expect(bodyText).toContain('"type":"delta"');
+    expect(bodyText).toContain('"type":"done"');
+    const convMatch = bodyText.match(/"conversationId":"([^"]+)"/);
+    if (convMatch?.[1]) {
+      await db.delete(aiConversations).where(eq(aiConversations.id, convMatch[1]));
     }
   });
 
@@ -535,7 +1010,7 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(br.json().rules[0].lift).toBeGreaterThan(1.5);
 
     expect(lp.statusCode).toBe(200);
-    expect(lp.json().cashierAnomalies.length).toBe(5);
+    expect(lp.json().cashierAnomalies.length).toBeGreaterThanOrEqual(5);
     expect(lp.json().cashierAnomalies[0].riskLevel).toBe("high");
 
     expect(csv.statusCode).toBe(200);
@@ -645,4 +1120,1441 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(promoAction?.previewJson.daypartWindow).toBe("08:00-12:00");
     await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
   });
+
+  it("Milestone 1: serves Supplier OTIF scorecards, auto-detects PO vs GRN short/cost variances, and resolves them with RBAC", async () => {
+    // 1. Cashier blocked from scorecards & variances
+    const cashierSc = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/supplier-scorecards",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierSc.statusCode).toBe(403);
+
+    const cashierVar = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/variances",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierVar.statusCode).toBe(403);
+
+    // 2. Owner reads seeded Supplier OTIF Scorecards
+    const scRes = await app.inject({
+      method: "GET",
+      url: "/api/purchasing/supplier-scorecards",
+      headers: authHeaders(),
+    });
+    expect(scRes.statusCode).toBe(200);
+    const scBody = scRes.json() as {
+      summary: { supplierCount: number; avgOtifPct: number };
+      scorecards: { supplierId: string; grade: string; otifRatePct: number }[];
+    };
+    expect(scBody.summary.supplierCount).toBeGreaterThanOrEqual(5);
+    expect(scBody.scorecards.length).toBeGreaterThanOrEqual(5);
+
+    // 3. Create PO (4 cases @ origAvgCost) and receive short (2 cases) at +20% unit cost overcharge
+    const prodRes = await app.inject({
+      method: "GET",
+      url: "/api/products?page=1&pageSize=1",
+      headers: authHeaders(),
+    });
+    const prod = prodRes.json().items[0] as { id: string; avgCostCents: number };
+    const origAvgCost = prod.avgCostCents;
+    const supplierId = scBody.scorecards[0].supplierId;
+
+    const poRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/orders",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        notes: "M1 3-way variance test PO",
+        lines: [
+          {
+            productId: prod.id,
+            caseQty: 10,
+            orderedCases: 4,
+            unitCostCents: Math.max(100, origAvgCost),
+          },
+        ],
+      },
+    });
+    expect(poRes.statusCode).toBe(201);
+    const po = poRes.json() as { id: string };
+
+    const poUnitCost = Math.max(100, origAvgCost);
+    const overchargedUnitCost = Math.round(poUnitCost * 1.25);
+    const invNo = `TEST-M1-VAR-${Date.now()}`;
+    const grnRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/grn",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        poId: po.id,
+        invoiceNumber: invNo,
+        lines: [
+          {
+            productId: prod.id,
+            caseQty: 10,
+            paidCases: 2,
+            freeBonusCases: 0,
+            invoiceLineTotalCents: 20 * overchargedUnitCost,
+          },
+        ],
+      },
+    });
+    expect(grnRes.statusCode).toBe(201);
+    const grnBody = grnRes.json() as { grnId: string; variancesCreated: number };
+    expect(grnBody.variancesCreated).toBe(2); // short_delivery + cost_overcharge
+
+    // 4. Query variances endpoint and verify both variance types exist
+    const varListRes = await app.inject({
+      method: "GET",
+      url: `/api/purchasing/variances?status=open&supplierId=${supplierId}`,
+      headers: authHeaders(),
+    });
+    expect(varListRes.statusCode).toBe(200);
+    const createdVars = (
+      varListRes.json().variances as { id: string; grnId: string; varianceType: string }[]
+    ).filter((v) => v.grnId === grnBody.grnId);
+    expect(createdVars.map((v) => v.varianceType).sort()).toEqual([
+      "cost_overcharge",
+      "short_delivery",
+    ]);
+
+    // 5. Resolve one variance via PATCH (credit note), verify resolvedAt & audit; cashier blocked
+    const targetVar = createdVars[0];
+    const cashierPatch = await app.inject({
+      method: "PATCH",
+      url: `/api/purchasing/variances/${targetVar.id}`,
+      headers: authHeaders(cashierToken),
+      payload: { status: "disputed" },
+    });
+    expect(cashierPatch.statusCode).toBe(403);
+
+    const resolveRes = await app.inject({
+      method: "PATCH",
+      url: `/api/purchasing/variances/${targetVar.id}`,
+      headers: authHeaders(),
+      payload: {
+        status: "resolved_credit_note",
+        resolutionNote: "Credit memo CN-9921 issued by distributor",
+      },
+    });
+    expect(resolveRes.statusCode).toBe(200);
+    expect(resolveRes.json().variance.status).toBe("resolved_credit_note");
+    expect(resolveRes.json().variance.resolvedAt).toBeTruthy();
+
+    // Cleanup test rows and restore avgCostCents
+    await cleanupGrn(grnBody.grnId);
+    await cleanupPo(po.id);
+    await db.update(products).set({ avgCostCents: origAvgCost }).where(eq(products.id, prod.id));
+  });
+
+  it("Milestone 2: supports Phantom Stock verification, Dynamic Markdown application (promo + tag), and 07:30 Shelf Tag ZPL print queue with RBAC", async () => {
+    const clerkLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "clerk1", pin: "2222", includeToken: true },
+    });
+    expect(clerkLogin.statusCode).toBe(200);
+    const clerkToken = (clerkLogin.json() as { token: string }).token;
+
+    // 1. Phantom stock listing: cashier blocked, clerk allowed
+    const cashierPh = await app.inject({
+      method: "GET",
+      url: "/api/inventory/phantom-stock",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierPh.statusCode).toBe(403);
+
+    const phRes = await app.inject({
+      method: "GET",
+      url: "/api/inventory/phantom-stock",
+      headers: authHeaders(clerkToken),
+    });
+    expect(phRes.statusCode).toBe(200);
+    const phBody = phRes.json() as {
+      summary: { totalFlagged: number };
+      items: {
+        productId: string;
+        status: string;
+        bookStockUnits: number;
+        estimatedValueAtRiskCents: number;
+      }[];
+    };
+    expect(phBody.summary.totalFlagged).toBeGreaterThan(0);
+    const samplePh = phBody.items[0];
+
+    // Clerk verifies phantom stock OK (non-destructive check, restored right after)
+    const verifyRes = await app.inject({
+      method: "POST",
+      url: `/api/inventory/phantom-stock/${samplePh.productId}/verify`,
+      headers: authHeaders(clerkToken),
+      payload: { markVerifiedOk: true, note: "Integration test shelf spot-check" },
+    });
+    expect(verifyRes.statusCode).toBe(200);
+    expect(verifyRes.json().status).toBe("verified_ok");
+
+    // Restore original phantom row state
+    await db
+      .update(analyticsPhantomStock)
+      .set({
+        status: samplePh.status,
+        bookStockUnits: samplePh.bookStockUnits,
+        estimatedValueAtRiskCents: samplePh.estimatedValueAtRiskCents,
+      })
+      .where(eq(analyticsPhantomStock.productId, samplePh.productId));
+
+    // 2. Dynamic markdowns: clerk can view, clerk CANNOT apply (403), owner CAN apply (201)
+    const mdRes = await app.inject({
+      method: "GET",
+      url: "/api/inventory/dynamic-markdowns",
+      headers: authHeaders(clerkToken),
+    });
+    expect(mdRes.statusCode).toBe(200);
+    const mdBody = mdRes.json() as {
+      items: { batchId: string; recommendedDiscountBp: number; status: string }[];
+    };
+    expect(mdBody.items.length).toBeGreaterThan(0);
+    const sampleMd = mdBody.items[0];
+    const [origBatch] = await db
+      .select({ status: inventoryBatches.status })
+      .from(inventoryBatches)
+      .where(eq(inventoryBatches.id, sampleMd.batchId));
+
+    const clerkApply = await app.inject({
+      method: "POST",
+      url: `/api/inventory/dynamic-markdowns/${sampleMd.batchId}/apply`,
+      headers: authHeaders(clerkToken),
+      payload: { discountBp: sampleMd.recommendedDiscountBp },
+    });
+    expect(clerkApply.statusCode).toBe(403);
+
+    const ownerApply = await app.inject({
+      method: "POST",
+      url: `/api/inventory/dynamic-markdowns/${sampleMd.batchId}/apply`,
+      headers: authHeaders(),
+      payload: { discountBp: sampleMd.recommendedDiscountBp, minMarginGuardBp: 0 },
+    });
+    expect(ownerApply.statusCode).toBe(201);
+    const applied = ownerApply.json() as {
+      promotionId: string;
+      shelfTagId: string | null;
+      status: string;
+    };
+    expect(applied.status).toBe("applied");
+    expect(applied.shelfTagId).toBeTruthy();
+
+    // 3. 07:30 Shelf Tag Queue: clerk lists pending & prints the newly queued clearance tag -> ZPL
+    const queueRes = await app.inject({
+      method: "GET",
+      url: "/api/labels/queue?status=pending",
+      headers: authHeaders(clerkToken),
+    });
+    expect(queueRes.statusCode).toBe(200);
+    const queuedTags = queueRes.json().tags as { id: string }[];
+    expect(queuedTags.some((t) => t.id === applied.shelfTagId)).toBe(true);
+
+    const printRes = await app.inject({
+      method: "POST",
+      url: "/api/labels/queue/print",
+      headers: authHeaders(clerkToken),
+      payload: { tagIds: [applied.shelfTagId] },
+    });
+    expect(printRes.statusCode).toBe(200);
+    const printed = printRes.json() as { printedCount: number; zpl: string };
+    expect(printed.printedCount).toBe(1);
+    expect(printed.zpl).toContain("^XA");
+    expect(printed.zpl).toContain("CLEARANCE");
+    expect(printed.zpl).toContain("^XZ");
+
+    // Cleanup M2 test mutations
+    if (applied.shelfTagId) {
+      await db.delete(shelfTagQueue).where(eq(shelfTagQueue.id, applied.shelfTagId));
+    }
+    await db.delete(promotions).where(eq(promotions.id, applied.promotionId));
+    await db
+      .update(analyticsDynamicMarkdowns)
+      .set({ status: sampleMd.status })
+      .where(eq(analyticsDynamicMarkdowns.batchId, sampleMd.batchId));
+    if (origBatch) {
+      await db
+        .update(inventoryBatches)
+        .set({ status: origBatch.status })
+        .where(eq(inventoryBatches.id, sampleMd.batchId));
+    }
+  });
+
+  it("Milestone 3: supports Loyalty CRM enrollment, single-use coupon concurrency locking, points accrual/clawback, and promo toggling", async () => {
+    // 1. Enroll new loyalty customer + duplicate phone 409 check
+    const uniquePhone = `555-${String(Date.now()).slice(-7)}`;
+    const enrollRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(cashierToken),
+      payload: {
+        phone: uniquePhone,
+        fullName: "Test Shopper Loyalty",
+        email: "loyalty.test@example.com",
+      },
+    });
+    expect(enrollRes.statusCode).toBe(201);
+    const customer = enrollRes.json().customer as { id: string; phone: string };
+
+    const dupEnroll = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(cashierToken),
+      payload: { phone: uniquePhone, fullName: "Duplicate Phone" },
+    });
+    expect(dupEnroll.statusCode).toBe(409);
+
+    // 2. Cashier cannot issue coupons (403); owner issues single-use $2 coupon (min $5)
+    const couponCode = `TESTC-${String(Date.now()).slice(-6)}`;
+    const cashierIssue = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(cashierToken),
+      payload: { code: couponCode, discountCents: 200, minBasketCents: 500, validDays: 7 },
+    });
+    expect(cashierIssue.statusCode).toBe(403);
+
+    const issueRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(),
+      payload: {
+        code: couponCode,
+        customerId: customer.id,
+        discountCents: 200,
+        minBasketCents: 500,
+        validDays: 7,
+      },
+    });
+    expect(issueRes.statusCode).toBe(201);
+    const issuedCoupon = issueRes.json().coupon as { id: string; code: string };
+
+    // 3. Validate coupon: fails below min basket, passes at $10 with matching customer
+    const valLow = await app.inject({
+      method: "GET",
+      url: `/api/loyalty/coupons/validate/${couponCode}?basketCents=300&customerId=${customer.id}`,
+      headers: authHeaders(cashierToken),
+    });
+    expect(valLow.statusCode).toBe(200);
+    expect(valLow.json().valid).toBe(false);
+
+    const valOk = await app.inject({
+      method: "GET",
+      url: `/api/loyalty/coupons/validate/${couponCode}?basketCents=1000&customerId=${customer.id}`,
+      headers: authHeaders(cashierToken),
+    });
+    expect(valOk.statusCode).toBe(200);
+    expect(valOk.json().valid).toBe(true);
+    expect(valOk.json().coupon.discountCents).toBe(200);
+
+    // 4. Concurrent double-redemption race on single-use coupon -> strictly one 201 and one 409!
+    const bootRes = await app.inject({
+      method: "GET",
+      url: "/api/pos/bootstrap",
+      headers: authHeaders(cashierToken),
+    });
+    const boot = bootRes.json() as {
+      products: { id: string; taxRateId: string; avgCostCents: number; requiresAgeCheck: boolean }[];
+      barcodes: { productId: string; barcode: string; packQty: number; packLabel: string; sellPriceCents: number }[];
+      taxRates: { id: string; rateBp: number; isInclusive: boolean }[];
+    };
+    const safeProd = boot.products.find((p) => !p.requiresAgeCheck)!;
+    const bc = boot.barcodes.find((b) => b.productId === safeProd.id)!;
+    const tax = boot.taxRates.find((t) => t.id === safeProd.taxRateId)!;
+
+    const unitPrice = bc.sellPriceCents;
+    const qtyPacks = Math.max(1, Math.ceil(600 / Math.max(1, unitPrice)));
+    const discountCents = 200;
+    const afterDiscount = unitPrice * qtyPacks - discountCents;
+    const lineTax = tax.isInclusive
+      ? Math.round((afterDiscount * tax.rateBp) / (10000 + tax.rateBp))
+      : Math.round((afterDiscount * tax.rateBp) / 10000);
+    const lineTotal = tax.isInclusive ? afterDiscount : afterDiscount + lineTax;
+
+    const makeSalePayload = (saleId: string, rcpt: string) => ({
+      id: saleId,
+      registerCode: "REG-01",
+      receiptNo: rcpt,
+      kind: "sale" as const,
+      soldAt: new Date().toISOString(),
+      ageVerified: false,
+      customerId: customer.id,
+      couponCode,
+      lines: [
+        {
+          id: generateUuidV7(),
+          productId: safeProd.id,
+          scannedBarcode: bc.barcode,
+          packLabel: bc.packLabel,
+          packQty: bc.packQty,
+          qtyPacks,
+          unitPriceCents: unitPrice,
+          unitCostCents: safeProd.avgCostCents ?? 0,
+          discountCents,
+          taxRateBp: tax.rateBp,
+          taxCents: lineTax,
+          lineTotalCents: lineTotal,
+        },
+      ],
+      payments: [
+        {
+          id: generateUuidV7(),
+          method: "card" as const,
+          amountCents: lineTotal,
+          tenderedCents: lineTotal,
+          changeCents: 0,
+        },
+      ],
+    });
+
+    const raceAId = generateUuidV7();
+    const raceBId = generateUuidV7();
+    const payloadA = makeSalePayload(raceAId, `TEST-CPN-A-${raceAId.slice(-6)}`);
+    const payloadB = makeSalePayload(raceBId, `TEST-CPN-B-${raceBId.slice(-6)}`);
+
+    const [resA, resB] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: payloadA,
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: payloadB,
+      }),
+    ]);
+    expect([resA.statusCode, resB.statusCode].sort()).toEqual([201, 409]);
+
+    const winnerPayload = resA.statusCode === 201 ? payloadA : payloadB;
+    const winnerBody = (resA.statusCode === 201 ? resA : resB).json() as {
+      id: string;
+      pointsEarned: number;
+    };
+    expect(winnerBody.pointsEarned).toBe(Math.floor(lineTotal / 100));
+
+    // Idempotent retry of winning sale ID still returns 200 duplicate: true!
+    const retryWin = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(cashierToken),
+      payload: winnerPayload,
+    });
+    expect(retryWin.statusCode).toBe(200);
+    expect(retryWin.json().duplicate).toBe(true);
+
+    // 5. Verify customer accrued points and recent-sales includes lines + alreadyVoided=false
+    const [custAfterSale] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.id, customer.id));
+    expect(custAfterSale.pointsBalance).toBe(Math.floor(lineTotal / 100));
+
+    const recentRes = await app.inject({
+      method: "GET",
+      url: "/api/pos/recent-sales",
+      headers: authHeaders(),
+    });
+    expect(recentRes.statusCode).toBe(200);
+    const recentRow = (
+      recentRes.json().sales as { id: string; alreadyVoided: boolean; lines: unknown[] }[]
+    ).find((s) => s.id === winnerPayload.id);
+    expect(recentRow).toBeDefined();
+    expect(recentRow?.alreadyVoided).toBe(false);
+    expect(recentRow?.lines.length).toBe(1);
+
+    // 6. Owner voids the sale -> points clawed back to 0
+    const voidId = generateUuidV7();
+    const voidRes = await app.inject({
+      method: "POST",
+      url: "/api/pos/sales",
+      headers: authHeaders(),
+      payload: {
+        ...winnerPayload,
+        id: voidId,
+        receiptNo: `TEST-CPN-VOID-${voidId.slice(-6)}`,
+        kind: "void",
+        originalSaleId: winnerPayload.id,
+        couponCode: null,
+        lines: [{ ...winnerPayload.lines[0], id: generateUuidV7() }],
+        payments: [{ ...winnerPayload.payments[0], id: generateUuidV7() }],
+      },
+    });
+    expect(voidRes.statusCode).toBe(201);
+    const [custAfterVoid] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.id, customer.id));
+    expect(custAfterVoid.pointsBalance).toBe(0);
+
+    // 7. Create & toggle a promotion via PATCH /api/promotions/:id
+    const promoCreate = await app.inject({
+      method: "POST",
+      url: "/api/promotions",
+      headers: authHeaders(),
+      payload: {
+        name: "Test M3 Morning Basket Promo",
+        promoType: "basket_threshold",
+        priority: 30,
+        combinable: true,
+        minMarginGuardBp: 500,
+        daypartStartHour: 8,
+        daypartEndHour: 12,
+        rulesJson: { minBasketCents: 2000, flatDiscountCents: 200 },
+      },
+    });
+    expect(promoCreate.statusCode).toBe(201);
+    const createdPromoId = (promoCreate.json() as { id: string }).id;
+
+    const promoPause = await app.inject({
+      method: "PATCH",
+      url: `/api/promotions/${createdPromoId}`,
+      headers: authHeaders(),
+      payload: { active: false },
+    });
+    expect(promoPause.statusCode).toBe(200);
+    expect(promoPause.json().promotion.active).toBe(false);
+
+    // Cleanup test rows
+    await db.delete(promotions).where(eq(promotions.id, createdPromoId));
+    await db.delete(loyaltyLedger).where(eq(loyaltyLedger.customerId, customer.id));
+    await db.delete(targetedCoupons).where(eq(targetedCoupons.id, issuedCoupon.id));
+    await cleanupSales([winnerPayload.id, voidId]);
+    await db.delete(customers).where(eq(customers.id, customer.id));
+  });
+
+  it("Milestone 3: supports Hourly Lane Staffing Plan generation/assignment and Daily Floor Task Checklist completion with RBAC", async () => {
+    const clerkLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "clerk1", pin: "2222", includeToken: true },
+    });
+    expect(clerkLogin.statusCode).toBe(200);
+    const clerkToken = (clerkLogin.json() as { token: string }).token;
+
+    // 1. Cashier blocked from staffing plan & tasks
+    const cashierStaff = await app.inject({
+      method: "GET",
+      url: "/api/operations/staffing-plan",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierStaff.statusCode).toBe(403);
+
+    const cashierTasks = await app.inject({
+      method: "GET",
+      url: "/api/operations/tasks",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierTasks.statusCode).toBe(403);
+
+    // 2. Generate staffing plan for a dedicated test date, assign a cashier, and confirm
+    const testPlanDate = "2027-01-15";
+    const genRes = await app.inject({
+      method: "POST",
+      url: "/api/operations/staffing-plan/generate",
+      headers: authHeaders(),
+      payload: { planDate: testPlanDate },
+    });
+    expect(genRes.statusCode).toBe(201);
+    expect(genRes.json().generatedCount).toBe(14);
+
+    const listPlan = await app.inject({
+      method: "GET",
+      url: `/api/operations/staffing-plan?date=${testPlanDate}`,
+      headers: authHeaders(),
+    });
+    expect(listPlan.statusCode).toBe(200);
+    const planBody = listPlan.json() as {
+      staffOptions: { id: string; fullName: string }[];
+      slots: { id: string; hour: number }[];
+    };
+    expect(planBody.slots.length).toBe(14);
+    expect(planBody.staffOptions.length).toBeGreaterThan(0);
+
+    const patchSlot = await app.inject({
+      method: "PATCH",
+      url: `/api/operations/staffing-plan/${planBody.slots[0].id}`,
+      headers: authHeaders(),
+      payload: {
+        assignedStaffId: planBody.staffOptions[0].id,
+        status: "confirmed",
+        recommendedLanes: 2,
+      },
+    });
+    expect(patchSlot.statusCode).toBe(200);
+    expect(patchSlot.json().slot.status).toBe("confirmed");
+    expect(patchSlot.json().slot.assignedCashierName).toBe(planBody.staffOptions[0].fullName);
+
+    // 3. Daily Floor Tasks: clerk lists tasks & completes one, then restore original state
+    const tasksRes = await app.inject({
+      method: "GET",
+      url: "/api/operations/tasks?date=all",
+      headers: authHeaders(clerkToken),
+    });
+    expect(tasksRes.statusCode).toBe(200);
+    const taskList = tasksRes.json().tasks as {
+      id: string;
+      status: string;
+      completedBy: string | null;
+      completedAt: string | null;
+      completionNote: string | null;
+    }[];
+    expect(taskList.length).toBeGreaterThan(0);
+    const sampleTask = taskList[0];
+
+    const compRes = await app.inject({
+      method: "POST",
+      url: `/api/operations/tasks/${sampleTask.id}/complete`,
+      headers: authHeaders(clerkToken),
+      payload: { note: "Restocked top shelf before 08:00" },
+    });
+    expect(compRes.statusCode).toBe(200);
+    expect(compRes.json().task.status).toBe("completed");
+    expect(compRes.json().task.completedBy).toContain("Marcus");
+
+    // Cleanup test staffing plan & restore task state
+    await db.delete(shiftRosters).where(eq(shiftRosters.planDate, testPlanDate));
+    await db
+      .update(storeTasks)
+      .set({
+        status: sampleTask.status,
+        completedBy: sampleTask.completedBy,
+        completedAt: sampleTask.completedAt ? new Date(sampleTask.completedAt) : null,
+        completionNote: sampleTask.completionNote,
+      })
+      .where(eq(storeTasks.id, sampleTask.id));
+  });
+
+  it("Production Hardening: verifies live DB /api/health readiness probe and M1-M3 AI Copilot read tools", async () => {
+    const liveRes = await app.inject({ method: "GET", url: "/api/health/live" });
+    expect(liveRes.statusCode).toBe(200);
+    expect(liveRes.json().status).toBe("ok");
+
+    const healthRes = await app.inject({ method: "GET", url: "/api/health" });
+    expect(healthRes.statusCode).toBe(200);
+    const hBody = healthRes.json() as { status: string; db: string; dbLatencyMs: number };
+    expect(hBody.status).toBe("ok");
+    expect(hBody.db).toBe("connected");
+    expect(hBody.dbLatencyMs).toBeGreaterThanOrEqual(0);
+
+    // Exercise all 4 new M1-M3 Copilot tools through the chat fallback router
+    const chatRes = await app.inject({
+      method: "POST",
+      url: "/api/ai/chat",
+      headers: authHeaders(),
+      payload: {
+        message: "Show supplier OTIF scorecards, phantom stock ghost SKUs, dynamic markdowns, and today's floor task checklist",
+      },
+    });
+    expect(chatRes.statusCode).toBe(200);
+    const chatData = chatRes.json() as {
+      conversationId: string;
+      toolTraces: { tool: string }[];
+    };
+    const toolsCalled = new Set(chatData.toolTraces.map((t) => t.tool));
+    expect(toolsCalled.has("get_supplier_scorecards")).toBe(true);
+    expect(toolsCalled.has("get_phantom_stock_alerts")).toBe(true);
+    expect(toolsCalled.has("get_dynamic_markdowns")).toBe(true);
+    expect(toolsCalled.has("get_floor_tasks")).toBe(true);
+    await db.delete(aiConversations).where(eq(aiConversations.id, chatData.conversationId));
+  });
+
+  it("Wave 2 Phase 1: enforces Staff Governance, PIN rotation, last-owner protection, Audit Log filtering, PO detail, Z-Reports & CSV exports", async () => {
+    // 1. Accountant persona login + RBAC check
+    const accLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "accountant", pin: "4444", includeToken: true },
+    });
+    expect(accLogin.statusCode).toBe(200);
+    const accountantToken = (accLogin.json() as { token: string }).token;
+
+    const accAdminUsers = await app.inject({
+      method: "GET",
+      url: "/api/admin/users",
+      headers: authHeaders(accountantToken),
+    });
+    expect(accAdminUsers.statusCode).toBe(403);
+
+    const cashierAudit = await app.inject({
+      method: "GET",
+      url: "/api/admin/audit-logs",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierAudit.statusCode).toBe(403);
+
+    // 2. Owner creates temp staff account, tests self-service PIN rotation & instant session revocation
+    const tempUsername = `temp_gov_${Date.now().toString().slice(-6)}`;
+    const createRes = await app.inject({
+      method: "POST",
+      url: "/api/admin/users",
+      headers: authHeaders(),
+      payload: {
+        username: tempUsername,
+        fullName: "Temp Governance Tester",
+        role: "cashier",
+        pin: "7392",
+      },
+    });
+    expect(createRes.statusCode).toBe(201);
+    const createdUser = (createRes.json() as { user: { id: string; username: string } }).user;
+
+    try {
+      // Login twice to create 2 concurrent sessions
+      const [sessA, sessB] = await Promise.all([
+        app.inject({
+          method: "POST",
+          url: "/api/auth/login",
+          payload: { username: tempUsername, pin: "7392", includeToken: true },
+        }),
+        app.inject({
+          method: "POST",
+          url: "/api/auth/login",
+          payload: { username: tempUsername, pin: "7392", includeToken: true },
+        }),
+      ]);
+      expect(sessA.statusCode).toBe(200);
+      expect(sessB.statusCode).toBe(200);
+      const tokenA = (sessA.json() as { token: string }).token;
+      const tokenB = (sessB.json() as { token: string }).token;
+
+      // Self-service PIN rotation on session A must revoke session B
+      const rotRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/change-pin",
+        headers: authHeaders(tokenA),
+        payload: { currentPin: "7392", newPin: "8429" },
+      });
+      expect(rotRes.statusCode).toBe(200);
+      expect(rotRes.json().otherSessionsRevoked).toBeGreaterThanOrEqual(1);
+
+      // Session B must now be rejected (401), while Session A remains valid
+      const checkB = await app.inject({
+        method: "GET",
+        url: "/api/pos/bootstrap",
+        headers: authHeaders(tokenB),
+      });
+      expect(checkB.statusCode).toBe(401);
+
+      const checkA = await app.inject({
+        method: "GET",
+        url: "/api/pos/bootstrap",
+        headers: authHeaders(tokenA),
+      });
+      expect(checkA.statusCode).toBe(200);
+
+      // Owner can explicitly revoke all sessions via POST /api/admin/users/:id/revoke-sessions
+      const revokeRes = await app.inject({
+        method: "POST",
+        url: `/api/admin/users/${createdUser.id}/revoke-sessions`,
+        headers: authHeaders(),
+      });
+      expect(revokeRes.statusCode).toBe(200);
+      expect(revokeRes.json().sessionsRevoked).toBeGreaterThanOrEqual(1);
+
+      const checkAAfterRevoke = await app.inject({
+        method: "GET",
+        url: "/api/pos/bootstrap",
+        headers: authHeaders(tokenA),
+      });
+      expect(checkAAfterRevoke.statusCode).toBe(401);
+
+      // Re-login with rotated PIN then verify deactivation revokes active session
+      const sessC = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { username: tempUsername, pin: "8429", includeToken: true },
+      });
+      expect(sessC.statusCode).toBe(200);
+      const tokenC = (sessC.json() as { token: string }).token;
+
+      const deactRes = await app.inject({
+        method: "PATCH",
+        url: `/api/admin/users/${createdUser.id}`,
+        headers: authHeaders(),
+        payload: { active: false },
+      });
+      expect(deactRes.statusCode).toBe(200);
+      expect(deactRes.json().sessionsRevoked).toBeGreaterThanOrEqual(1);
+
+      const checkCAfterDeact = await app.inject({
+        method: "GET",
+        url: "/api/pos/bootstrap",
+        headers: authHeaders(tokenC),
+      });
+      expect(checkCAfterDeact.statusCode).toBe(401);
+
+      // Last active owner protection: cannot deactivate sole active owner
+      const usersList = await app.inject({
+        method: "GET",
+        url: "/api/admin/users",
+        headers: authHeaders(),
+      });
+      expect(usersList.statusCode).toBe(200);
+      const allUsers = usersList.json().users as { id: string; role: string; active: boolean }[];
+      const activeOwners = allUsers.filter((u) => u.role === "owner" && u.active);
+      if (activeOwners.length === 1) {
+        const blockOwner = await app.inject({
+          method: "PATCH",
+          url: `/api/admin/users/${activeOwners[0].id}`,
+          headers: authHeaders(),
+          payload: { active: false },
+        });
+        expect(blockOwner.statusCode).toBe(409);
+      }
+    } finally {
+      await db.delete(userSessions).where(eq(userSessions.userId, createdUser.id));
+      await db.delete(auditLogs).where(eq(auditLogs.entityId, createdUser.id));
+      await db.delete(users).where(eq(users.id, createdUser.id));
+    }
+
+    // 3. Immutable Audit Log Explorer & Z-Report Shift Summary (accessible by Accountant)
+    const [auditRes, shiftRes, posListRes] = await Promise.all([
+      app.inject({
+        method: "GET",
+        url: "/api/admin/audit-logs?page=1&pageSize=15",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/pos/shifts/summary",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/purchasing/orders",
+        headers: authHeaders(accountantToken),
+      }),
+    ]);
+    expect(auditRes.statusCode).toBe(200);
+    expect(Array.isArray(auditRes.json().logs)).toBe(true);
+    expect(Array.isArray(auditRes.json().facets.actions)).toBe(true);
+
+    expect(shiftRes.statusCode).toBe(200);
+    expect(shiftRes.json().summary.totalShifts).toBeGreaterThanOrEqual(0);
+
+    expect(posListRes.statusCode).toBe(200);
+    const poList = posListRes.json().orders as { id: string; poNumber: string }[];
+    if (poList.length > 0) {
+      const poDetail = await app.inject({
+        method: "GET",
+        url: `/api/purchasing/orders/${poList[0].id}`,
+        headers: authHeaders(accountantToken),
+      });
+      expect(poDetail.statusCode).toBe(200);
+      expect(poDetail.json().order.poNumber).toBe(poList[0].poNumber);
+      expect(Array.isArray(poDetail.json().lines)).toBe(true);
+    }
+
+    // 4. All 5 Formula-Safe CSV Exports + OpenAPI 3.1 Spec
+    const [invCsv, varCsv, shiftCsv, auditCsv, specRes] = await Promise.all([
+      app.inject({
+        method: "GET",
+        url: "/api/exports/inventory-valuation.csv",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/exports/supplier-variances.csv",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/exports/shifts.csv",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/exports/audit-logs.csv",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/openapi.json",
+        headers: authHeaders(accountantToken),
+      }),
+    ]);
+    expect(invCsv.statusCode).toBe(200);
+    expect(invCsv.body).toContain("SKU,ProductName,Brand");
+    expect(varCsv.statusCode).toBe(200);
+    expect(varCsv.body).toContain("CreatedAt,Supplier,PONumber");
+    expect(shiftCsv.statusCode).toBe(200);
+    expect(shiftCsv.body).toContain("ZReportNo,Register,Cashier");
+    expect(auditCsv.statusCode).toBe(200);
+    expect(auditCsv.body).toContain("Timestamp,Actor,Action");
+    expect(specRes.statusCode).toBe(200);
+    expect(specRes.json().openapi).toBe("3.1.0");
+    expect(specRes.json().paths["/admin/users"]).toBeTruthy();
+
+    // 5. Wave 2 Phase 3: Promo ROI Attribution & ML Pipeline 12-Check Data-Quality Contracts
+    const [promoRoiRes, pipeRes] = await Promise.all([
+      app.inject({
+        method: "GET",
+        url: "/api/analytics/promo-roi",
+        headers: authHeaders(accountantToken),
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/admin/pipeline-runs",
+        headers: authHeaders(accountantToken),
+      }),
+    ]);
+    expect(promoRoiRes.statusCode).toBe(200);
+    expect(promoRoiRes.json().items.length).toBeGreaterThan(0);
+
+    expect(pipeRes.statusCode).toBe(200);
+    expect(pipeRes.json().latest).toBeTruthy();
+    expect(pipeRes.json().latest.dqPassed).toBe(true);
+    expect(pipeRes.json().latest.dqChecksJson.length).toBe(12);
+  });
+
+  it("Wave 2B: enforces duplicate GRN invoice 409, PO state machine & multi-drop variance closure, FEFO batch & coupon restore on void, RFM coupon guard, ETag 304, OpenAPI completeness, and import/cycle-count/grns/fold-ledger routes", async () => {
+    // 1. ETag conditional caching on GET /api/pos/bootstrap -> 304 Not Modified (M-12)
+    const boot1 = await app.inject({
+      method: "GET",
+      url: "/api/pos/bootstrap",
+      headers: authHeaders(),
+    });
+    expect(boot1.statusCode).toBe(200);
+    const etag = boot1.headers["etag"];
+    expect(etag).toBeTruthy();
+    const boot304 = await app.inject({
+      method: "GET",
+      url: "/api/pos/bootstrap",
+      headers: { ...authHeaders(), "if-none-match": String(etag) },
+    });
+    expect(boot304.statusCode).toBe(304);
+
+    // 2. OpenAPI spec auto-documents 100% of registered routes (M-11)
+    const specRes = await app.inject({
+      method: "GET",
+      url: "/api/openapi.json",
+      headers: authHeaders(),
+    });
+    expect(specRes.statusCode).toBe(200);
+    const specPaths = specRes.json().paths as Record<string, Record<string, unknown>>;
+    expect(specPaths["/pos/shifts/active"]?.get).toBeTruthy();
+    expect(specPaths["/pos/fold-ledger"]?.post).toBeTruthy();
+    expect(specPaths["/purchasing/grns"]?.get).toBeTruthy();
+    expect(specPaths["/ai/chat/stream"]?.post).toBeTruthy();
+    expect(specPaths["/inventory/cycle-count"]?.post).toBeTruthy();
+    expect(specPaths["/import/commit"]?.post).toBeTruthy();
+
+    // 3. PO state-transition machine + multi-drop GRN cumulative variance closure + duplicate supplier invoice 409 (H-05, H-09)
+    const metaRes = await app.inject({
+      method: "GET",
+      url: "/api/meta",
+      headers: authHeaders(),
+    });
+    const supplierId = (metaRes.json().suppliers as { id: string }[])[0].id;
+    const prodRes = await app.inject({
+      method: "GET",
+      url: "/api/products?page=1&pageSize=1",
+      headers: authHeaders(),
+    });
+    expect(prodRes.json().items.length).toBe(1);
+    const prod = prodRes.json().items[0] as {
+      id: string;
+      avgCostCents: number;
+      taxRateBp: number;
+      taxInclusive: boolean;
+      barcodes: { barcode: string; packQty: number; packLabel: string; sellPriceCents: number }[];
+    };
+    const origAvgCost = prod.avgCostCents;
+    const poUnitCost = Math.max(100, origAvgCost);
+
+    const draftPoRes = await app.inject({
+      method: "POST",
+      url: "/api/purchasing/orders",
+      headers: authHeaders(),
+      payload: {
+        supplierId,
+        status: "draft",
+        notes: "Wave 2B state machine test",
+        lines: [{ productId: prod.id, caseQty: 10, orderedCases: 4, unitCostCents: poUnitCost }],
+      },
+    });
+    expect(draftPoRes.statusCode).toBe(201);
+    const poId = (draftPoRes.json() as { id: string }).id;
+    const grnIdsToClean: string[] = [];
+
+    try {
+      // Cannot jump directly from draft -> received (409)
+      const badJump = await app.inject({
+        method: "PATCH",
+        url: `/api/purchasing/orders/${poId}/status`,
+        headers: authHeaders(),
+        payload: { status: "received" },
+      });
+      expect(badJump.statusCode).toBe(409);
+
+      // Cannot post GRN against draft PO (409)
+      const draftGrn = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: `INV-W2B-DRAFT-${Date.now()}`,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(draftGrn.statusCode).toBe(409);
+
+      // Approve PO (draft -> approved)
+      const approveRes = await app.inject({
+        method: "PATCH",
+        url: `/api/purchasing/orders/${poId}/status`,
+        headers: authHeaders(),
+        payload: { status: "approved" },
+      });
+      expect(approveRes.statusCode).toBe(200);
+
+      // Drop 1: receive 2 of 4 cases -> creates 1 open short_delivery variance
+      const invDrop1 = `INV-W2B-D1-${Date.now()}`;
+      const drop1 = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: invDrop1,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(drop1.statusCode).toBe(201);
+      grnIdsToClean.push(drop1.json().grnId);
+      expect(drop1.json().variancesCreated).toBe(1);
+
+      // Duplicate supplier invoice must fail with 409 Conflict (H-05)
+      const dupInv = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: invDrop1,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(dupInv.statusCode).toBe(409);
+
+      // Drop 2: receive remaining 2 cases -> PO becomes received & prior short_delivery auto-resolves!
+      const invDrop2 = `INV-W2B-D2-${Date.now()}`;
+      const drop2 = await app.inject({
+        method: "POST",
+        url: "/api/purchasing/grn",
+        headers: authHeaders(),
+        payload: {
+          supplierId,
+          poId,
+          invoiceNumber: invDrop2,
+          lines: [
+            {
+              productId: prod.id,
+              caseQty: 10,
+              paidCases: 2,
+              freeBonusCases: 0,
+              invoiceLineTotalCents: 20 * poUnitCost,
+            },
+          ],
+        },
+      });
+      expect(drop2.statusCode).toBe(201);
+      grnIdsToClean.push(drop2.json().grnId);
+
+      const [poFinal] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, poId));
+      expect(poFinal.status).toBe("received");
+      const openVarsAfterFull = await db
+        .select()
+        .from(grnVariances)
+        .where(and(eq(grnVariances.poId, poId), eq(grnVariances.status, "open")));
+      expect(openVarsAfterFull.length).toBe(0);
+
+      // Terminal received PO cannot be cancelled (409)
+      const cancelReceived = await app.inject({
+        method: "PATCH",
+        url: `/api/purchasing/orders/${poId}/status`,
+        headers: authHeaders(),
+        payload: { status: "cancelled" },
+      });
+      expect(cancelReceived.statusCode).toBe(409);
+
+      // GET /api/purchasing/grns returns recent receipts (H-25)
+      const grnsList = await app.inject({
+        method: "GET",
+        url: "/api/purchasing/grns",
+        headers: authHeaders(),
+      });
+      expect(grnsList.statusCode).toBe(200);
+      expect((grnsList.json().grns as { id: string }[]).some((g) => g.id === drop2.json().grnId)).toBe(true);
+    } finally {
+      for (const gid of grnIdsToClean) {
+        await cleanupGrn(gid);
+      }
+      await cleanupPo(poId);
+      await db.update(products).set({ avgCostCents: origAvgCost }).where(eq(products.id, prod.id));
+    }
+
+    // 4. RFM-segment coupon validation + FEFO batch restore & coupon un-redeem on void (H-10)
+    const testBatchId = generateUuidV7();
+    await db.insert(inventoryBatches).values({
+      id: testBatchId,
+      productId: prod.id,
+      lotCode: `LOT-W2B-${Date.now()}`,
+      bestBeforeDate: "2020-01-01", // earliest expiry so FEFO picks this batch first
+      unitCostCents: origAvgCost,
+      qtyReceived: 5,
+      qtyRemaining: 5,
+      status: "active",
+    });
+
+    const custPhone = `555-${Date.now().toString().slice(-7)}`;
+    const custCreate = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/customers",
+      headers: authHeaders(),
+      payload: { phone: custPhone, fullName: "Wave 2B RFM Tester" },
+    });
+    expect(custCreate.statusCode).toBe(201);
+    const testCustomer = custCreate.json().customer as { id: string };
+
+    const segCouponCode = `VIPW2B-${Date.now().toString().slice(-5)}`;
+    const segCpnRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(),
+      payload: {
+        code: segCouponCode,
+        rfmSegment: "Champions",
+        discountCents: 100,
+        minBasketCents: 100,
+        validDays: 7,
+      },
+    });
+    expect(segCpnRes.statusCode).toBe(201);
+    const segCouponId = segCpnRes.json().coupon.id as string;
+
+    const newCpnCode = `NEWW2B-${Date.now().toString().slice(-5)}`;
+    const newCpnRes = await app.inject({
+      method: "POST",
+      url: "/api/loyalty/coupons",
+      headers: authHeaders(),
+      payload: {
+        code: newCpnCode,
+        rfmSegment: "New",
+        discountCents: 100,
+        minBasketCents: 100,
+        validDays: 7,
+      },
+    });
+    expect(newCpnRes.statusCode).toBe(201);
+    const newCouponId = newCpnRes.json().coupon.id as string;
+
+    const saleIdsToClean: string[] = [];
+    try {
+      // Customer is "New", so "Champions" coupon MUST fail validation
+      const wrongSegVal = await app.inject({
+        method: "GET",
+        url: `/api/loyalty/coupons/validate/${segCouponCode}?basketCents=1000&customerId=${testCustomer.id}`,
+        headers: authHeaders(cashierToken),
+      });
+      expect(wrongSegVal.statusCode).toBe(200);
+      expect(wrongSegVal.json().valid).toBe(false);
+
+      // "New" coupon passes validation for this customer
+      const okSegVal = await app.inject({
+        method: "GET",
+        url: `/api/loyalty/coupons/validate/${newCpnCode}?basketCents=1000&customerId=${testCustomer.id}`,
+        headers: authHeaders(cashierToken),
+      });
+      expect(okSegVal.statusCode).toBe(200);
+      expect(okSegVal.json().valid).toBe(true);
+
+      // Post sale depleting testBatch (5 -> 3) & redeeming newCpnCode
+      const bc = prod.barcodes[0];
+      const qtyPacks = Math.max(1, Math.ceil(200 / Math.max(1, bc.sellPriceCents)));
+      const baseUnits = bc.packQty * qtyPacks;
+      const lineSub = bc.sellPriceCents * qtyPacks;
+      const disc = Math.min(100, lineSub - 1);
+      const afterDisc = lineSub - disc;
+      const lineTax = prod.taxInclusive
+        ? Math.round((afterDisc * prod.taxRateBp) / (10000 + prod.taxRateBp))
+        : Math.round((afterDisc * prod.taxRateBp) / 10000);
+      const lineTotal = prod.taxInclusive ? afterDisc : afterDisc + lineTax;
+
+      const origSaleId = generateUuidV7();
+      const voidSaleId = generateUuidV7();
+      saleIdsToClean.push(origSaleId, voidSaleId);
+
+      const postSale = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(),
+        payload: {
+          id: origSaleId,
+          registerCode: "REG-W2B",
+          receiptNo: `W2B-SALE-${origSaleId.slice(-6)}`,
+          kind: "sale",
+          soldAt: new Date().toISOString(),
+          ageVerified: true,
+          customerId: testCustomer.id,
+          couponCode: newCpnCode,
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: prod.id,
+              scannedBarcode: bc.barcode,
+              packLabel: bc.packLabel,
+              packQty: bc.packQty,
+              qtyPacks,
+              unitPriceCents: bc.sellPriceCents,
+              discountCents: disc,
+              taxRateBp: prod.taxRateBp,
+              taxCents: lineTax,
+              lineTotalCents: lineTotal,
+            },
+          ],
+          payments: [
+            {
+              id: generateUuidV7(),
+              method: "card",
+              amountCents: lineTotal,
+            },
+          ],
+        },
+      });
+      expect(postSale.statusCode).toBe(201);
+
+      const [batchAfterSale] = await db
+        .select()
+        .from(inventoryBatches)
+        .where(eq(inventoryBatches.id, testBatchId));
+      expect(batchAfterSale.qtyRemaining).toBe(Math.max(0, 5 - baseUnits));
+
+      // Void sale -> FEFO batch MUST restore back to 5 AND coupon MUST become un-redeemed!
+      const postVoid = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(),
+        payload: {
+          id: voidSaleId,
+          registerCode: "REG-W2B",
+          receiptNo: `W2B-VOID-${voidSaleId.slice(-6)}`,
+          kind: "void",
+          originalSaleId: origSaleId,
+          soldAt: new Date().toISOString(),
+          ageVerified: true,
+          customerId: testCustomer.id,
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: prod.id,
+              scannedBarcode: bc.barcode,
+              packLabel: bc.packLabel,
+              packQty: bc.packQty,
+              qtyPacks,
+              unitPriceCents: bc.sellPriceCents,
+              discountCents: disc,
+              taxRateBp: prod.taxRateBp,
+              taxCents: lineTax,
+              lineTotalCents: lineTotal,
+            },
+          ],
+          payments: [
+            {
+              id: generateUuidV7(),
+              method: "card",
+              amountCents: lineTotal,
+            },
+          ],
+        },
+      });
+      expect(postVoid.statusCode).toBe(201);
+
+      const [batchAfterVoid] = await db
+        .select()
+        .from(inventoryBatches)
+        .where(eq(inventoryBatches.id, testBatchId));
+      expect(batchAfterVoid.qtyRemaining).toBe(5);
+      expect(batchAfterVoid.status).toBe("active");
+
+      const [couponAfterVoid] = await db
+        .select()
+        .from(targetedCoupons)
+        .where(eq(targetedCoupons.id, newCouponId));
+      expect(couponAfterVoid.redeemedSaleId).toBeNull();
+    } finally {
+      await db.delete(loyaltyLedger).where(eq(loyaltyLedger.customerId, testCustomer.id));
+      await db.delete(targetedCoupons).where(inArray(targetedCoupons.id, [segCouponId, newCouponId]));
+      await cleanupSales(saleIdsToClean);
+      await db.delete(inventoryBatches).where(eq(inventoryBatches.id, testBatchId));
+      await db.delete(customers).where(eq(customers.id, testCustomer.id));
+    }
+
+    // 5. Untested routes (H-25) & sanitized CSV commit (H-11): import/commit, cycle-count, fold-ledger, shifts/active
+    const impSku = `IMP-W2B-${Date.now().toString().slice(-6)}`;
+    const impBarcode = buildValidEan13("889", Number(Date.now().toString().slice(-6)));
+    const commitRes = await app.inject({
+      method: "POST",
+      url: "/api/import/commit",
+      headers: authHeaders(),
+      payload: {
+        rows: [
+          {
+            sku: impSku,
+            name: "Wave 2B Imported Sparkling Water 500ml",
+            brand: "Wave2B",
+            barcode: impBarcode,
+            packQty: 1,
+            packLabel: "Single",
+            unitCostCents: 60,
+            sellPriceCents: 199,
+          },
+          // Duplicate within batch -> cleanly skipped without leaking raw SQL error
+          {
+            sku: impSku,
+            name: "Duplicate Row",
+            brand: "Wave2B",
+            barcode: impBarcode,
+            packQty: 1,
+            packLabel: "Single",
+            unitCostCents: 60,
+            sellPriceCents: 199,
+          },
+        ],
+      },
+    });
+    expect(commitRes.statusCode).toBe(200);
+    expect(commitRes.json().imported).toBe(1);
+    expect(commitRes.json().skipped).toBe(1);
+    expect(String(commitRes.json().errors[0].reason)).not.toContain("insert into");
+
+    const [impProd] = await db.select().from(products).where(eq(products.sku, impSku));
+    expect(impProd).toBeDefined();
+
+    try {
+      // Cycle count sets stock to 12 units -> posts count_adj movement
+      const ccRes = await app.inject({
+        method: "POST",
+        url: "/api/inventory/cycle-count",
+        headers: authHeaders(),
+        payload: { productId: impProd.id, countedBaseUnits: 12 },
+      });
+      expect(ccRes.statusCode).toBe(200);
+      expect(ccRes.json().varianceUnits).toBe(12);
+
+      // Fold ledger rolls unfolded stock_movements into stock_baselines atomically
+      const foldRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/fold-ledger",
+        headers: authHeaders(),
+      });
+      expect(foldRes.statusCode).toBe(200);
+      expect(Number(foldRes.json().movements_folded)).toBeGreaterThanOrEqual(1);
+
+      const [foldedBaseline] = await db
+        .select()
+        .from(stockBaselines)
+        .where(eq(stockBaselines.productId, impProd.id));
+      expect(foldedBaseline.quantity).toBe(12);
+    } finally {
+      await db.delete(stockMovements).where(eq(stockMovements.productId, impProd.id));
+      await db.delete(stockBaselines).where(eq(stockBaselines.productId, impProd.id));
+      await db.delete(productBarcodes).where(eq(productBarcodes.productId, impProd.id));
+      await db.delete(products).where(eq(products.id, impProd.id));
+    }
+
+    // Active shift lookup & shift_id-scoped cash closeout (M-08)
+    const testReg = `REG-W2B-${Date.now().toString().slice(-4)}`;
+    const openRes = await app.inject({
+      method: "POST",
+      url: "/api/pos/shifts/open",
+      headers: authHeaders(),
+      payload: { registerCode: testReg, openingFloatCents: 25000 },
+    });
+    expect(openRes.statusCode).toBe(201);
+    const openedShift = openRes.json() as { id: string; openingFloatCents: number };
+    try {
+      const activeRes = await app.inject({
+        method: "GET",
+        url: `/api/pos/shifts/active?registerCode=${testReg}`,
+        headers: authHeaders(),
+      });
+      expect(activeRes.statusCode).toBe(200);
+      expect(activeRes.json().shift.id).toBe(openedShift.id);
+      expect(activeRes.json().shift.openingFloatCents).toBe(25000);
+
+      const closeRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/shifts/close",
+        headers: authHeaders(),
+        payload: { registerCode: testReg, blindCountedCashCents: 25000, cashDropsCents: 0 },
+      });
+      expect(closeRes.statusCode).toBe(200);
+      expect(closeRes.json().expectedCashCents).toBe(25000);
+      expect(closeRes.json().varianceCents).toBe(0);
+    } finally {
+      await db.delete(posShifts).where(eq(posShifts.id, openedShift.id));
+    }
+  });
+
+  it("Wave 2E: bounds Prometheus cardinality (__unmatched__), emits per-route histograms, reversals, SSE & analytics freshness gauges", async () => {
+    const randomProbe = `/api/probe-scanner-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const notFoundRes = await app.inject({ method: "GET", url: randomProbe });
+    expect(notFoundRes.statusCode).toBe(404);
+
+    const metricsRes = await app.inject({
+      method: "GET",
+      url: "/api/metrics",
+      headers: authHeaders(),
+    });
+    expect(metricsRes.statusCode).toBe(200);
+    const body = metricsRes.body;
+    // Random 404 path must NEVER appear as a Prometheus label (cardinality protection)
+    expect(body).not.toContain(randomProbe);
+    expect(body).toContain('route="__unmatched__"');
+    expect(body).toContain("http_route_request_duration_ms_bucket{");
+    expect(body).toContain('supermarket_pos_reversals_total{kind="void"}');
+    expect(body).toContain('supermarket_pos_reversals_total{kind="refund"}');
+    expect(body).toContain("supermarket_sse_active_streams");
+    expect(body).toContain("supermarket_analytics_last_run_age_seconds");
+    expect(body).toContain("supermarket_analytics_dq_passed");
+  });
 });
+

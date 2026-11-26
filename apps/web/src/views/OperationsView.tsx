@@ -1,11 +1,24 @@
-import { useEffect, useState } from "react";
-import {
-  computeEffectiveUnitCostCents,
-  formatBp,
-  formatMoney,
-} from "@supermarket/shared";
-import { AlertTriangle, Check, FileUp, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import type { UserRole } from "@supermarket/shared/dtos";
+import { computeEffectiveUnitCostCents, formatBp, formatMoney } from "@supermarket/shared/money";
+import { AlertTriangle, Award, Check, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import type { ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
+import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
+import { readQueryParam, syncQueryParam } from "../lib/urlSync";
+
+const FloorTasksTab = lazy(() =>
+  import("../components/FloorTasksTab").then((m) => ({ default: m.FloorTasksTab }))
+);
+const PurchaseOrdersTab = lazy(() =>
+  import("../components/PurchaseOrdersTab").then((m) => ({ default: m.PurchaseOrdersTab }))
+);
+const ShelfIntegrityTab = lazy(() =>
+  import("../components/ShelfIntegrityTab").then((m) => ({ default: m.ShelfIntegrityTab }))
+);
+const SupplierMatchTab = lazy(() =>
+  import("../components/SupplierMatchTab").then((m) => ({ default: m.SupplierMatchTab }))
+);
 
 interface MarginAlert {
   id: string;
@@ -47,7 +60,7 @@ interface ProductPick {
   id: string;
   sku: string;
   name: string;
-  avgCostCents: number;
+  avgCostCents?: number;
   primarySellPriceCents: number;
 }
 
@@ -81,16 +94,33 @@ interface ParsedInvoiceResponse {
   };
 }
 
+type OpsSubTab = "receiving" | "orders" | "shelf" | "tasks" | "suppliers";
+
+function resolveOpsSubTab(canManage: boolean): OpsSubTab {
+  const fromUrl = readQueryParam("sub") as OpsSubTab | null;
+  const allowed: OpsSubTab[] = canManage
+    ? ["receiving", "orders", "shelf", "tasks", "suppliers"]
+    : ["receiving", "shelf", "tasks"];
+  return fromUrl && allowed.includes(fromUrl) ? fromUrl : "receiving";
+}
+
 export function OperationsView({
   suppliers,
+  userRole = "owner",
   onCountsChanged,
 }: {
   suppliers: SupplierOption[];
+  userRole?: UserRole;
   onCountsChanged?: () => void;
 }) {
+  const canManage = userRole === "owner" || userRole === "manager";
+  const [subTab, setSubTab] = useState<OpsSubTab>(() => resolveOpsSubTab(canManage));
+
   const [marginAlerts, setMarginAlerts] = useState<MarginAlert[]>([]);
   const [expiryBatches, setExpiryBatches] = useState<ExpiryBatch[]>([]);
   const [horizonDays, setHorizonDays] = useState(45);
+  const [loading, setLoading] = useState(true);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
   const [skuSearch, setSkuSearch] = useState("");
   const [productOptions, setProductOptions] = useState<ProductPick[]>([]);
   const [selectedProdId, setSelectedProdId] = useState("");
@@ -98,6 +128,7 @@ export function OperationsView({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // GRN Bonus-Case Receiving Form
+  const [linkedPo, setLinkedPo] = useState<{ id: string; poNumber: string } | null>(null);
   const [supplierId, setSupplierId] = useState(suppliers[0]?.id ?? "");
   const [invoiceNo, setInvoiceNo] = useState(
     `INV-${new Date().getFullYear()}-${String(Math.floor(10000 + Math.random() * 89999))}`
@@ -112,29 +143,79 @@ export function OperationsView({
   const [scanningInvoice, setScanningInvoice] = useState(false);
   const [scannedInvoice, setScannedInvoice] = useState<ParsedInvoiceResponse | null>(null);
 
-  const loadAll = async (days = horizonDays) => {
-    try {
-      const [ma, exp] = await Promise.all([
-        apiGet<{ alerts: MarginAlert[] }>("/api/inventory/margin-alerts"),
-        apiGet<{ items: ExpiryBatch[] }>(`/api/inventory/expiry-alerts?days=${days}`),
-      ]);
-      setMarginAlerts(ma.alerts);
-      setExpiryBatches(exp.items);
-      if (!supplierId && suppliers[0]) {
-        setSupplierId(suppliers[0].id);
-      }
-      onCountsChanged?.();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed loading operations data");
-    }
+  const selectSubTab = (next: OpsSubTab) => {
+    setSubTab(next);
+    syncQueryParam("sub", next, { push: true });
   };
 
   useEffect(() => {
-    void loadAll(horizonDays);
+    const onPopState = () => setSubTab(resolveOpsSubTab(canManage));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [canManage]);
+
+  // Keep supplier selection hydrated once metadata arrives asynchronously
+  useEffect(() => {
+    if (!supplierId && suppliers.length > 0) {
+      setSupplierId(suppliers[0].id);
+    }
+  }, [suppliers, supplierId]);
+
+  const loadMarginAlerts = useCallback(async (signal?: AbortSignal) => {
+    if (!canManage) {
+      setMarginAlerts([]);
+      return;
+    }
+    try {
+      const ma = await apiGet<{ alerts: MarginAlert[] }>("/api/inventory/margin-alerts", signal);
+      if (!signal?.aborted) setMarginAlerts(ma.alerts);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading margin alerts");
+      }
+    }
+  }, [canManage]);
+
+  const loadExpiryBatches = useCallback(async (days = horizonDays, signal?: AbortSignal) => {
+    setLoading(true);
+    setErrorMsg(null);
+    try {
+      const exp = await apiGet<{ items: ExpiryBatch[] }>(
+        `/api/inventory/expiry-alerts?days=${days}`,
+        signal
+      );
+      if (!signal?.aborted) setExpiryBatches(exp.items);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading FEFO expiry batches");
+      }
+    } finally {
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
+    }
   }, [horizonDays]);
 
-  // Searchable 3,120-SKU picker for GRN receiving
+  const refreshAfterMutation = async () => {
+    await Promise.all([loadMarginAlerts(), loadExpiryBatches(horizonDays)]);
+    onCountsChanged?.();
+  };
+
   useEffect(() => {
+    const controller = new AbortController();
+    void loadMarginAlerts(controller.signal);
+    return () => controller.abort();
+  }, [loadMarginAlerts]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadExpiryBatches(horizonDays, controller.signal);
+    return () => controller.abort();
+  }, [horizonDays, loadExpiryBatches]);
+
+  // Searchable 3,120-SKU picker for GRN receiving (manager/owner only)
+  useEffect(() => {
+    if (!canManage) return;
     const controller = new AbortController();
     const timer = setTimeout(() => {
       void (async () => {
@@ -145,9 +226,12 @@ export function OperationsView({
             `/api/products?${qs.toString()}`,
             controller.signal
           );
+          if (controller.signal.aborted) return;
           setProductOptions(res.items);
-          if (res.items.length > 0 && !res.items.some((i) => i.id === selectedProdId)) {
-            setSelectedProdId(res.items[0].id);
+          if (res.items.length > 0) {
+            setSelectedProdId((prev) =>
+              res.items.some((i) => i.id === prev) ? prev : res.items[0].id
+            );
           }
         } catch (err) {
           if ((err as Error).name !== "AbortError") {
@@ -160,7 +244,7 @@ export function OperationsView({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [skuSearch]);
+  }, [skuSearch, canManage]);
 
   const paidUnits = paidCases * caseQty;
   const freeUnits = freeBonusCases * caseQty;
@@ -170,7 +254,9 @@ export function OperationsView({
   const paidOnlyCost = paidUnits > 0 ? Math.round(invoiceCents / paidUnits) : 0;
 
   const handleApplySuggestedPrice = async (alertId: string, sku: string) => {
+    if (busyAction) return;
     setErrorMsg(null);
+    setBusyAction(`price-${alertId}`);
     try {
       const res = await apiPost<{ newSellPriceCents: number; updatedPackTiers?: number }>(
         `/api/inventory/margin-alerts/${alertId}/apply-price`,
@@ -179,9 +265,11 @@ export function OperationsView({
       setFeedback(
         `Updated ${sku} shelf price to ${formatMoney(res.newSellPriceCents)} (scaled ${res.updatedPackTiers ?? 1} barcode tiers) and resolved alert.`
       );
-      await loadAll();
+      await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating price");
+    } finally {
+      setBusyAction(null);
     }
   };
 
@@ -190,7 +278,9 @@ export function OperationsView({
     action: "clearance" | "write_off",
     sku: string
   ) => {
+    if (busyAction) return;
     setErrorMsg(null);
+    setBusyAction(`batch-${batchId}-${action}`);
     try {
       await apiPost(`/api/inventory/batches/${batchId}/action`, {
         action,
@@ -201,16 +291,23 @@ export function OperationsView({
           ? `Marked batch for ${sku} as 30% Clearance Markdown.`
           : `Wrote off expired ${sku} batch to immutable spoilage ledger.`
       );
-      await loadAll();
+      await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating batch");
+    } finally {
+      setBusyAction(null);
     }
   };
 
   const handlePostGrn = async () => {
+    if (busyAction) return;
     setErrorMsg(null);
     if (!supplierId || !selectedProdId) {
       setErrorMsg("Select both a supplier and a product before posting a GRN.");
+      return;
+    }
+    if (!invoiceNo.trim()) {
+      setErrorMsg("Enter a supplier invoice number before posting a GRN.");
       return;
     }
     if (!Number.isFinite(parsedInvoice) || parsedInvoice < 0) {
@@ -221,13 +318,16 @@ export function OperationsView({
       setErrorMsg("Paid cases + free bonus cases must be greater than 0.");
       return;
     }
+    setBusyAction("grn");
     try {
       const res = await apiPost<{
         grnId: string;
         marginAlertsTriggered: number;
+        variancesDetected?: number;
       }>("/api/purchasing/grn", {
+        poId: linkedPo?.id,
         supplierId,
-        invoiceNumber: invoiceNo,
+        invoiceNumber: invoiceNo.trim(),
         lines: [
           {
             productId: selectedProdId,
@@ -235,32 +335,56 @@ export function OperationsView({
             paidCases,
             freeBonusCases,
             invoiceLineTotalCents: invoiceCents,
-            bestBeforeDate: bestBefore,
+            bestBeforeDate: bestBefore || undefined,
           },
         ],
       });
+      const linkedLabel = linkedPo ? ` against ${linkedPo.poNumber}` : "";
+      setLinkedPo(null);
       setInvoiceNo(
         `INV-${new Date().getFullYear()}-${String(Math.floor(10000 + Math.random() * 89999))}`
       );
       setFeedback(
-        `Posted GRN (+${paidUnits + freeUnits} base units added to ledger, effective cost ${formatMoney(effectiveUnitCost)}/unit). Margin alerts triggered: ${res.marginAlertsTriggered}.`
+        `Posted GRN${linkedLabel} (+${paidUnits + freeUnits} base units added to ledger, effective cost ${formatMoney(effectiveUnitCost)}/unit). Margin alerts: ${res.marginAlertsTriggered}${res.variancesDetected ? `, 3-way variances detected: ${res.variancesDetected}` : ""}.`
       );
-      await loadAll();
+      await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed posting GRN");
+    } finally {
+      setBusyAction(null);
     }
+  };
+
+  const handleReceiveAgainstPo = (draft: ReceiveAgainstPoDraft) => {
+    setLinkedPo({ id: draft.poId, poNumber: draft.poNumber });
+    setSupplierId(draft.supplierId);
+    setSelectedProdId(draft.productId);
+    setSkuSearch(draft.sku);
+    setCaseQty(draft.caseQty);
+    setPaidCases(draft.paidCases);
+    setFreeBonusCases(0);
+    setInvoiceTotalUsd((draft.invoiceLineTotalCents / 100).toFixed(2));
+    setErrorMsg(null);
+    setFeedback(
+      `Loaded ${draft.poNumber} (${draft.sku} — ${draft.productName}, ${draft.paidCases} cs) into the GRN Receiving form for 3-way PO matching.`
+    );
+    selectSubTab("receiving");
   };
 
   const handleInvoiceFileUpload = async (file: File) => {
     setErrorMsg(null);
     setScanningInvoice(true);
     try {
-      const isText = file.type.startsWith("text/") || file.name.toLowerCase().endsWith(".txt");
+      const lowerName = file.name.toLowerCase();
+      const isText =
+        file.type.startsWith("text/") ||
+        lowerName.endsWith(".txt") ||
+        lowerName.endsWith(".csv");
       if (isText) {
         const textContent = await file.text();
         const res = await apiPost<ParsedInvoiceResponse>("/api/ai/grn/parse-invoice", {
           fileName: file.name,
-          mimeType: file.type || "text/plain",
+          mimeType: lowerName.endsWith(".csv") ? "text/csv" : file.type || "text/plain",
           textContent,
         });
         setScannedInvoice(res);
@@ -332,353 +456,546 @@ export function OperationsView({
     <div>
       <header className="page-header">
         <div>
-          <h1>Receiving (GRN), FEFO Expiry &amp; Margin Protection</h1>
+          <h1>Receiving (GRN), FEFO Expiry &amp; Operations</h1>
           <p className="page-subtitle">
-            Protect your 1–3% supermarket net profit by catching vendor wholesale price creep, accounting for free bonus cases, and clearing near-expiry packaged stock.
+            {canManage
+              ? "Protect your 1–3% supermarket net profit across receiving, purchase orders, vendor OTIF scorecards, 3-way dock variance matching, and FEFO expiry control."
+              : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."}
           </p>
         </div>
+        <SubTabBar
+          ariaLabel="Operations sections"
+          activeId={subTab}
+          onSelect={selectSubTab}
+          tabs={(
+            [
+              {
+                id: "receiving" as const,
+                elementId: "ops-subtab-receiving",
+                panelId: "ops-panel-receiving",
+                label: (
+                  <>
+                    <PackageCheck size={14} aria-hidden="true" /> Receiving &amp; FEFO
+                  </>
+                ),
+              },
+              ...(canManage
+                ? [
+                    {
+                      id: "orders" as const,
+                      elementId: "ops-subtab-orders",
+                      panelId: "ops-panel-orders",
+                      label: (
+                        <>
+                          <FileText size={14} aria-hidden="true" /> Purchase Orders
+                        </>
+                      ),
+                    },
+                  ]
+                : []),
+              {
+                id: "shelf" as const,
+                elementId: "ops-subtab-shelf",
+                panelId: "ops-panel-shelf",
+                label: (
+                  <>
+                    <Ghost size={14} aria-hidden="true" /> Shelf Integrity &amp; 07:30 Tags
+                  </>
+                ),
+              },
+              {
+                id: "tasks" as const,
+                elementId: "ops-subtab-tasks",
+                panelId: "ops-panel-tasks",
+                label: (
+                  <>
+                    <ClipboardList size={14} aria-hidden="true" /> Daily Floor Tasks
+                  </>
+                ),
+              },
+              ...(canManage
+                ? [
+                    {
+                      id: "suppliers" as const,
+                      elementId: "ops-subtab-suppliers",
+                      panelId: "ops-panel-suppliers",
+                      label: (
+                        <>
+                          <Award size={14} aria-hidden="true" /> Supplier OTIF &amp; 3-Way Match
+                        </>
+                      ),
+                    },
+                  ]
+                : []),
+            ] satisfies SubTabItem<OpsSubTab>[]
+          )}
+        />
       </header>
 
+      {!canManage && (
+        <div className="banner banner-amber" style={{ marginBottom: 14 }}>
+          <span>
+            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, phantom stock blind counts, 07:30 shelf tag batch printing, and daily floor checklist completion are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
+          </span>
+        </div>
+      )}
+
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 14 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
           <span>{errorMsg}</span>
-          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
           </button>
         </div>
       )}
 
       {feedback && (
-        <div className="banner banner-green" style={{ marginBottom: 16 }}>
+        <div className="banner banner-green" role="status" style={{ marginBottom: 16 }}>
           <span>{feedback}</span>
-          <button className="btn btn-sm" onClick={() => setFeedback(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setFeedback(null)}>
             Dismiss
           </button>
         </div>
       )}
 
-      {/* Multimodal AI Invoice -> GRN Scanner */}
-      <section className="panel" style={{ marginBottom: 20 }}>
-        <div className="panel-header">
-          <div>
-            <h2 className="panel-title">
-              <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary)" }} />
-              Multimodal AI Supplier Invoice → GRN Scanner
-            </h2>
-            <p className="panel-desc">
-              Upload a distributor invoice image, PDF, or delivery note to extract paid + free bonus cases, match SKUs, and run calibrated cost-creep triage.
-            </p>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <label className="btn btn-sm" style={{ cursor: "pointer" }}>
-              <FileUp size={13} /> {scanningInvoice ? "Scanning..." : "Upload Invoice (PNG/PDF/TXT)"}
-              <input
-                type="file"
-                accept=".png,.jpg,.jpeg,.webp,.pdf,.txt"
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) void handleInvoiceFileUpload(file);
-                }}
-              />
-            </label>
-            <button
-              id="scan-sample-invoice-btn"
-              className="btn btn-primary btn-sm"
-              disabled={scanningInvoice}
-              onClick={() => void handleSampleInvoiceScan()}
-            >
-              <Sparkles size={13} /> Try Sample Invoice
-            </button>
-          </div>
-        </div>
-
-        {scannedInvoice && (
-          <div className="stack-md" style={{ gap: 12 }}>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <span className="tag tag-green mono">{scannedInvoice.model}</span>
-              <span className="tag tag-neutral">
-                {scannedInvoice.supplierName} · {scannedInvoice.invoiceNumber}
-              </span>
-              {scannedInvoice.note && (
-                <span className="tag tag-amber">{scannedInvoice.note}</span>
-              )}
-            </div>
-
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Extracted Item → Catalog Match</th>
-                    <th className="text-right">Paid + Bonus</th>
-                    <th className="text-right">Line Total</th>
-                    <th className="text-right">Eff. Unit Cost</th>
-                    <th className="text-right">Cost Delta</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {scannedInvoice.lines.map((l, idx) => (
-                    <tr key={`${l.description}-${idx}`}>
-                      <td>
-                        <div style={{ fontWeight: 600 }}>
-                          {l.matchedSku ? `${l.matchedSku} — ${l.matchedName}` : l.description}
-                        </div>
-                        <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                          Confidence {Math.round(l.matchConfidence * 100)}% · BBD {l.bestBeforeDate}
-                        </div>
-                      </td>
-                      <td className="text-right mono">
-                        {l.paidCases} + {l.freeBonusCases} free (×{l.caseQty})
-                      </td>
-                      <td className="text-right mono">{formatMoney(l.invoiceLineTotalCents)}</td>
-                      <td className="text-right mono">{formatMoney(l.effectiveUnitCostCents)}</td>
-                      <td className="text-right">
-                        <span className={`tag mono ${l.costDeltaPct > 8 ? "tag-red" : "tag-green"}`}>
-                          {l.costDeltaPct > 0 ? `+${l.costDeltaPct}%` : `${l.costDeltaPct}%`}
-                        </span>
-                      </td>
-                      <td className="text-right">
-                        <button
-                          className="btn btn-primary btn-sm"
-                          onClick={() => applyScannedLineToGrn(l)}
-                        >
-                          Load into GRN Form
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="triage-box">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-                <strong style={{ fontSize: 12.5 }}>
-                  Calibrated Invoice Discrepancy Triage ({scannedInvoice.triage.model})
-                </strong>
-                <span className="mono" style={{ fontSize: 11.5, color: "var(--ink-secondary)" }}>
-                  {scannedInvoice.triage.summary}
-                </span>
+      <div
+        role="tabpanel"
+        id={`ops-panel-${subTab}`}
+        aria-labelledby={`ops-subtab-${subTab}`}
+      >
+      {subTab === "orders" && canManage ? (
+        <Suspense fallback={<div className="panel">Loading Purchase Orders...</div>}>
+          <PurchaseOrdersTab
+            onReceiveAgainstPo={handleReceiveAgainstPo}
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
+      ) : subTab === "suppliers" && canManage ? (
+        <Suspense fallback={<div className="panel">Loading Supplier Scorecards...</div>}>
+          <SupplierMatchTab
+            canManage={canManage}
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
+      ) : subTab === "shelf" ? (
+        <Suspense fallback={<div className="panel">Loading Shelf Integrity...</div>}>
+          <ShelfIntegrityTab
+            canManage={canManage}
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+              onCountsChanged?.();
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
+      ) : subTab === "tasks" ? (
+        <Suspense fallback={<div className="panel">Loading Floor Tasks...</div>}>
+          <FloorTasksTab
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
+      ) : (
+        <>
+          {canManage && (
+        <>
+          {/* Multimodal AI Invoice -> GRN Scanner */}
+          <section className="panel" style={{ marginBottom: 20 }}>
+            <div className="panel-header">
+              <div>
+                <h2 className="panel-title">
+                  <Sparkles size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-primary-ink)" }} />
+                  Multimodal AI Supplier Invoice → GRN Scanner
+                </h2>
+                <p className="panel-desc">
+                  Upload a distributor invoice image, PDF, CSV, or delivery note to extract paid + free bonus cases, match SKUs, and run calibrated cost-creep triage.
+                </p>
               </div>
-              <div style={{ fontSize: 12.5, color: "var(--ink-primary)", marginTop: 4 }}>
-                {scannedInvoice.triage.recommendedAction}
-              </div>
-            </div>
-          </div>
-        )}
-      </section>
-
-      <div className="grid-asymmetric">
-        {/* Margin Erosion Alerts */}
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2 className="panel-title">
-                <AlertTriangle size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-crimson)" }} />
-                Active Vendor Margin-Erosion Alerts ({marginAlerts.length})
-              </h2>
-              <p className="panel-desc">
-                Triggered automatically on Goods Receipt when a distributor cost increase compresses tax-exclusive net margin below category floor.
-              </p>
-            </div>
-          </div>
-
-          {marginAlerts.length === 0 ? (
-            <div className="banner banner-green">
-              All product retail prices currently meet target margin floors!
-            </div>
-          ) : (
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>SKU / Product</th>
-                    <th className="text-right">Old → New Cost</th>
-                    <th className="text-right">Current Price</th>
-                    <th className="text-right">Compressed Margin</th>
-                    <th className="text-right">Suggested Price</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {marginAlerts.map((a) => (
-                    <tr key={a.id}>
-                      <td>
-                        <div style={{ fontWeight: 600 }}>{a.name}</div>
-                        <div className="mono" style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                          {a.sku} · Floor {formatBp(a.minMarginBp)}
-                        </div>
-                      </td>
-                      <td className="text-right mono">
-                        {formatMoney(a.previousCostCents)} →{" "}
-                        <strong style={{ color: "var(--accent-crimson)" }}>
-                          {formatMoney(a.newCostCents)}
-                        </strong>
-                      </td>
-                      <td className="text-right mono">{formatMoney(a.currentSellPriceCents)}</td>
-                      <td className="text-right">
-                        <span className="tag tag-red mono">{formatBp(a.resultingMarginBp)}</span>
-                      </td>
-                      <td className="text-right mono" style={{ fontWeight: 700, color: "var(--accent-primary)" }}>
-                        {formatMoney(a.suggestedSellPriceCents)}
-                      </td>
-                      <td className="text-right">
-                        <button
-                          className="btn btn-primary btn-sm"
-                          onClick={() => void handleApplySuggestedPrice(a.id, a.sku)}
-                        >
-                          <Check size={13} /> Apply Price
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        {/* Bonus-Case GRN Receiving Builder */}
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2 className="panel-title">
-                <PackageCheck size={15} style={{ verticalAlign: "middle", marginRight: 6 }} />
-                Receive Goods (GRN + Free Bonus Cases)
-              </h2>
-              <p className="panel-desc">
-                Supports distributor &ldquo;Buy 10 Cases Get 1 Free&rdquo; rebates and computes true effective unit cost + MWAC.
-              </p>
-            </div>
-          </div>
-
-          <div className="stack-md" style={{ gap: 11 }}>
-            <div className="field">
-              <label>Supplier &amp; Invoice #</label>
-              <div className="form-grid">
-                <select
-                  className="select"
-                  value={supplierId}
-                  onChange={(e) => setSupplierId(e.target.value)}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <label className="btn btn-sm" style={{ cursor: "pointer" }}>
+                  <FileUp size={13} /> {scanningInvoice ? "Scanning..." : "Upload Invoice (PNG/PDF/CSV/TXT)"}
+                  <input
+                    type="file"
+                    accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.csv"
+                    style={{ display: "none" }}
+                    disabled={scanningInvoice}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = "";
+                      if (file) void handleInvoiceFileUpload(file);
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  id="scan-sample-invoice-btn"
+                  className="btn btn-primary btn-sm"
+                  disabled={scanningInvoice}
+                  onClick={() => void handleSampleInvoiceScan()}
                 >
-                  {suppliers.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  className="input mono"
-                  value={invoiceNo}
-                  onChange={(e) => setInvoiceNo(e.target.value)}
-                />
+                  <Sparkles size={13} /> Try Sample Invoice
+                </button>
               </div>
             </div>
 
-            <div className="field">
-              <label>Search &amp; Select Any of 3,120+ SKUs</label>
-              <div className="search-box" style={{ maxWidth: "100%", marginBottom: 6 }}>
-                <Search size={14} className="search-icon" />
-                <input
-                  id="grn-sku-search"
-                  className="input"
-                  placeholder="Filter by SKU, brand, product, or barcode..."
-                  value={skuSearch}
-                  onChange={(e) => setSkuSearch(e.target.value)}
-                />
-              </div>
-              <select
-                className="select"
-                value={selectedProdId}
-                onChange={(e) => setSelectedProdId(e.target.value)}
-              >
-                {productOptions.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.sku} — {p.name} (Cost {formatMoney(p.avgCostCents)})
-                  </option>
-                ))}
-              </select>
-            </div>
+            {scannedInvoice && (
+              <div className="stack-md" style={{ gap: 12 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <span className="tag tag-green mono">{scannedInvoice.model}</span>
+                  <span className="tag tag-neutral">
+                    {scannedInvoice.supplierName} · {scannedInvoice.invoiceNumber}
+                  </span>
+                  {scannedInvoice.note && (
+                    <span className="tag tag-amber">{scannedInvoice.note}</span>
+                  )}
+                </div>
 
-            <div className="form-grid">
-              <div className="field">
-                <label>Units per Case</label>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={1}
-                  value={caseQty}
-                  onChange={(e) => setCaseQty(Math.max(1, Number(e.target.value) || 1))}
-                />
-              </div>
-              <div className="field">
-                <label>Invoice Line Total ($)</label>
-                <input
-                  className="input mono"
-                  value={invoiceTotalUsd}
-                  onChange={(e) => setInvoiceTotalUsd(e.target.value)}
-                />
-              </div>
-              <div className="field">
-                <label>Paid Cases</label>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={0}
-                  value={paidCases}
-                  onChange={(e) => setPaidCases(Math.max(0, Number(e.target.value) || 0))}
-                />
-              </div>
-              <div className="field">
-                <label>Free Bonus Cases</label>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={0}
-                  value={freeBonusCases}
-                  onChange={(e) => setFreeBonusCases(Math.max(0, Number(e.target.value) || 0))}
-                />
-              </div>
-            </div>
+                <div className="table-wrap" role="region" aria-label="Scanned supplier invoice lines" tabIndex={0}>
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Extracted Item → Catalog Match</th>
+                        <th className="text-right">Paid + Bonus</th>
+                        <th className="text-right">Line Total</th>
+                        <th className="text-right">Eff. Unit Cost</th>
+                        <th className="text-right">Cost Delta</th>
+                        <th>
+                          <span className="sr-only">Actions</span>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {scannedInvoice.lines.map((l, idx) => (
+                        <tr key={`${l.description}-${idx}`}>
+                          <td>
+                            <div style={{ fontWeight: 600 }}>
+                              {l.matchedSku ? `${l.matchedSku} — ${l.matchedName}` : l.description}
+                            </div>
+                            <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                              Confidence {Math.round(l.matchConfidence * 100)}% · BBD {l.bestBeforeDate}
+                            </div>
+                          </td>
+                          <td className="text-right mono">
+                            {l.paidCases} + {l.freeBonusCases} free (×{l.caseQty})
+                          </td>
+                          <td className="text-right mono">{formatMoney(l.invoiceLineTotalCents)}</td>
+                          <td className="text-right mono">{formatMoney(l.effectiveUnitCostCents)}</td>
+                          <td className="text-right">
+                            <span className={`tag mono ${l.costDeltaPct > 8 ? "tag-red" : "tag-green"}`}>
+                              {l.costDeltaPct > 0 ? `+${l.costDeltaPct}%` : `${l.costDeltaPct}%`}
+                            </span>
+                          </td>
+                          <td className="text-right">
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              onClick={() => applyScannedLineToGrn(l)}
+                            >
+                              Load into GRN Form
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
 
-            <div className="field">
-              <label>Carton Best-Before Date (FEFO Batch)</label>
-              <input
-                className="input mono"
-                type="date"
-                value={bestBefore}
-                onChange={(e) => setBestBefore(e.target.value)}
-              />
-            </div>
+                <div className="triage-box">
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <strong style={{ fontSize: 12.5 }}>
+                      Calibrated Invoice Discrepancy Triage ({scannedInvoice.triage.model})
+                    </strong>
+                    <span className="mono" style={{ fontSize: 11.5, color: "var(--ink-secondary)" }}>
+                      {scannedInvoice.triage.summary}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12.5, color: "var(--ink-primary)", marginTop: 4 }}>
+                    {scannedInvoice.triage.recommendedAction}
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
 
-            <div className="totals-box">
-              <div className="total-row">
-                <span>Total Base Units Added</span>
-                <strong className="mono">
-                  +{paidUnits + freeUnits} ({paidUnits} paid + {freeUnits} bonus)
-                </strong>
+          <div className="grid-asymmetric">
+            {/* Margin Erosion Alerts */}
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">
+                    <AlertTriangle size={15} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--accent-crimson)" }} />
+                    Active Vendor Margin-Erosion Alerts ({marginAlerts.length})
+                  </h2>
+                  <p className="panel-desc">
+                    Triggered automatically on Goods Receipt when a distributor cost increase compresses tax-exclusive net margin below category floor.
+                  </p>
+                </div>
               </div>
-              <div className="total-row">
-                <span>Invoice Cost / Paid Unit</span>
-                <span className="mono">{formatMoney(paidOnlyCost)}</span>
-              </div>
-              <div className="total-row" style={{ color: "var(--accent-primary)", fontWeight: 700 }}>
-                <span>True Effective Unit Cost (incl. Free Cases)</span>
-                <span className="mono">{formatMoney(effectiveUnitCost)}</span>
-              </div>
-            </div>
 
-            <button
-              id="post-grn-btn"
-              className="btn btn-primary"
-              onClick={() => void handlePostGrn()}
-            >
-              Post GRN to Stock Ledger &amp; Check Margin
-            </button>
+              {loading && marginAlerts.length === 0 ? (
+                <div style={{ color: "var(--ink-muted)", padding: "12px 0" }}>
+                  Loading margin alerts...
+                </div>
+              ) : marginAlerts.length === 0 ? (
+                <div className="banner banner-green">
+                  All product retail prices currently meet target margin floors!
+                </div>
+              ) : (
+                <div className="table-wrap" role="region" aria-label="Vendor margin erosion alerts" tabIndex={0}>
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>SKU / Product</th>
+                        <th className="text-right">Old → New Cost</th>
+                        <th className="text-right">Current Price</th>
+                        <th className="text-right">Compressed Margin</th>
+                        <th className="text-right">Suggested Price</th>
+                        <th>
+                          <span className="sr-only">Actions</span>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {marginAlerts.map((a) => (
+                        <tr key={a.id}>
+                          <td>
+                            <div style={{ fontWeight: 600 }}>{a.name}</div>
+                            <div className="mono" style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                              {a.sku} · Floor {formatBp(a.minMarginBp)}
+                            </div>
+                          </td>
+                          <td className="text-right mono">
+                            {formatMoney(a.previousCostCents)} →{" "}
+                            <strong style={{ color: "var(--accent-crimson)" }}>
+                              {formatMoney(a.newCostCents)}
+                            </strong>
+                          </td>
+                          <td className="text-right mono">{formatMoney(a.currentSellPriceCents)}</td>
+                          <td className="text-right">
+                            <span className="tag tag-red mono">{formatBp(a.resultingMarginBp)}</span>
+                          </td>
+                          <td className="text-right mono" style={{ fontWeight: 700, color: "var(--accent-primary-ink)" }}>
+                            {formatMoney(a.suggestedSellPriceCents)}
+                          </td>
+                          <td className="text-right">
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              disabled={busyAction !== null}
+                              onClick={() => void handleApplySuggestedPrice(a.id, a.sku)}
+                            >
+                              <Check size={13} />{" "}
+                              {busyAction === `price-${a.id}` ? "Applying..." : "Apply Price"}
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+
+            {/* Bonus-Case GRN Receiving Builder */}
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">
+                    <PackageCheck size={15} style={{ verticalAlign: "middle", marginRight: 6 }} />
+                    Receive Goods (GRN + Free Bonus Cases)
+                  </h2>
+                  <p className="panel-desc">
+                    Supports distributor &ldquo;Buy 10 Cases Get 1 Free&rdquo; rebates and computes true effective unit cost + MWAC.
+                  </p>
+                </div>
+              </div>
+
+              <div className="stack-md" style={{ gap: 11 }}>
+                {linkedPo && (
+                  <div className="banner banner-amber" style={{ padding: "8px 12px" }}>
+                    <span>
+                      Linked to Purchase Order <strong className="mono">{linkedPo.poNumber}</strong> (3-way match active)
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => setLinkedPo(null)}
+                    >
+                      Unlink PO
+                    </button>
+                  </div>
+                )}
+                <div className="field">
+                  <label htmlFor="grn-supplier-select">Supplier &amp; Invoice #</label>
+                  <div className="form-grid">
+                    <select
+                      id="grn-supplier-select"
+                      aria-label="Supplier"
+                      className="select"
+                      value={supplierId}
+                      onChange={(e) => setSupplierId(e.target.value)}
+                      disabled={busyAction !== null}
+                    >
+                      {suppliers.length === 0 ? (
+                        <option value="">Loading suppliers...</option>
+                      ) : (
+                        suppliers.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    <input
+                      id="grn-invoice-input"
+                      aria-label="Supplier invoice number"
+                      className="input mono"
+                      value={invoiceNo}
+                      onChange={(e) => setInvoiceNo(e.target.value)}
+                      disabled={busyAction !== null}
+                    />
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label htmlFor="grn-sku-search">Search &amp; Select Any of 3,120+ SKUs</label>
+                  <div className="search-box" style={{ maxWidth: "100%", marginBottom: 6 }}>
+                    <Search size={14} className="search-icon" aria-hidden="true" />
+                    <input
+                      id="grn-sku-search"
+                      className="input"
+                      placeholder="Filter by SKU, brand, product, or barcode..."
+                      value={skuSearch}
+                      onChange={(e) => setSkuSearch(e.target.value)}
+                    />
+                  </div>
+                  <select
+                    id="grn-product-select"
+                    aria-label="Select product SKU for goods receipt"
+                    className="select"
+                    value={selectedProdId}
+                    onChange={(e) => setSelectedProdId(e.target.value)}
+                    disabled={busyAction !== null}
+                  >
+                    {productOptions.length === 0 ? (
+                      <option value="">No matching SKUs found</option>
+                    ) : (
+                      productOptions.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.sku} — {p.name}
+                          {typeof p.avgCostCents === "number" ? ` (Cost ${formatMoney(p.avgCostCents)})` : ""}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </div>
+
+                <div className="form-grid">
+                  <div className="field">
+                    <label htmlFor="grn-case-qty">Units per Case</label>
+                    <input
+                      id="grn-case-qty"
+                      className="input mono"
+                      type="number"
+                      min={1}
+                      value={caseQty}
+                      onChange={(e) => setCaseQty(Math.max(1, Math.trunc(Number(e.target.value) || 1)))}
+                      disabled={busyAction !== null}
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="grn-invoice-total">Invoice Line Total ($)</label>
+                    <input
+                      id="grn-invoice-total"
+                      className="input mono"
+                      value={invoiceTotalUsd}
+                      onChange={(e) => setInvoiceTotalUsd(e.target.value)}
+                      disabled={busyAction !== null}
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="grn-paid-cases">Paid Cases</label>
+                    <input
+                      id="grn-paid-cases"
+                      className="input mono"
+                      type="number"
+                      min={0}
+                      value={paidCases}
+                      onChange={(e) => setPaidCases(Math.max(0, Math.trunc(Number(e.target.value) || 0)))}
+                      disabled={busyAction !== null}
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="grn-free-cases">Free Bonus Cases</label>
+                    <input
+                      id="grn-free-cases"
+                      className="input mono"
+                      type="number"
+                      min={0}
+                      value={freeBonusCases}
+                      onChange={(e) => setFreeBonusCases(Math.max(0, Math.trunc(Number(e.target.value) || 0)))}
+                      disabled={busyAction !== null}
+                    />
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label htmlFor="grn-best-before">Carton Best-Before Date (FEFO Batch)</label>
+                  <input
+                    id="grn-best-before"
+                    className="input mono"
+                    type="date"
+                    value={bestBefore}
+                    onChange={(e) => setBestBefore(e.target.value)}
+                    disabled={busyAction !== null}
+                  />
+                </div>
+
+                <div className="totals-box">
+                  <div className="total-row">
+                    <span>Total Base Units Added</span>
+                    <strong className="mono">
+                      +{paidUnits + freeUnits} ({paidUnits} paid + {freeUnits} bonus)
+                    </strong>
+                  </div>
+                  <div className="total-row">
+                    <span>Invoice Cost / Paid Unit</span>
+                    <span className="mono">{formatMoney(paidOnlyCost)}</span>
+                  </div>
+                  <div className="total-row" style={{ color: "var(--accent-primary-ink)", fontWeight: 700 }}>
+                    <span>True Effective Unit Cost (incl. Free Cases)</span>
+                    <span className="mono">{formatMoney(effectiveUnitCost)}</span>
+                  </div>
+                </div>
+
+                <button
+                  id="post-grn-btn"
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={busyAction !== null || !supplierId || !selectedProdId}
+                  onClick={() => void handlePostGrn()}
+                >
+                  {busyAction === "grn"
+                    ? "Posting GRN..."
+                    : "Post GRN to Stock Ledger & Check Margin"}
+                </button>
+              </div>
+            </section>
           </div>
-        </section>
-      </div>
+        </>
+      )}
 
       {/* FEFO Best-Before Expiry Console */}
       <section className="panel">
@@ -693,6 +1010,7 @@ export function OperationsView({
             </p>
           </div>
           <select
+            aria-label="FEFO expiry alert horizon"
             className="select"
             value={horizonDays}
             onChange={(e) => setHorizonDays(Number(e.target.value))}
@@ -704,7 +1022,7 @@ export function OperationsView({
           </select>
         </div>
 
-        <div className="table-wrap">
+        <div className="table-wrap" role="region" aria-label="FEFO expiry alerts table" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -714,64 +1032,88 @@ export function OperationsView({
                 <th>Status</th>
                 <th className="text-right">Remaining Qty</th>
                 <th className="text-right">At-Risk Cost</th>
-                <th className="text-right">Action</th>
+                {canManage && <th className="text-right">Action</th>}
               </tr>
             </thead>
             <tbody>
-              {expiryBatches.slice(0, 35).map((b) => (
-                <tr key={b.batchId}>
-                  <td>
-                    <span
-                      className={`tag mono ${
-                        b.daysLeft <= 14 ? "tag-red" : b.daysLeft <= 30 ? "tag-amber" : "tag-neutral"
-                      }`}
-                    >
-                      {b.daysLeft}d
-                    </span>
-                  </td>
-                  <td>
-                    <div style={{ fontWeight: 600 }}>{b.name}</div>
-                    <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                      {b.sku} · {b.departmentName} · Aisle {b.aisleLocation}
-                    </div>
-                  </td>
-                  <td className="mono">
-                    <div>{b.bestBeforeDate}</div>
-                    <div style={{ fontSize: 11, color: "var(--ink-muted)" }}>{b.lotCode}</div>
-                  </td>
-                  <td>
-                    <span className={`tag ${b.status === "clearance" ? "tag-amber" : "tag-blue"}`}>
-                      {b.status}
-                    </span>
-                  </td>
-                  <td className="text-right mono">{b.qtyRemaining}</td>
-                  <td className="text-right mono" style={{ fontWeight: 600 }}>
-                    {formatMoney(b.atRiskCostCents)}
-                  </td>
-                  <td className="text-right">
-                    <div style={{ display: "inline-flex", gap: 6 }}>
-                      {b.status !== "clearance" && (
-                        <button
-                          className="btn btn-amber btn-sm"
-                          onClick={() => void handleBatchAction(b.batchId, "clearance", b.sku)}
-                        >
-                          <Percent size={12} /> 30% Clearance
-                        </button>
-                      )}
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => void handleBatchAction(b.batchId, "write_off", b.sku)}
-                      >
-                        <Trash2 size={12} /> Write Off
-                      </button>
-                    </div>
+              {loading && expiryBatches.length === 0 ? (
+                <tr>
+                  <td colSpan={canManage ? 7 : 6}>Loading FEFO expiry batches...</td>
+                </tr>
+              ) : expiryBatches.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={canManage ? 7 : 6}
+                    style={{ textAlign: "center", color: "var(--ink-muted)", padding: "20px 12px" }}
+                  >
+                    No packaged batches expiring within {horizonDays} days.
                   </td>
                 </tr>
-              ))}
+              ) : (
+                expiryBatches.slice(0, 35).map((b) => (
+                  <tr key={b.batchId}>
+                    <td>
+                      <span
+                        className={`tag mono ${
+                          b.daysLeft <= 14 ? "tag-red" : b.daysLeft <= 30 ? "tag-amber" : "tag-neutral"
+                        }`}
+                      >
+                        {b.daysLeft}d
+                      </span>
+                    </td>
+                    <td>
+                      <div style={{ fontWeight: 600 }}>{b.name}</div>
+                      <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                        {b.sku} · {b.departmentName} · Aisle {b.aisleLocation}
+                      </div>
+                    </td>
+                    <td className="mono">
+                      <div>{b.bestBeforeDate}</div>
+                      <div style={{ fontSize: 11, color: "var(--ink-muted)" }}>{b.lotCode}</div>
+                    </td>
+                    <td>
+                      <span className={`tag ${b.status === "clearance" ? "tag-amber" : "tag-blue"}`}>
+                        {b.status}
+                      </span>
+                    </td>
+                    <td className="text-right mono">{b.qtyRemaining}</td>
+                    <td className="text-right mono" style={{ fontWeight: 600 }}>
+                      {formatMoney(b.atRiskCostCents)}
+                    </td>
+                    {canManage && (
+                      <td className="text-right">
+                        <div style={{ display: "inline-flex", gap: 6 }}>
+                          {b.status !== "clearance" && (
+                            <button
+                              type="button"
+                              className="btn btn-amber btn-sm"
+                              disabled={busyAction !== null}
+                              onClick={() => void handleBatchAction(b.batchId, "clearance", b.sku)}
+                            >
+                              <Percent size={12} /> 30% Clearance
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="btn btn-sm"
+                            disabled={busyAction !== null}
+                            onClick={() => void handleBatchAction(b.batchId, "write_off", b.sku)}
+                          >
+                            <Trash2 size={12} /> Write Off
+                          </button>
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>
       </section>
+        </>
+      )}
+      </div>
     </div>
   );
 }

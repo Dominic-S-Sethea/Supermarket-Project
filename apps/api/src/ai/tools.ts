@@ -7,17 +7,19 @@ import {
   type CartInputLine,
   type PromotionRule,
 } from "@supermarket/shared";
-import { and, desc, eq, ilike, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import {
   aiProposedActions,
   analyticsAbcXyz,
   analyticsBasketRules,
   analyticsDemandForecasts,
+  analyticsDynamicMarkdowns,
   analyticsLpAnomalies,
+  analyticsPhantomStock,
   analyticsShiftDiagnostics,
-  categories,
+  analyticsSupplierScorecards,
   db,
-  departments,
+  grnVariances,
   inventoryBatches,
   marginAlerts,
   productBarcodes,
@@ -25,6 +27,7 @@ import {
   shiftExperiments,
   stockBaselines,
   stockMovements,
+  storeTasks,
   supplierProducts,
   suppliers,
   taxRates,
@@ -225,9 +228,79 @@ export const COPILOT_TOOLS: CopilotToolDefinition[] = [
       required: ["name", "promoType"],
     },
   },
+  {
+    type: "function",
+    name: "get_supplier_scorecards",
+    description:
+      "Get 90-day Supplier OTIF scorecards (on-time, in-full, lead-time variability, A-D grade) and open 3-way PO/GRN/invoice dock variance exposure.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "get_phantom_stock_alerts",
+    description:
+      "Get open Poisson phantom-stock (silent zero-sales ghost inventory) alerts ranked by probability and estimated book value at risk.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max SKUs to return (default 10, max 25)." },
+      },
+    },
+  },
+  {
+    type: "function",
+    name: "get_dynamic_markdowns",
+    description:
+      "Get elasticity-optimized FEFO dynamic markdown recommendations for near-expiry batches with incremental cash recovery estimates.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max batches to return (default 10, max 25)." },
+      },
+    },
+  },
+  {
+    type: "function",
+    name: "get_floor_tasks",
+    description:
+      "Get today's pending store floor task checklist (pre-open restocks, blind cycle counts, 07:30 shelf tags, expiry markdowns) ranked by priority.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max tasks to return (default 12, max 30)." },
+      },
+    },
+  },
 ];
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const VALID_URGENCIES = new Set(["critical", "reorder_now", "watch", "healthy"]);
+const VALID_PROMO_TYPES = new Set<PromotionRule["promoType"]>([
+  "clearance",
+  "tier_price",
+  "mix_and_match",
+  "bogo",
+  "basket_threshold",
+]);
+
+function finiteIntInRange(value: unknown, min: number, max: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
 export async function executeCopilotTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: CopilotToolContext
+): Promise<Record<string, unknown>> {
+  try {
+    return await executeCopilotToolInner(name, args ?? {}, ctx);
+  } catch {
+    return { error: `Tool "${name}" could not complete with the supplied parameters.` };
+  }
+}
+
+async function executeCopilotToolInner(
   name: string,
   args: Record<string, unknown>,
   ctx: CopilotToolContext
@@ -345,7 +418,10 @@ export async function executeCopilotTool(
     }
 
     case "search_catalog": {
-      const q = String(args.query ?? "").trim();
+      const q = String(args.query ?? "").trim().slice(0, 120);
+      if (!q) {
+        return { error: "Search query must be a non-empty string." };
+      }
       const limit = Math.min(25, Math.max(1, Number(args.limit ?? 10) || 10));
       const unfoldedSq = db
         .select({
@@ -428,7 +504,11 @@ export async function executeCopilotTool(
     }
 
     case "get_reorder_alerts": {
-      const urgency = typeof args.urgency === "string" && args.urgency ? args.urgency : null;
+      const rawUrgency = typeof args.urgency === "string" ? args.urgency.trim().toLowerCase() : "";
+      if (rawUrgency && !VALID_URGENCIES.has(rawUrgency)) {
+        return { error: `Invalid urgency filter "${rawUrgency}".` };
+      }
+      const urgency = rawUrgency || null;
       const limit = Math.min(30, Math.max(1, Number(args.limit ?? 15) || 15));
       const rows = await db
         .select({
@@ -686,8 +766,15 @@ export async function executeCopilotTool(
     }
 
     case "propose_purchase_order": {
-      const supQuery = String(args.supplierName ?? "").trim();
-      const urgencyFilter = typeof args.urgency === "string" && args.urgency ? args.urgency : null;
+      const supQuery = String(args.supplierName ?? "").trim().slice(0, 120);
+      if (!supQuery) {
+        return { error: "supplierName is required to propose a purchase order." };
+      }
+      const rawUrgency = typeof args.urgency === "string" ? args.urgency.trim().toLowerCase() : "";
+      if (rawUrgency && !VALID_URGENCIES.has(rawUrgency)) {
+        return { error: `Invalid urgency filter "${rawUrgency}".` };
+      }
+      const urgencyFilter = rawUrgency || null;
       const [sup] = await db
         .select()
         .from(suppliers)
@@ -737,8 +824,8 @@ export async function executeCopilotTool(
         supplierId: sup.id,
         supplierName: sup.name,
         notes:
-          typeof args.notes === "string" && args.notes
-            ? args.notes
+          typeof args.notes === "string" && args.notes.trim()
+            ? args.notes.trim().slice(0, 500)
             : `AI-drafted replenishment PO for ${sup.name}`,
         lines: forecastRows.map((r) => ({
           productId: r.productId,
@@ -780,8 +867,11 @@ export async function executeCopilotTool(
     }
 
     case "propose_price_update": {
-      const key = String(args.skuOrProductId ?? "").trim();
-      const isUuid = /^[0-9a-f-]{36}$/i.test(key);
+      const key = String(args.skuOrProductId ?? "").trim().slice(0, 80);
+      if (!key) {
+        return { error: "skuOrProductId is required." };
+      }
+      const isUuid = UUID_RE.test(key);
       const [prod] = await db
         .select({
           id: products.id,
@@ -825,10 +915,8 @@ export async function executeCopilotTool(
         prod.taxInclusive,
         5
       );
-      const targetPrice =
-        typeof args.newSellPriceCents === "number" && args.newSellPriceCents > 0
-          ? Math.round(args.newSellPriceCents)
-          : openAlert?.suggestedSellPriceCents ?? suggested;
+      const requestedPrice = finiteIntInRange(args.newSellPriceCents, 1, 10_000_000);
+      const targetPrice = requestedPrice ?? openAlert?.suggestedSellPriceCents ?? suggested;
 
       const currentMarginBp = computeNetMarginBp(
         primaryBc.sellPriceCents,
@@ -848,8 +936,8 @@ export async function executeCopilotTool(
         alertId: openAlert?.id ?? null,
         newSellPriceCents: targetPrice,
         reason:
-          typeof args.reason === "string" && args.reason
-            ? args.reason
+          typeof args.reason === "string" && args.reason.trim()
+            ? args.reason.trim().slice(0, 300)
             : "Restore net margin floor across primary & multi-pack tiers",
       };
 
@@ -884,26 +972,54 @@ export async function executeCopilotTool(
     }
 
     case "propose_promotion": {
-      const promoType = String(args.promoType ?? "clearance") as PromotionRule["promoType"];
-      const promoName = String(args.name ?? "AI Suggested Promotion");
-      const minMarginGuardBp =
-        typeof args.minMarginGuardBp === "number" ? Math.round(args.minMarginGuardBp) : 1000;
-      const daypartStartHour =
-        typeof args.daypartStartHour === "number" ? Math.round(args.daypartStartHour) : null;
-      const daypartEndHour =
-        typeof args.daypartEndHour === "number" ? Math.round(args.daypartEndHour) : null;
-      const productIds = Array.isArray(args.productIds)
-        ? args.productIds.map(String)
-        : undefined;
+      const rawPromoType = String(args.promoType ?? "clearance").trim() as PromotionRule["promoType"];
+      if (!VALID_PROMO_TYPES.has(rawPromoType)) {
+        return { error: `Unsupported promoType "${rawPromoType}".` };
+      }
+      const promoType = rawPromoType;
+      const promoName = String(args.name ?? "AI Suggested Promotion").trim().slice(0, 160);
+      if (promoName.length < 2) {
+        return { error: "Promotion name must be at least 2 characters." };
+      }
+      const minMarginGuardBp = finiteIntInRange(args.minMarginGuardBp, 0, 9500) ?? 1000;
+      const rawDaypartStart = finiteIntInRange(args.daypartStartHour, 0, 23);
+      const rawDaypartEnd = finiteIntInRange(args.daypartEndHour, 1, 24);
+      const hasCompleteDaypart = rawDaypartStart !== null && rawDaypartEnd !== null;
+      const daypartStartHour = hasCompleteDaypart ? rawDaypartStart : null;
+      const daypartEndHour = hasCompleteDaypart ? rawDaypartEnd : null;
+
+      // Filter productIds safely to valid UUIDs (prevent Postgres 22P02 if LLM passes SKUs or garbage)
+      let productIds: string[] | undefined;
+      if (Array.isArray(args.productIds) && args.productIds.length > 0) {
+        const rawIds = args.productIds.map((x) => String(x).trim()).filter(Boolean).slice(0, 50);
+        const uuids = rawIds.filter((x) => UUID_RE.test(x));
+        const nonUuids = rawIds.filter((x) => !UUID_RE.test(x));
+        if (nonUuids.length > 0) {
+          const resolvedBySku = await db
+            .select({ id: products.id })
+            .from(products)
+            .where(inArray(products.sku, nonUuids));
+          uuids.push(...resolvedBySku.map((r) => r.id));
+        }
+        const deduped = Array.from(new Set(uuids));
+        if (deduped.length === 0) {
+          return { error: "No valid product UUIDs or SKUs found in productIds." };
+        }
+        productIds = deduped;
+      }
 
       const rulesJson: Record<string, unknown> = {};
       if (productIds && productIds.length > 0) rulesJson.productIds = productIds;
-      if (typeof args.discountBp === "number") rulesJson.discountBp = Math.round(args.discountBp);
-      if (typeof args.requiredQty === "number") rulesJson.requiredQty = Math.round(args.requiredQty);
-      if (typeof args.bundlePriceCents === "number")
-        rulesJson.bundlePriceCents = Math.round(args.bundlePriceCents);
-      if (typeof args.buyQty === "number") rulesJson.buyQty = Math.round(args.buyQty);
-      if (typeof args.getQty === "number") rulesJson.getQty = Math.round(args.getQty);
+      const discountBp = finiteIntInRange(args.discountBp, 1, 9500);
+      if (discountBp !== null) rulesJson.discountBp = discountBp;
+      const requiredQty = finiteIntInRange(args.requiredQty, 1, 100);
+      if (requiredQty !== null) rulesJson.requiredQty = requiredQty;
+      const bundlePriceCents = finiteIntInRange(args.bundlePriceCents, 1, 10_000_000);
+      if (bundlePriceCents !== null) rulesJson.bundlePriceCents = bundlePriceCents;
+      const buyQty = finiteIntInRange(args.buyQty, 1, 50);
+      if (buyQty !== null) rulesJson.buyQty = buyQty;
+      const getQty = finiteIntInRange(args.getQty, 1, 50);
+      if (getQty !== null) rulesJson.getQty = getQty;
 
       // Dry-run simulate through @supermarket/shared evaluateCart()
       const sampleProds = await db
@@ -932,9 +1048,9 @@ export async function executeCopilotTool(
 
       const qtyPerLine =
         promoType === "bogo"
-          ? (Number(args.buyQty ?? 2) + Number(args.getQty ?? 1))
+          ? (buyQty ?? 2) + (getQty ?? 1)
           : promoType === "tier_price" || promoType === "mix_and_match"
-            ? Math.max(1, Number(args.requiredQty ?? 2))
+            ? Math.max(1, requiredQty ?? 2)
             : 1;
 
       const sampleCart: CartInputLine[] = sampleProds.map((p, idx) => ({
@@ -1014,6 +1130,146 @@ export async function executeCopilotTool(
         proposedActionId: action.id,
         status: "pending_approval",
         ...previewJson,
+      };
+    }
+
+    case "get_supplier_scorecards": {
+      const rows = await db
+        .select({
+          supplierName: suppliers.name,
+          grade: analyticsSupplierScorecards.grade,
+          otifRatePct: analyticsSupplierScorecards.otifRatePct,
+          onTimeRatePct: analyticsSupplierScorecards.onTimeRatePct,
+          inFullRatePct: analyticsSupplierScorecards.inFullRatePct,
+          avgLeadTimeDays: analyticsSupplierScorecards.avgLeadTimeDays,
+          leadTimeStdDays: analyticsSupplierScorecards.leadTimeStdDays,
+          costVarianceRatePct: analyticsSupplierScorecards.costVarianceRatePct,
+          totalVarianceCents: analyticsSupplierScorecards.totalVarianceCents,
+        })
+        .from(analyticsSupplierScorecards)
+        .innerJoin(suppliers, eq(analyticsSupplierScorecards.supplierId, suppliers.id))
+        .orderBy(asc(analyticsSupplierScorecards.otifRatePct));
+
+      const [openVars] = await db
+        .select({
+          cnt: sql<number>`count(*)::int`,
+          impactCents: sql<number>`coalesce(sum(${grnVariances.financialImpactCents}), 0)::bigint`,
+        })
+        .from(grnVariances)
+        .where(inArray(grnVariances.status, ["open", "disputed"]));
+
+      return {
+        supplierCount: rows.length,
+        openVarianceCount: Number(openVars?.cnt ?? 0),
+        openVarianceImpactUsd: formatMoney(Number(openVars?.impactCents ?? 0)),
+        scorecards: rows.map((r) => ({
+          supplierName: r.supplierName,
+          grade: r.grade,
+          otifPct: Number(r.otifRatePct.toFixed(1)),
+          onTimePct: Number(r.onTimeRatePct.toFixed(1)),
+          inFullPct: Number(r.inFullRatePct.toFixed(1)),
+          leadTimeDays: `${r.avgLeadTimeDays.toFixed(1)}±${r.leadTimeStdDays.toFixed(1)}d`,
+          costVariancePct: Number(r.costVarianceRatePct.toFixed(1)),
+        })),
+      };
+    }
+
+    case "get_phantom_stock_alerts": {
+      const limit = finiteIntInRange(args.limit, 1, 25) ?? 10;
+      const rows = await db
+        .select({
+          sku: products.sku,
+          name: products.name,
+          aisleLocation: products.aisleLocation,
+          bookStockUnits: analyticsPhantomStock.bookStockUnits,
+          daysSinceLastSale: analyticsPhantomStock.daysSinceLastSale,
+          phantomProb: analyticsPhantomStock.phantomProb,
+          estimatedValueAtRiskCents: analyticsPhantomStock.estimatedValueAtRiskCents,
+        })
+        .from(analyticsPhantomStock)
+        .innerJoin(products, eq(analyticsPhantomStock.productId, products.id))
+        .where(eq(analyticsPhantomStock.status, "open"))
+        .orderBy(desc(analyticsPhantomStock.phantomProb))
+        .limit(limit);
+
+      const totalAtRisk = rows.reduce((s, r) => s + r.estimatedValueAtRiskCents, 0);
+      return {
+        openAlerts: rows.length,
+        totalAtRiskUsd: formatMoney(totalAtRisk),
+        items: rows.map((r) => ({
+          sku: r.sku,
+          name: r.name,
+          aisle: r.aisleLocation,
+          bookStock: r.bookStockUnits,
+          silentDays: Number(r.daysSinceLastSale.toFixed(1)),
+          phantomProbPct: Math.round(r.phantomProb * 100),
+          atRiskUsd: formatMoney(r.estimatedValueAtRiskCents),
+        })),
+      };
+    }
+
+    case "get_dynamic_markdowns": {
+      const limit = finiteIntInRange(args.limit, 1, 25) ?? 10;
+      const rows = await db
+        .select({
+          sku: products.sku,
+          name: products.name,
+          daysLeft: analyticsDynamicMarkdowns.daysLeft,
+          qtyRemaining: analyticsDynamicMarkdowns.qtyRemaining,
+          recommendedDiscountBp: analyticsDynamicMarkdowns.recommendedDiscountBp,
+          recommendedPromoPriceCents: analyticsDynamicMarkdowns.recommendedPromoPriceCents,
+          expectedRecoveryCents: analyticsDynamicMarkdowns.expectedRecoveryCents,
+          baselineNoPromoRecoveryCents: analyticsDynamicMarkdowns.baselineNoPromoRecoveryCents,
+        })
+        .from(analyticsDynamicMarkdowns)
+        .innerJoin(products, eq(analyticsDynamicMarkdowns.productId, products.id))
+        .where(eq(analyticsDynamicMarkdowns.status, "recommended"))
+        .orderBy(asc(analyticsDynamicMarkdowns.daysLeft), desc(analyticsDynamicMarkdowns.expectedRecoveryCents))
+        .limit(limit);
+
+      const totalLift = rows.reduce(
+        (s, r) => s + Math.max(0, r.expectedRecoveryCents - r.baselineNoPromoRecoveryCents),
+        0
+      );
+      return {
+        recommendedCount: rows.length,
+        totalIncrementalRecoveryUsd: formatMoney(totalLift),
+        items: rows.map((r) => ({
+          sku: r.sku,
+          name: r.name,
+          daysLeft: r.daysLeft,
+          qtyRemaining: r.qtyRemaining,
+          recommendedDiscount: formatBp(r.recommendedDiscountBp),
+          promoPriceUsd: formatMoney(r.recommendedPromoPriceCents),
+          incrementalRecoveryUsd: formatMoney(
+            Math.max(0, r.expectedRecoveryCents - r.baselineNoPromoRecoveryCents)
+          ),
+        })),
+      };
+    }
+
+    case "get_floor_tasks": {
+      const limit = finiteIntInRange(args.limit, 1, 30) ?? 12;
+      const rows = await db
+        .select({
+          taskDate: storeTasks.taskDate,
+          shiftBucket: storeTasks.shiftBucket,
+          taskType: storeTasks.taskType,
+          priority: storeTasks.priority,
+          title: storeTasks.title,
+          aisleLocation: storeTasks.aisleLocation,
+          targetQty: storeTasks.targetQty,
+          status: storeTasks.status,
+        })
+        .from(storeTasks)
+        .where(eq(storeTasks.status, "pending"))
+        .orderBy(asc(storeTasks.priority), desc(storeTasks.taskDate))
+        .limit(limit);
+
+      return {
+        pendingTasks: rows.length,
+        urgentCount: rows.filter((r) => r.priority === 1).length,
+        tasks: rows,
       };
     }
 

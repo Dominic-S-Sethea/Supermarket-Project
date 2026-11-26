@@ -1,0 +1,120 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-supermarket}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-supermarket_os}
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+    volumes:
+      - pg_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-supermarket} -d ${POSTGRES_DB:-supermarket_os}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "1.5"
+
+  analytics:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.analytics
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-supermarket}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-supermarket_os}
+      ANALYTICS_WORKER_HOST: 0.0.0.0
+      ANALYTICS_WORKER_PORT: 8090
+      ANALYTICS_WORKER_TOKEN: ${ANALYTICS_WORKER_TOKEN:-}
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "1.0"
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgres://${POSTGRES_USER:-supermarket}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-supermarket_os}
+      AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET (>= 32 chars) in .env}
+      AUTH_SECRET_PREVIOUS: ${AUTH_SECRET_PREVIOUS:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_STORE_INTERACTIONS: ${GEMINI_STORE_INTERACTIONS:-false}
+      ANALYTICS_WORKER_URL: http://analytics:8090
+      ANALYTICS_WORKER_TOKEN: ${ANALYTICS_WORKER_TOKEN:-}
+      ENABLE_OPENAPI_DOCS: ${ENABLE_OPENAPI_DOCS:-true}
+      PG_POOL_MAX: ${PG_POOL_MAX:-20}
+      PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-15000}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.web
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+volumes:
+  pg_prod_data:

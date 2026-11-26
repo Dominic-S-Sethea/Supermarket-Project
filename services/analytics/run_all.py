@@ -14,9 +14,11 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 import uuid
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 import numpy as np
 import psycopg
@@ -27,8 +29,64 @@ logging.basicConfig(
 )
 log = logging.getLogger("supermarket.analytics")
 
+def safe_float(
+    val: object,
+    default: float = 0.0,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Coerce value to a finite float, falling back to default on NaN/Inf/None."""
+    try:
+        num = float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(num):
+        return default
+    if lo is not None and num < lo:
+        num = lo
+    if hi is not None and num > hi:
+        num = hi
+    return num
+
+
+def sanitize_series(values: np.ndarray | list[float], non_negative: bool = True) -> np.ndarray:
+    """Convert to a 1D finite float64 array, replacing NaN/Inf with 0.0."""
+    arr = np.asarray(values, dtype=float).ravel()
+    if arr.size == 0:
+        return np.zeros(0, dtype=float)
+    arr = np.where(np.isfinite(arr), arr, 0.0)
+    if non_negative:
+        arr = np.maximum(0.0, arr)
+    return arr
+
+
+def sanitize_json_payload(obj: object) -> object:
+    """Recursively convert NumPy scalars and replace non-finite floats before JSONB writes."""
+    if isinstance(obj, dict):
+        return {str(k): sanitize_json_payload(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_json_payload(v) for v in obj]
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        fval = float(obj)
+        return fval if math.isfinite(fval) else 0.0
+    return obj
+
+
+def safe_json_dumps(obj: object) -> str:
+    """Serialize payload with allow_nan=False so Postgres JSONB never receives NaN/Infinity."""
+    return json.dumps(sanitize_json_payload(obj), allow_nan=False)
+
+
 def log_event(stage: str, **fields: object) -> None:
-    log.info(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stage": stage, **fields}))
+    log.info(
+        safe_json_dumps(
+            {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stage": stage, **fields}
+        )
+    )
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -38,36 +96,39 @@ DATABASE_URL = os.environ.get(
 
 def croston_sba_forecast(series: np.ndarray, alpha: float = 0.2) -> float:
     """Syntetos-Boylan Approximation (Croston-SBA) for intermittent Z-class SKUs."""
-    nz_indices = np.flatnonzero(series > 0)
+    clean = sanitize_series(series, non_negative=True)
+    safe_alpha = safe_float(alpha, default=0.2, lo=0.01, hi=1.0)
+    nz_indices = np.flatnonzero(clean > 0)
     if len(nz_indices) == 0:
         return 0.0
     if len(nz_indices) == 1:
-        return float(series[nz_indices[0]]) / max(1.0, len(series))
+        return safe_float(float(clean[nz_indices[0]]) / max(1.0, float(len(clean))), lo=0.0)
 
-    z_hat = float(series[nz_indices[0]])  # smoothed demand size
+    z_hat = float(clean[nz_indices[0]])  # smoothed demand size
     p_hat = float(nz_indices[0] + 1)  # smoothed inter-demand interval
 
     for i in range(1, len(nz_indices)):
-        demand = float(series[nz_indices[i]])
+        demand = float(clean[nz_indices[i]])
         interval = float(nz_indices[i] - nz_indices[i - 1])
-        z_hat = alpha * demand + (1.0 - alpha) * z_hat
-        p_hat = alpha * interval + (1.0 - alpha) * p_hat
+        z_hat = safe_alpha * demand + (1.0 - safe_alpha) * z_hat
+        p_hat = safe_alpha * interval + (1.0 - safe_alpha) * p_hat
 
     # SBA bias-correction factor (1 - alpha/2)
-    return (1.0 - alpha / 2.0) * (z_hat / max(1.0, p_hat))
+    return safe_float((1.0 - safe_alpha / 2.0) * (z_hat / max(1.0, p_hat)), lo=0.0)
 
 
 def croston_holdout_wmape(series: np.ndarray, holdout_days: int = 14) -> float:
     """Genuine out-of-sample WMAPE for Croston-SBA over the trailing holdout window."""
-    if len(series) <= holdout_days or series.sum() == 0:
+    clean = sanitize_series(series, non_negative=True)
+    if holdout_days <= 0 or len(clean) <= holdout_days or float(clean.sum()) <= 0.0:
         return 0.0
-    train = series[:-holdout_days]
-    actual_sum = float(series[-holdout_days:].sum())
+    train = clean[:-holdout_days]
+    actual_sum = float(clean[-holdout_days:].sum())
     pred_sum = croston_sba_forecast(train) * holdout_days
-    if actual_sum <= 0:
+    if actual_sum <= 0.0:
         return 0.0 if pred_sum <= 0.1 else 100.0
     wmape = abs(actual_sum - pred_sum) / actual_sum * 100.0
-    return round(min(200.0, wmape), 1)
+    return round(safe_float(wmape, lo=0.0, hi=200.0), 1)
 
 
 def weekend_ets_forecast(
@@ -78,14 +139,16 @@ def weekend_ets_forecast(
     Seasonal indices are fit ONLY on the training split (series[:-holdout_days]) for leak-free WMAPE.
     Returns (predicted_daily_mean, holdout_wmape_pct).
     """
-    n = len(series)
-    if n < holdout_days + 14 or series.sum() == 0:
-        mean_val = float(series.mean()) if n > 0 else 0.0
+    clean = sanitize_series(series, non_negative=True)
+    safe_alpha = safe_float(alpha, default=0.25, lo=0.01, hi=1.0)
+    n = len(clean)
+    if holdout_days <= 0 or n < holdout_days + 14 or float(clean.sum()) <= 0.0:
+        mean_val = safe_float(float(clean.mean()), lo=0.0) if n > 0 else 0.0
         return mean_val, 0.0
 
     split = n - holdout_days
-    train = series[:split]
-    holdout = series[split:]
+    train = clean[:split]
+    holdout = clean[split:]
 
     # 1. Fit day-of-week seasonal indices & SES level strictly on training window (no holdout leakage)
     train_overall = max(0.01, float(train.mean()))
@@ -100,7 +163,7 @@ def weekend_ets_forecast(
     )
     train_level = float(train_deseason[0])
     for t in range(split):
-        train_level = alpha * train_deseason[t] + (1.0 - alpha) * train_level
+        train_level = safe_alpha * train_deseason[t] + (1.0 - safe_alpha) * train_level
 
     # 2. Out-of-sample forecast over the 14-day holdout window
     holdout_preds = np.array(
@@ -108,28 +171,32 @@ def weekend_ets_forecast(
         dtype=float,
     )
     denom = float(holdout.sum())
-    if denom > 0:
+    if denom > 0.0:
         wmape = float(np.abs(holdout - holdout_preds).sum()) / denom * 100.0
-        wmape = round(min(200.0, wmape), 1)
+        wmape = round(safe_float(wmape, lo=0.0, hi=200.0), 1)
     else:
-        wmape = 0.0
+        wmape = 0.0 if float(holdout_preds.sum()) <= 0.1 else 100.0
 
     # 3. Refit on full 60-day history to generate the live 7-day forward forecast
-    full_overall = max(0.01, float(series.mean()))
-    full_dow = np.array([series[i::7].mean() for i in range(7)], dtype=float)
+    full_overall = max(0.01, float(clean.mean()))
+    full_dow = np.array(
+        [clean[i::7].mean() if len(clean[i::7]) > 0 else full_overall for i in range(7)],
+        dtype=float,
+    )
     full_seasonal = np.clip(full_dow / full_overall, 0.5, 2.2)
     full_deseason = np.array(
-        [series[t] / full_seasonal[t % 7] for t in range(n)], dtype=float
+        [clean[t] / full_seasonal[t % 7] for t in range(n)], dtype=float
     )
     level = float(full_deseason[0])
     for t in range(n):
-        level = alpha * full_deseason[t] + (1.0 - alpha) * level
+        level = safe_alpha * full_deseason[t] + (1.0 - safe_alpha) * level
 
     next_7_mean = float(np.mean([level * full_seasonal[(n + h) % 7] for h in range(7)]))
-    return max(0.0, next_7_mean), wmape
+    return safe_float(next_7_mean, lo=0.0), wmape
 
 
 def recommend_abc_xyz_action(segment: str, days_of_stock: float) -> str:
+    safe_dos = safe_float(days_of_stock, default=0.0, lo=0.0)
     if segment in ("AX", "BX"):
         return "Auto-replenish tightly; weekly cycle count; zero stockout tolerance"
     if segment in ("AY", "BY"):
@@ -138,7 +205,7 @@ def recommend_abc_xyz_action(segment: str, days_of_stock: float) -> str:
         return "Manager-reviewed ordering; maintain safety buffer for erratic spikes"
     if segment in ("CX", "CY"):
         return "Automated low-touch Min/Max par replenishment (monthly review)"
-    if days_of_stock > 120:
+    if safe_dos > 120:
         return "Candidate for clearance markdown or delisting (capital trap)"
     return "Order strictly on demand; minimize shelf facings"
 
@@ -154,28 +221,40 @@ def score_cashiers_robust(
     if not rows:
         return []
 
+    sanitized_rows = [
+        (
+            str(cashier),
+            max(0, int(safe_float(total, default=0.0, lo=0.0))),
+            max(0, int(safe_float(v, default=0.0, lo=0.0))),
+            max(0, int(safe_float(ref, default=0.0, lo=0.0))),
+            max(0, int(safe_float(ns, default=0.0, lo=0.0))),
+        )
+        for cashier, total, v, ref, ns in rows
+    ]
+
     void_rates = np.array(
-        [(v / max(1, total)) * 100.0 for _, total, v, _, _ in rows], dtype=float
+        [(v / max(1, total)) * 100.0 for _, total, v, _, _ in sanitized_rows], dtype=float
     )
     composites = np.array(
         [
             ((v + 0.8 * ref + 0.5 * ns) / max(1, total)) * 100.0
-            for _, total, v, ref, ns in rows
+            for _, total, v, ref, ns in sanitized_rows
         ],
         dtype=float,
     )
 
-    median_comp = float(np.median(composites))
-    mad = max(0.05, float(np.median(np.abs(composites - median_comp))))
+    median_comp = safe_float(float(np.median(composites)))
+    mad = max(0.05, safe_float(float(np.median(np.abs(composites - median_comp))), default=0.05))
 
     scored = []
     for (cashier, total, voids, refunds, no_sales), v_rate, comp in zip(
-        rows, void_rates, composites
+        sanitized_rows, void_rates, composites
     ):
-        robust_z = 0.6745 * (float(comp) - median_comp) / mad
-        if robust_z >= 2.5 or float(v_rate) >= 4.0:
+        v_rate_safe = safe_float(float(v_rate), lo=0.0)
+        robust_z = safe_float(0.6745 * (float(comp) - median_comp) / mad)
+        if robust_z >= 2.5 or v_rate_safe >= 4.0:
             risk = "high"
-        elif robust_z >= 1.2 or float(v_rate) >= 2.2:
+        elif robust_z >= 1.2 or v_rate_safe >= 2.2:
             risk = "elevated"
         else:
             risk = "normal"
@@ -183,12 +262,12 @@ def score_cashiers_robust(
         scored.append(
             (
                 cashier,
-                int(total),
-                int(voids),
-                int(refunds),
-                int(no_sales),
-                round(float(v_rate), 2),
-                round(float(robust_z), 2),
+                total,
+                voids,
+                refunds,
+                no_sales,
+                round(v_rate_safe, 2),
+                round(robust_z, 2),
                 risk,
             )
         )
@@ -196,6 +275,14 @@ def score_cashiers_robust(
 
 
 def run_abc_xyz_and_forecasts(
+    conn: psycopg.Connection,
+    supplier_lead_std: dict[str, float] | None = None,
+) -> tuple[int, int]:
+    with conn.transaction():
+        return _run_abc_xyz_and_forecasts_impl(conn, supplier_lead_std)
+
+
+def _run_abc_xyz_and_forecasts_impl(
     conn: psycopg.Connection,
     supplier_lead_std: dict[str, float] | None = None,
 ) -> tuple[int, int]:
@@ -270,6 +357,12 @@ def run_abc_xyz_and_forecasts(
     cum_profit = 0
 
     for pid, avg_cost, on_hand, case_qty, moq_cases, lead_days, supplier_name, supplier_id in ranked:
+        avg_cost_i = max(0, int(safe_float(avg_cost, default=0.0)))
+        on_hand_i = int(safe_float(on_hand, default=0.0))
+        case_qty_i = max(1, int(safe_float(case_qty, default=24.0, lo=1.0)))
+        moq_cases_i = max(1, int(safe_float(moq_cases, default=1.0, lo=1.0)))
+        lead_days_i = max(1, int(safe_float(lead_days, default=3.0, lo=1.0)))
+
         rev60 = rev_map.get(pid, 0)
         prof60 = profit_map.get(pid, 0)
         cum_profit += max(0, prof60)
@@ -277,16 +370,16 @@ def run_abc_xyz_and_forecasts(
 
         abc = "A" if share <= 0.78 else ("B" if share <= 0.94 else "C")
 
-        series = series_map.get(pid)
-        if series is None:
+        series = sanitize_series(series_map.get(pid, np.zeros(HORIZON, dtype=float)))
+        if len(series) != HORIZON:
             series = np.zeros(HORIZON, dtype=float)
 
-        units60 = int(series.sum())
-        avg_daily = units60 / float(HORIZON)
-        std_daily = float(series.std())
-        cv = (std_daily / avg_daily) if avg_daily > 0 else 9.99
+        units60 = int(round(float(series.sum())))
+        avg_daily = safe_float(units60 / float(HORIZON), lo=0.0)
+        std_daily = safe_float(float(series.std()), lo=0.0)
+        cv = safe_float((std_daily / avg_daily) if avg_daily > 0.0 else 9.99, default=9.99, lo=0.0, hi=9.99)
         nz_days = int(np.count_nonzero(series > 0))
-        adi = (HORIZON / float(nz_days)) if nz_days > 0 else float(HORIZON)
+        adi = safe_float((HORIZON / float(nz_days)) if nz_days > 0 else float(HORIZON), default=float(HORIZON), lo=1.0)
 
         if cv < 0.85 and adi <= 2.2:
             xyz = "X"
@@ -297,9 +390,13 @@ def run_abc_xyz_and_forecasts(
 
         segment = f"{abc}{xyz}"
 
-        avg_inv_cost = max(1, max(1, int(on_hand)) * max(1, int(avg_cost)))
-        gmroii = round((prof60 * 6.08) / avg_inv_cost, 2)
-        dos = round(max(0, int(on_hand)) / max(0.05, avg_daily), 1) if units60 > 0 else 999.0
+        avg_inv_cost = max(1, max(1, on_hand_i) * max(1, avg_cost_i))
+        gmroii = round(safe_float((prof60 * 6.08) / avg_inv_cost), 2)
+        dos = (
+            round(safe_float(max(0, on_hand_i) / max(0.05, avg_daily), default=999.0, lo=0.0, hi=999.0), 1)
+            if units60 > 0
+            else 999.0
+        )
 
         abc_records.append(
             (
@@ -327,43 +424,44 @@ def run_abc_xyz_and_forecasts(
             daily_fc, wmape = weekend_ets_forecast(series)
             model_used = "WeekendETS"
 
+        daily_fc = safe_float(daily_fc, lo=0.0)
+        wmape = safe_float(wmape, lo=0.0, hi=200.0)
+
         fc7 = int(math.ceil(daily_fc * 7.0))
         fc14 = int(math.ceil(daily_fc * 14.0))
 
         # Dynamic Safety Stock: Z * sqrt(L * sigma_D^2 + D^2 * sigma_L^2) using measured empirical sigma_L
         z_factor = 1.65 if abc == "A" else (1.28 if abc == "B" else 0.84)
-        fallback_sigma_l = max(0.4, lead_days * 0.25)
-        sigma_l = (
+        fallback_sigma_l = max(0.4, lead_days_i * 0.25)
+        raw_sigma_l = (
             supplier_lead_std.get(supplier_id, fallback_sigma_l)
             if supplier_lead_std
             else fallback_sigma_l
         )
-        safety_stock = int(
-            math.ceil(
-                z_factor * math.sqrt(lead_days * (std_daily**2) + (daily_fc**2) * (sigma_l**2))
-            )
-        )
-        rop = int(math.ceil(daily_fc * lead_days)) + safety_stock
+        sigma_l = safe_float(raw_sigma_l, default=fallback_sigma_l, lo=0.0)
+        variance_term = max(0.0, lead_days_i * (std_daily**2) + (daily_fc**2) * (sigma_l**2))
+        safety_stock = int(math.ceil(z_factor * math.sqrt(variance_term)))
+        rop = int(math.ceil(daily_fc * lead_days_i)) + safety_stock
 
         target_cover_units = fc14 + safety_stock if abc in ("A", "B") else fc7 + safety_stock
-        deficit = target_cover_units - int(on_hand)
+        deficit = target_cover_units - on_hand_i
 
-        if int(on_hand) <= rop and daily_fc > 0.15 and deficit > 0:
-            raw_cases = math.ceil(deficit / max(1, int(case_qty)))
-            order_cases = max(int(moq_cases), raw_cases)
+        if on_hand_i <= rop and daily_fc > 0.15 and deficit > 0:
+            raw_cases = math.ceil(deficit / case_qty_i)
+            order_cases = max(moq_cases_i, raw_cases)
         else:
             order_cases = 0
 
-        if int(on_hand) <= max(2, int(daily_fc * lead_days)) and daily_fc >= 0.4:
+        if on_hand_i <= max(2, int(daily_fc * lead_days_i)) and daily_fc >= 0.4:
             urgency = "critical"
         elif order_cases > 0:
             urgency = "reorder_now"
-        elif int(on_hand) <= int(rop * 1.25) and daily_fc >= 0.25:
+        elif on_hand_i <= int(rop * 1.25) and daily_fc >= 0.25:
             urgency = "watch"
         else:
             urgency = "healthy"
 
-        est_order_cost = order_cases * int(case_qty) * int(avg_cost)
+        est_order_cost = order_cases * case_qty_i * avg_cost_i
 
         forecast_records.append(
             (
@@ -373,9 +471,9 @@ def run_abc_xyz_and_forecasts(
                 fc14,
                 safety_stock,
                 rop,
-                int(on_hand),
+                on_hand_i,
                 order_cases,
-                int(case_qty),
+                case_qty_i,
                 est_order_cost,
                 supplier_name,
                 wmape,
@@ -384,65 +482,67 @@ def run_abc_xyz_and_forecasts(
         )
 
     # Atomic upserts without taking ACCESS EXCLUSIVE TRUNCATE locks against live API readers
-    with conn.cursor() as cur:
-        cur.executemany(
-            """
-            INSERT INTO analytics_abc_xyz (
-                product_id, revenue_60d_cents, profit_60d_cents, units_60d,
-                avg_daily_units, demand_cv, adi, abc_class, xyz_class, segment,
-                gmroii, days_of_stock, recommended_action, computed_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
-            ON CONFLICT (product_id) DO UPDATE SET
-                revenue_60d_cents = EXCLUDED.revenue_60d_cents,
-                profit_60d_cents = EXCLUDED.profit_60d_cents,
-                units_60d = EXCLUDED.units_60d,
-                avg_daily_units = EXCLUDED.avg_daily_units,
-                demand_cv = EXCLUDED.demand_cv,
-                adi = EXCLUDED.adi,
-                abc_class = EXCLUDED.abc_class,
-                xyz_class = EXCLUDED.xyz_class,
-                segment = EXCLUDED.segment,
-                gmroii = EXCLUDED.gmroii,
-                days_of_stock = EXCLUDED.days_of_stock,
-                recommended_action = EXCLUDED.recommended_action,
-                computed_at = now()
-            """,
-            abc_records,
-        )
-        cur.executemany(
-            """
-            INSERT INTO analytics_demand_forecasts (
-                product_id, model_used, forecast_7d_units, forecast_14d_units,
-                safety_stock_units, reorder_point_units, current_stock_units,
-                suggested_order_cases, case_qty, estimated_order_cost_cents,
-                supplier_name, wmape_pct, urgency, computed_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
-            ON CONFLICT (product_id) DO UPDATE SET
-                model_used = EXCLUDED.model_used,
-                forecast_7d_units = EXCLUDED.forecast_7d_units,
-                forecast_14d_units = EXCLUDED.forecast_14d_units,
-                safety_stock_units = EXCLUDED.safety_stock_units,
-                reorder_point_units = EXCLUDED.reorder_point_units,
-                current_stock_units = EXCLUDED.current_stock_units,
-                suggested_order_cases = EXCLUDED.suggested_order_cases,
-                case_qty = EXCLUDED.case_qty,
-                estimated_order_cost_cents = EXCLUDED.estimated_order_cost_cents,
-                supplier_name = EXCLUDED.supplier_name,
-                wmape_pct = EXCLUDED.wmape_pct,
-                urgency = EXCLUDED.urgency,
-                computed_at = now()
-            """,
-            forecast_records,
-        )
-        cur.execute(
-            "DELETE FROM analytics_abc_xyz WHERE product_id <> ALL(%s::uuid[])",
-            (active_pids,),
-        )
-        cur.execute(
-            "DELETE FROM analytics_demand_forecasts WHERE product_id <> ALL(%s::uuid[])",
-            (active_pids,),
-        )
-    conn.commit()
+    with conn.transaction():
+        with conn.cursor() as cur:
+            if abc_records:
+                cur.executemany(
+                    """
+                    INSERT INTO analytics_abc_xyz (
+                        product_id, revenue_60d_cents, profit_60d_cents, units_60d,
+                        avg_daily_units, demand_cv, adi, abc_class, xyz_class, segment,
+                        gmroii, days_of_stock, recommended_action, computed_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                    ON CONFLICT (product_id) DO UPDATE SET
+                        revenue_60d_cents = EXCLUDED.revenue_60d_cents,
+                        profit_60d_cents = EXCLUDED.profit_60d_cents,
+                        units_60d = EXCLUDED.units_60d,
+                        avg_daily_units = EXCLUDED.avg_daily_units,
+                        demand_cv = EXCLUDED.demand_cv,
+                        adi = EXCLUDED.adi,
+                        abc_class = EXCLUDED.abc_class,
+                        xyz_class = EXCLUDED.xyz_class,
+                        segment = EXCLUDED.segment,
+                        gmroii = EXCLUDED.gmroii,
+                        days_of_stock = EXCLUDED.days_of_stock,
+                        recommended_action = EXCLUDED.recommended_action,
+                        computed_at = now()
+                    """,
+                    abc_records,
+                )
+            if forecast_records:
+                cur.executemany(
+                    """
+                    INSERT INTO analytics_demand_forecasts (
+                        product_id, model_used, forecast_7d_units, forecast_14d_units,
+                        safety_stock_units, reorder_point_units, current_stock_units,
+                        suggested_order_cases, case_qty, estimated_order_cost_cents,
+                        supplier_name, wmape_pct, urgency, computed_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                    ON CONFLICT (product_id) DO UPDATE SET
+                        model_used = EXCLUDED.model_used,
+                        forecast_7d_units = EXCLUDED.forecast_7d_units,
+                        forecast_14d_units = EXCLUDED.forecast_14d_units,
+                        safety_stock_units = EXCLUDED.safety_stock_units,
+                        reorder_point_units = EXCLUDED.reorder_point_units,
+                        current_stock_units = EXCLUDED.current_stock_units,
+                        suggested_order_cases = EXCLUDED.suggested_order_cases,
+                        case_qty = EXCLUDED.case_qty,
+                        estimated_order_cost_cents = EXCLUDED.estimated_order_cost_cents,
+                        supplier_name = EXCLUDED.supplier_name,
+                        wmape_pct = EXCLUDED.wmape_pct,
+                        urgency = EXCLUDED.urgency,
+                        computed_at = now()
+                    """,
+                    forecast_records,
+                )
+            cur.execute(
+                "DELETE FROM analytics_abc_xyz WHERE product_id <> ALL(%s::uuid[])",
+                (active_pids,),
+            )
+            cur.execute(
+                "DELETE FROM analytics_demand_forecasts WHERE product_id <> ALL(%s::uuid[])",
+                (active_pids,),
+            )
     print(
         f"[ABC-XYZ & Forecasts] Computed {len(abc_records)} SKUs in {time.perf_counter() - t0:.2f}s"
     )
@@ -456,6 +556,8 @@ def _mine_basket_subset(
     min_lift: float,
     top_n: int,
 ) -> list[tuple[str, str, str, str, str, str, int, float, float, float]]:
+    if not rows or top_n <= 0:
+        return []
     baskets: dict[str, set[str]] = defaultdict(set)
     name_map: dict[str, str] = {}
     for sale_id, pid, name in rows:
@@ -477,13 +579,13 @@ def _mine_basket_subset(
 
     rules = []
     for (a, b), co in pair_counts.items():
-        if co < min_co:
+        if co < min_co or item_counts[a] <= 0 or item_counts[b] <= 0:
             continue
-        support = co / total_baskets
-        conf_ab = co / item_counts[a]
-        conf_ba = co / item_counts[b]
+        support = safe_float(co / total_baskets, lo=0.0, hi=1.0)
+        conf_ab = safe_float(co / item_counts[a], lo=0.0, hi=1.0)
+        conf_ba = safe_float(co / item_counts[b], lo=0.0, hi=1.0)
         prob_b = item_counts[b] / total_baskets
-        lift = conf_ab / max(1e-9, prob_b)
+        lift = safe_float(conf_ab / max(1e-9, prob_b), lo=0.0)
         if lift < min_lift:
             continue
         if conf_ab >= conf_ba:
@@ -500,9 +602,9 @@ def _mine_basket_subset(
                 name_map[ant],
                 name_map[cons],
                 int(co),
-                round(float(support), 5),
-                round(float(conf), 4),
-                round(float(lift), 2),
+                round(support, 5),
+                round(conf, 4),
+                round(lift, 2),
             )
         )
 
@@ -511,6 +613,11 @@ def _mine_basket_subset(
 
 
 def run_market_basket(conn: psycopg.Connection) -> int:
+    with conn.transaction():
+        return _run_market_basket_impl(conn)
+
+
+def _run_market_basket_impl(conn: psycopg.Connection) -> int:
     t0 = time.perf_counter()
     with conn.cursor() as cur:
         cur.execute("""
@@ -535,19 +642,20 @@ def run_market_basket(conn: psycopg.Connection) -> int:
     )
     combined = all_rules + morning_rules
 
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM analytics_basket_rules;")
-        cur.executemany(
-            """
-            INSERT INTO analytics_basket_rules (
-                id, shift_bucket, antecedent_product_id, consequent_product_id,
-                antecedent_name, consequent_name, co_occurrences,
-                support, confidence, lift
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            combined,
-        )
-    conn.commit()
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM analytics_basket_rules;")
+            if combined:
+                cur.executemany(
+                    """
+                    INSERT INTO analytics_basket_rules (
+                        id, shift_bucket, antecedent_product_id, consequent_product_id,
+                        antecedent_name, consequent_name, co_occurrences,
+                        support, confidence, lift
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    combined,
+                )
     print(
         f"[Market Basket] Mined {len(all_rows)} lines -> {len(all_rules)} full-day + {len(morning_rules)} morning rules in {time.perf_counter() - t0:.2f}s"
     )
@@ -629,26 +737,35 @@ def kmeans_missions(
 ) -> tuple[np.ndarray, np.ndarray, float, int]:
     """Standardize features and fit K-Means++ across candidate K values, selecting best Silhouette Score."""
     X_arr = np.asarray(X, dtype=float)
+    if X_arr.ndim != 2 or X_arr.shape[0] == 0 or X_arr.shape[1] == 0:
+        d = X_arr.shape[1] if X_arr.ndim == 2 else 0
+        return np.zeros(0, dtype=int), np.zeros((1, d), dtype=float), 0.0, 1
+    X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
     n, d = X_arr.shape
     if n < 10:
         labels = np.zeros(n, dtype=int)
-        return labels, X_arr.mean(axis=0, keepdims=True) if n > 0 else np.zeros((1, d)), 0.0, 1
+        return labels, X_arr.mean(axis=0, keepdims=True), 0.0, 1
 
     mean = X_arr.mean(axis=0)
-    std = np.where(X_arr.std(axis=0) > 1e-6, X_arr.std(axis=0), 1.0)
+    raw_std = X_arr.std(axis=0)
+    std = np.where(raw_std > 1e-6, raw_std, 1.0)
     X_norm = (X_arr - mean) / std
+    if len(np.unique(np.round(X_norm, 9), axis=0)) < 2:
+        labels = np.zeros(n, dtype=int)
+        return labels, mean.reshape(1, d), 0.0, 1
+
     rng = np.random.default_rng(seed)
 
     best_sil = -1.0
     best_labels = np.zeros(n, dtype=int)
-    best_centroids = np.zeros((1, d), dtype=float)
+    best_centroids = mean.reshape(1, d).copy()
     best_k = 1
 
     for k in k_candidates:
-        if k >= n:
+        if k < 2 or k >= n:
             continue
         for _ in range(4):
-            # k-means++ initialization
+            # k-means++ initialization with zero-distance fallback
             first = int(rng.integers(0, n))
             centers = [X_norm[first].copy()]
             for _c in range(1, k):
@@ -657,8 +774,14 @@ def kmeans_missions(
                     np.sum((X_norm[:, None, :] - c_arr[None, :, :]) ** 2, axis=2),
                     axis=1,
                 )
-                probs = sq_d / max(1e-9, float(sq_d.sum()))
-                nxt = int(rng.choice(n, p=probs))
+                sq_d = np.maximum(0.0, np.nan_to_num(sq_d, nan=0.0, posinf=0.0, neginf=0.0))
+                total_sq = float(sq_d.sum())
+                if total_sq <= 1e-12:
+                    nxt = int(rng.integers(0, n))
+                else:
+                    probs = sq_d / total_sq
+                    probs = probs / float(probs.sum())
+                    nxt = int(rng.choice(n, p=probs))
                 centers.append(X_norm[nxt].copy())
             c_mat = np.vstack(centers)
 
@@ -674,14 +797,16 @@ def kmeans_missions(
                     if np.any(mask):
                         c_mat[j] = X_norm[mask].mean(axis=0)
 
-            sil = _silhouette_score(X_norm, labels)
+            sil = safe_float(_silhouette_score(X_norm, labels), default=0.0, lo=-1.0, hi=1.0)
             if sil > best_sil:
                 best_sil = sil
                 best_labels = labels.copy()
                 best_centroids = c_mat * std + mean
                 best_k = k
 
-    return best_labels, best_centroids, round(float(best_sil), 3), best_k
+    if best_sil < -0.99:
+        best_sil = 0.0
+    return best_labels, np.nan_to_num(best_centroids, nan=0.0, posinf=0.0, neginf=0.0), round(best_sil, 3), best_k
 
 
 def chronological_ridge_attribution(
@@ -697,11 +822,28 @@ def chronological_ridge_attribution(
     evaluate out-of-sample WMAPE vs day-of-week seasonal mean baseline, and rank causal drivers.
     """
     X_arr = np.asarray(X, dtype=float)
-    y_arr = np.asarray(y, dtype=float)
+    y_arr = np.asarray(y, dtype=float).ravel()
+    if X_arr.ndim != 2 or X_arr.shape[0] == 0 or X_arr.shape[1] == 0 or holdout_days <= 0:
+        return {
+            "holdoutWmapePct": 0.0,
+            "baselineWmapePct": 0.0,
+            "r2Train": 0.0,
+            "drivers": [],
+        }
+
+    X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    y_arr = np.nan_to_num(y_arr, nan=0.0, posinf=0.0, neginf=0.0)
     n, d = X_arr.shape
+    if len(y_arr) != n or len(feature_names) < d:
+        return {
+            "holdoutWmapePct": 0.0,
+            "baselineWmapePct": 0.0,
+            "r2Train": 0.0,
+            "drivers": [],
+        }
     labels = feature_labels if feature_labels and len(feature_labels) == d else feature_names
 
-    if n < holdout_days + 10 or y_arr.sum() <= 0:
+    if n < holdout_days + 10 or float(y_arr.sum()) <= 0.0:
         return {
             "holdoutWmapePct": 0.0,
             "baselineWmapePct": 0.0,
@@ -715,53 +857,67 @@ def chronological_ridge_attribution(
 
     # Fit preprocessing strictly on training split
     mu_x = X_tr.mean(axis=0)
-    sd_x = np.where(X_tr.std(axis=0) > 1e-6, X_tr.std(axis=0), 1.0)
+    tr_std = X_tr.std(axis=0)
+    sd_x = np.where(tr_std > 1e-6, tr_std, 1.0)
     X_tr_z = (X_tr - mu_x) / sd_x
     X_te_z = (X_te - mu_x) / sd_x
 
     mu_y = float(y_tr.mean())
     y_tr_c = y_tr - mu_y
 
-    # Closed-form Ridge: (X^T X + lam * I)^-1 X^T y
-    gram = X_tr_z.T @ X_tr_z + lam * np.eye(d, dtype=float)
-    beta = np.linalg.solve(gram, X_tr_z.T @ y_tr_c)
+    # Closed-form Ridge: (X^T X + lam * I)^-1 X^T y with lstsq fallback
+    safe_lam = safe_float(lam, default=2.5, lo=1e-4)
+    gram = X_tr_z.T @ X_tr_z + safe_lam * np.eye(d, dtype=float)
+    rhs = X_tr_z.T @ y_tr_c
+    try:
+        beta = np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        beta, _, _, _ = np.linalg.lstsq(gram, rhs, rcond=None)
+    beta = np.nan_to_num(beta, nan=0.0, posinf=0.0, neginf=0.0)
 
     y_tr_pred = mu_y + X_tr_z @ beta
     y_te_pred = np.maximum(0.0, mu_y + X_te_z @ beta)
 
     ss_res = float(np.sum((y_tr - y_tr_pred) ** 2))
-    ss_tot = max(1e-9, float(np.sum((y_tr - mu_y) ** 2)))
-    r2_train = max(0.0, min(1.0, 1.0 - ss_res / ss_tot))
+    ss_tot = float(np.sum((y_tr - mu_y) ** 2))
+    r2_train = safe_float(1.0 - ss_res / ss_tot, default=0.0, lo=0.0, hi=1.0) if ss_tot > 1e-9 else 0.0
 
-    denom_te = max(1e-9, float(np.sum(np.abs(y_te))))
-    ridge_wmape = float(np.sum(np.abs(y_te - y_te_pred)) / denom_te * 100.0)
+    denom_te = float(np.sum(np.abs(y_te)))
+    if denom_te > 1e-9:
+        ridge_wmape = safe_float(float(np.sum(np.abs(y_te - y_te_pred)) / denom_te * 100.0), lo=0.0, hi=200.0)
+    else:
+        ridge_wmape = 0.0 if float(np.sum(np.abs(y_te_pred))) <= 0.1 else 100.0
 
     # Naive weekday seasonal baseline fit strictly on training window
     dow_means = [
         float(y_tr[i::7].mean()) if len(y_tr[i::7]) > 0 else mu_y for i in range(7)
     ]
     baseline_pred = np.array([dow_means[(split + h) % 7] for h in range(holdout_days)], dtype=float)
-    baseline_wmape = float(np.sum(np.abs(y_te - baseline_pred)) / denom_te * 100.0)
+    if denom_te > 1e-9:
+        baseline_wmape = safe_float(float(np.sum(np.abs(y_te - baseline_pred)) / denom_te * 100.0), lo=0.0, hi=200.0)
+    else:
+        baseline_wmape = 0.0 if float(np.sum(np.abs(baseline_pred))) <= 0.1 else 100.0
 
     abs_beta = np.abs(beta)
-    total_abs = max(1e-9, float(abs_beta.sum()))
+    total_abs = float(abs_beta.sum())
     drivers = []
     for i in range(d):
-        coef_usd = float(beta[i])
+        coef_usd = safe_float(float(beta[i]))
+        imp_pct = safe_float(float(abs_beta[i] / total_abs * 100.0), lo=0.0, hi=100.0) if total_abs > 1e-9 else 0.0
         drivers.append(
             {
                 "feature": feature_names[i],
                 "label": labels[i],
                 "coefUsdPerSd": round(coef_usd, 2),
-                "importancePct": round(float(abs_beta[i] / total_abs * 100.0), 1),
+                "importancePct": round(imp_pct, 1),
                 "direction": "positive" if coef_usd >= 0 else "negative",
             }
         )
     drivers.sort(key=lambda r: r["importancePct"], reverse=True)
 
     return {
-        "holdoutWmapePct": round(min(200.0, ridge_wmape), 1),
-        "baselineWmapePct": round(min(200.0, baseline_wmape), 1),
+        "holdoutWmapePct": round(ridge_wmape, 1),
+        "baselineWmapePct": round(baseline_wmape, 1),
         "r2Train": round(r2_train, 3),
         "drivers": drivers,
     }
@@ -778,23 +934,27 @@ def compute_did_evaluation(
     Compute Difference-in-Differences treatment effect using an intra-store control shift.
     Checks for shared trend removal, bootstrap 95% CI, Welch p-value, and shift cannibalization.
     """
-    pre_t = np.asarray(pre_target, dtype=float)
-    post_t = np.asarray(post_target, dtype=float)
-    pre_c = np.asarray(pre_control, dtype=float)
-    post_c = np.asarray(post_control, dtype=float)
+    pre_t = np.asarray(pre_target, dtype=float).ravel()
+    post_t = np.asarray(post_target, dtype=float).ravel()
+    pre_c = np.asarray(pre_control, dtype=float).ravel()
+    post_c = np.asarray(post_control, dtype=float).ravel()
+    pre_t = pre_t[np.isfinite(pre_t)]
+    post_t = post_t[np.isfinite(post_t)]
+    pre_c = pre_c[np.isfinite(pre_c)]
+    post_c = post_c[np.isfinite(post_c)]
 
-    m_pre_t = float(pre_t.mean()) if len(pre_t) > 0 else 0.0
-    m_post_t = float(post_t.mean()) if len(post_t) > 0 else 0.0
-    m_pre_c = float(pre_c.mean()) if len(pre_c) > 0 else 0.0
-    m_post_c = float(post_c.mean()) if len(post_c) > 0 else 0.0
+    m_pre_t = safe_float(float(pre_t.mean())) if len(pre_t) > 0 else 0.0
+    m_post_t = safe_float(float(post_t.mean())) if len(post_t) > 0 else 0.0
+    m_pre_c = safe_float(float(pre_c.mean())) if len(pre_c) > 0 else 0.0
+    m_post_c = safe_float(float(post_c.mean())) if len(post_c) > 0 else 0.0
 
     delta_t = m_post_t - m_pre_t
     delta_c = m_post_c - m_pre_c
     # Scale control change by pre-period target/control ratio so proportional macro shocks cancel cleanly
-    scale = (m_pre_t / m_pre_c) if m_pre_c > 1e-6 else 1.0
-    did_lift = delta_t - delta_c * scale
-    did_lift_pct = (did_lift / max(1e-6, m_pre_t)) * 100.0 if m_pre_t > 0 else 0.0
-    control_change_pct = (delta_c / max(1e-6, m_pre_c)) * 100.0 if m_pre_c > 0 else 0.0
+    scale = safe_float(m_pre_t / m_pre_c, default=1.0, lo=0.0, hi=100.0) if m_pre_c > 1e-6 else 1.0
+    did_lift = safe_float(delta_t - delta_c * scale)
+    did_lift_pct = safe_float((did_lift / m_pre_t) * 100.0) if m_pre_t > 1e-6 else 0.0
+    control_change_pct = safe_float((delta_c / m_pre_c) * 100.0) if m_pre_c > 1e-6 else 0.0
 
     # Paired/independent bootstrap CI on DiD estimator
     rng = np.random.default_rng(seed)
@@ -806,12 +966,14 @@ def compute_did_evaluation(
             bt_post_t = float(rng.choice(post_t, size=len(post_t), replace=True).mean())
             bt_pre_c = float(rng.choice(pre_c, size=len(pre_c), replace=True).mean())
             bt_post_c = float(rng.choice(post_c, size=len(post_c), replace=True).mean())
-            bt_scale = (bt_pre_t / bt_pre_c) if bt_pre_c > 1e-6 else 1.0
+            bt_scale = safe_float(bt_pre_t / bt_pre_c, default=1.0, lo=0.0, hi=100.0) if bt_pre_c > 1e-6 else 1.0
             lifts[b] = (bt_post_t - bt_pre_t) - (bt_post_c - bt_pre_c) * bt_scale
         ci_lo, ci_hi = np.percentile(lifts, [2.5, 97.5])
-        se = max(1e-9, float(lifts.std(ddof=1)))
+        ci_lo = safe_float(float(ci_lo), default=did_lift)
+        ci_hi = safe_float(float(ci_hi), default=did_lift)
+        se = max(1e-9, safe_float(float(lifts.std(ddof=1)), default=0.0, lo=0.0))
         z_val = abs(did_lift) / se
-        p_val = math.erfc(z_val / math.sqrt(2.0))
+        p_val = safe_float(math.erfc(z_val / math.sqrt(2.0)), default=1.0, lo=0.0, hi=1.0)
     else:
         ci_lo, ci_hi, p_val = did_lift, did_lift, 1.0
 
@@ -830,9 +992,9 @@ def compute_did_evaluation(
         "postControlMeanUsd": round(m_post_c, 2),
         "didLiftUsdPerDay": round(did_lift, 2),
         "didLiftPct": round(did_lift_pct, 2),
-        "ciLowUsd": round(float(ci_lo), 2),
-        "ciHighUsd": round(float(ci_hi), 2),
-        "pValue": round(min(1.0, max(0.0, float(p_val))), 5),
+        "ciLowUsd": round(ci_lo, 2),
+        "ciHighUsd": round(ci_hi, 2),
+        "pValue": round(p_val, 5),
         "controlChangePct": round(control_change_pct, 2),
         "cannibalizationFlag": bool(cannibalized),
         "verdict": verdict,
@@ -840,8 +1002,13 @@ def compute_did_evaluation(
 
 
 def run_shift_diagnostics(conn: psycopg.Connection) -> dict:
+    with conn.transaction():
+        return _run_shift_diagnostics_impl(conn)
+
+
+def _run_shift_diagnostics_impl(conn: psycopg.Connection) -> dict:
     t0 = time.perf_counter()
-    SHIFT_HOURS = {"morning": 4.0, "afternoon": 3.0, "evening": 5.0}
+    SHIFT_HOURS = {"morning": 4.0, "afternoon": 5.0, "evening": 5.0}
     SHIFT_LABELS = {
         "morning": "Morning (08:00-11:59)",
         "afternoon": "Afternoon (12:00-16:59)",
@@ -1430,82 +1597,82 @@ def run_shift_diagnostics(conn: psycopg.Connection) -> dict:
         },
     }
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO analytics_shift_diagnostics (
-                id, window_days, primary_bottleneck, morning_share_pct,
-                morning_conversion_pct, afternoon_conversion_pct, evening_conversion_pct,
-                morning_est_lost_revenue_cents,
-                shift_comparison_json, hourly_profile_json, oos_root_causes_json,
-                queue_saturation_json, driver_attribution_json, shopper_missions_json,
-                recommendations_json, computed_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
-            ON CONFLICT (id) DO UPDATE SET
-                window_days = EXCLUDED.window_days,
-                primary_bottleneck = EXCLUDED.primary_bottleneck,
-                morning_share_pct = EXCLUDED.morning_share_pct,
-                morning_conversion_pct = EXCLUDED.morning_conversion_pct,
-                afternoon_conversion_pct = EXCLUDED.afternoon_conversion_pct,
-                evening_conversion_pct = EXCLUDED.evening_conversion_pct,
-                morning_est_lost_revenue_cents = EXCLUDED.morning_est_lost_revenue_cents,
-                shift_comparison_json = EXCLUDED.shift_comparison_json,
-                hourly_profile_json = EXCLUDED.hourly_profile_json,
-                oos_root_causes_json = EXCLUDED.oos_root_causes_json,
-                queue_saturation_json = EXCLUDED.queue_saturation_json,
-                driver_attribution_json = EXCLUDED.driver_attribution_json,
-                shopper_missions_json = EXCLUDED.shopper_missions_json,
-                recommendations_json = EXCLUDED.recommendations_json,
-                computed_at = now()
-            """,
-            (
-                "latest_60d",
-                60,
-                bottleneck,
-                float(morn_stats.get("revenueSharePct", 0.0)),
-                morn_conv,
-                aft_conv,
-                float(shift_map.get("evening", {}).get("conversionPct", 0.0)),
-                int(total_lost_rev_cents),
-                json.dumps(comparison_payload),
-                json.dumps(hourly_profile),
-                json.dumps(oos_items),
-                json.dumps({"thresholdBin": knee_bin, "bins": queue_curve}),
-                json.dumps(driver_attr),
-                json.dumps(missions_out),
-                json.dumps(recommendations),
-            ),
-        )
-
-        # Evaluate all saved shift DiD experiments
-        cur.execute("""
-            SELECT id::text, target_shift, control_shift, pre_start_date, pre_end_date, post_start_date, post_end_date
-            FROM shift_experiments
-        """)
-        exp_rows = cur.fetchall()
-        for exp_id, t_shift, c_shift, pre_s, pre_e, post_s, post_e in exp_rows:
-            pre_t_arr = np.array(
-                [r[2] / 100.0 for r in daily_by_shift.get(t_shift, []) if str(pre_s) <= r[0] <= str(pre_e)],
-                dtype=float,
-            )
-            post_t_arr = np.array(
-                [r[2] / 100.0 for r in daily_by_shift.get(t_shift, []) if str(post_s) <= r[0] <= str(post_e)],
-                dtype=float,
-            )
-            pre_c_arr = np.array(
-                [r[2] / 100.0 for r in daily_by_shift.get(c_shift, []) if str(pre_s) <= r[0] <= str(pre_e)],
-                dtype=float,
-            )
-            post_c_arr = np.array(
-                [r[2] / 100.0 for r in daily_by_shift.get(c_shift, []) if str(post_s) <= r[0] <= str(post_e)],
-                dtype=float,
-            )
-            did_res = compute_did_evaluation(pre_t_arr, post_t_arr, pre_c_arr, post_c_arr)
+    with conn.transaction():
+        with conn.cursor() as cur:
             cur.execute(
-                "UPDATE shift_experiments SET results_json = %s WHERE id = %s::uuid",
-                (json.dumps(did_res), exp_id),
+                """
+                INSERT INTO analytics_shift_diagnostics (
+                    id, window_days, primary_bottleneck, morning_share_pct,
+                    morning_conversion_pct, afternoon_conversion_pct, evening_conversion_pct,
+                    morning_est_lost_revenue_cents,
+                    shift_comparison_json, hourly_profile_json, oos_root_causes_json,
+                    queue_saturation_json, driver_attribution_json, shopper_missions_json,
+                    recommendations_json, computed_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                ON CONFLICT (id) DO UPDATE SET
+                    window_days = EXCLUDED.window_days,
+                    primary_bottleneck = EXCLUDED.primary_bottleneck,
+                    morning_share_pct = EXCLUDED.morning_share_pct,
+                    morning_conversion_pct = EXCLUDED.morning_conversion_pct,
+                    afternoon_conversion_pct = EXCLUDED.afternoon_conversion_pct,
+                    evening_conversion_pct = EXCLUDED.evening_conversion_pct,
+                    morning_est_lost_revenue_cents = EXCLUDED.morning_est_lost_revenue_cents,
+                    shift_comparison_json = EXCLUDED.shift_comparison_json,
+                    hourly_profile_json = EXCLUDED.hourly_profile_json,
+                    oos_root_causes_json = EXCLUDED.oos_root_causes_json,
+                    queue_saturation_json = EXCLUDED.queue_saturation_json,
+                    driver_attribution_json = EXCLUDED.driver_attribution_json,
+                    shopper_missions_json = EXCLUDED.shopper_missions_json,
+                    recommendations_json = EXCLUDED.recommendations_json,
+                    computed_at = now()
+                """,
+                (
+                    "latest_60d",
+                    60,
+                    bottleneck,
+                    safe_float(morn_stats.get("revenueSharePct", 0.0), lo=0.0, hi=100.0),
+                    safe_float(morn_conv, lo=0.0, hi=100.0),
+                    safe_float(aft_conv, lo=0.0, hi=100.0),
+                    safe_float(shift_map.get("evening", {}).get("conversionPct", 0.0), lo=0.0, hi=100.0),
+                    int(total_lost_rev_cents),
+                    safe_json_dumps(comparison_payload),
+                    safe_json_dumps(hourly_profile),
+                    safe_json_dumps(oos_items),
+                    safe_json_dumps({"thresholdBin": knee_bin, "bins": queue_curve}),
+                    safe_json_dumps(driver_attr),
+                    safe_json_dumps(missions_out),
+                    safe_json_dumps(recommendations),
+                ),
             )
-    conn.commit()
+
+            # Evaluate all saved shift DiD experiments
+            cur.execute("""
+                SELECT id::text, target_shift, control_shift, pre_start_date, pre_end_date, post_start_date, post_end_date
+                FROM shift_experiments
+            """)
+            exp_rows = cur.fetchall()
+            for exp_id, t_shift, c_shift, pre_s, pre_e, post_s, post_e in exp_rows:
+                pre_t_arr = np.array(
+                    [r[2] / 100.0 for r in daily_by_shift.get(t_shift, []) if str(pre_s) <= r[0] <= str(pre_e)],
+                    dtype=float,
+                )
+                post_t_arr = np.array(
+                    [r[2] / 100.0 for r in daily_by_shift.get(t_shift, []) if str(post_s) <= r[0] <= str(post_e)],
+                    dtype=float,
+                )
+                pre_c_arr = np.array(
+                    [r[2] / 100.0 for r in daily_by_shift.get(c_shift, []) if str(pre_s) <= r[0] <= str(pre_e)],
+                    dtype=float,
+                )
+                post_c_arr = np.array(
+                    [r[2] / 100.0 for r in daily_by_shift.get(c_shift, []) if str(post_s) <= r[0] <= str(post_e)],
+                    dtype=float,
+                )
+                did_res = compute_did_evaluation(pre_t_arr, post_t_arr, pre_c_arr, post_c_arr)
+                cur.execute(
+                    "UPDATE shift_experiments SET results_json = %s WHERE id = %s::uuid",
+                    (safe_json_dumps(did_res), exp_id),
+                )
     print(
         f"[Shift Diagnostics] Computed 60d shift funnel, {len(oos_items)} OOS SKUs, Silhouette={missions_out['silhouetteScore']} in {time.perf_counter() - t0:.2f}s"
     )
@@ -1514,52 +1681,53 @@ def run_shift_diagnostics(conn: psycopg.Connection) -> dict:
 
 def run_loss_prevention_anomalies(conn: psycopg.Connection) -> int:
     t0 = time.perf_counter()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                cashier_name,
-                COUNT(*)::int AS total_tx,
-                COUNT(*) FILTER (WHERE kind = 'void')::int AS voids,
-                COUNT(*) FILTER (WHERE kind = 'refund')::int AS refunds
-            FROM sales
-            WHERE sold_at >= now() - interval '60 days'
-            GROUP BY cashier_name
-        """)
-        sales_by_cashier = cur.fetchall()
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    cashier_name,
+                    COUNT(*)::int AS total_tx,
+                    COUNT(*) FILTER (WHERE kind = 'void')::int AS voids,
+                    COUNT(*) FILTER (WHERE kind = 'refund')::int AS refunds
+                FROM sales
+                WHERE sold_at >= now() - interval '60 days'
+                GROUP BY cashier_name
+            """)
+            sales_by_cashier = cur.fetchall()
 
-        cur.execute("""
-            SELECT actor, COUNT(*)::int AS no_sales
-            FROM audit_logs
-            WHERE action = 'no_sale_drawer' AND created_at >= now() - interval '60 days'
-            GROUP BY actor
-        """)
-        no_sale_map = {r[0]: int(r[1]) for r in cur.fetchall()}
+            cur.execute("""
+                SELECT actor, COUNT(*)::int AS no_sales
+                FROM audit_logs
+                WHERE action = 'no_sale_drawer' AND created_at >= now() - interval '60 days'
+                GROUP BY actor
+            """)
+            no_sale_map = {r[0]: int(r[1]) for r in cur.fetchall()}
 
-    if not sales_by_cashier:
-        return 0
+            if not sales_by_cashier:
+                cur.execute("DELETE FROM analytics_lp_anomalies;")
+                return 0
 
-    raw_rows = [
-        (cashier, int(total), int(voids), int(refunds), no_sale_map.get(cashier, 0))
-        for cashier, total, voids, refunds in sales_by_cashier
-    ]
-    scored = score_cashiers_robust(raw_rows)
-    records = [
-        (str(uuid.uuid4()), cashier, total, voids, refunds, no_sales, v_rate, robust_z, risk)
-        for cashier, total, voids, refunds, no_sales, v_rate, robust_z, risk in scored
-    ]
+            raw_rows = [
+                (cashier, int(total), int(voids), int(refunds), no_sale_map.get(cashier, 0))
+                for cashier, total, voids, refunds in sales_by_cashier
+            ]
+            scored = score_cashiers_robust(raw_rows)
+            records = [
+                (str(uuid.uuid4()), cashier, total, voids, refunds, no_sales, v_rate, robust_z, risk)
+                for cashier, total, voids, refunds, no_sales, v_rate, robust_z, risk in scored
+            ]
 
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM analytics_lp_anomalies;")
-        cur.executemany(
-            """
-            INSERT INTO analytics_lp_anomalies (
-                id, cashier_name, total_sales_count, void_count, refund_count,
-                no_sale_drawer_count, void_rate_pct, z_score, risk_level
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            records,
-        )
-    conn.commit()
+            cur.execute("DELETE FROM analytics_lp_anomalies;")
+            if records:
+                cur.executemany(
+                    """
+                    INSERT INTO analytics_lp_anomalies (
+                        id, cashier_name, total_sales_count, void_count, refund_count,
+                        no_sale_drawer_count, void_rate_pct, z_score, risk_level
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    records,
+                )
     print(
         f"[Loss Prevention] Scored {len(records)} cashiers in {time.perf_counter() - t0:.2f}s"
     )
@@ -1573,15 +1741,16 @@ def run_loss_prevention_anomalies(conn: psycopg.Connection) -> int:
 
 def compute_supplier_otif_metrics(deliveries: list[dict], expected_lead_days: int) -> dict:
     """Compute empirical OTIF, cost variance rate, lead-time mean/std, and A-D grade."""
+    safe_expected = max(1, int(safe_float(expected_lead_days, default=3.0, lo=1.0)))
     n = len(deliveries)
-    fallback_std = round(max(0.4, float(expected_lead_days) * 0.25), 2)
+    fallback_std = round(max(0.4, float(safe_expected) * 0.25), 2)
     if n == 0:
         return {
             "on_time_rate_pct": 100.0,
             "in_full_rate_pct": 100.0,
             "otif_rate_pct": 100.0,
             "cost_variance_rate_pct": 0.0,
-            "avg_lead_time_days": float(expected_lead_days),
+            "avg_lead_time_days": float(safe_expected),
             "lead_time_std_days": fallback_std,
             "grade": "B",
         }
@@ -1593,14 +1762,14 @@ def compute_supplier_otif_metrics(deliveries: list[dict], expected_lead_days: in
     lead_samples: list[float] = []
 
     for d in deliveries:
-        lead = max(0.1, float(d.get("lead_days", expected_lead_days)))
+        lead = safe_float(d.get("lead_days", safe_expected), default=float(safe_expected), lo=0.1)
         lead_samples.append(lead)
-        ordered = max(0, int(d.get("ordered_units", 0)))
-        received = max(0, int(d.get("received_units", 0)))
-        po_cost = max(0, int(d.get("po_cost_cents", 0)))
-        inv_cost = max(0, int(d.get("invoice_cost_cents", 0)))
+        ordered = max(0, int(safe_float(d.get("ordered_units", 0), default=0.0, lo=0.0)))
+        received = max(0, int(safe_float(d.get("received_units", 0), default=0.0, lo=0.0)))
+        po_cost = max(0, int(safe_float(d.get("po_cost_cents", 0), default=0.0, lo=0.0)))
+        inv_cost = max(0, int(safe_float(d.get("invoice_cost_cents", 0), default=0.0, lo=0.0)))
 
-        is_on_time = lead <= float(expected_lead_days) + 0.5
+        is_on_time = lead <= float(safe_expected) + 0.5
         is_in_full = received >= ordered if ordered > 0 else True
         if is_on_time:
             on_time_cnt += 1
@@ -1615,9 +1784,9 @@ def compute_supplier_otif_metrics(deliveries: list[dict], expected_lead_days: in
     in_full_pct = round(100.0 * in_full_cnt / n, 1)
     otif_pct = round(100.0 * otif_cnt / n, 1)
     cost_var_pct = round(100.0 * cost_var_cnt / n, 1)
-    avg_lead = round(float(np.mean(lead_samples)), 2)
+    avg_lead = round(safe_float(float(np.mean(lead_samples)), default=float(safe_expected), lo=0.1), 2)
     std_lead = (
-        round(max(0.25, float(np.std(lead_samples, ddof=1))), 2)
+        round(max(0.25, safe_float(float(np.std(lead_samples, ddof=1)), default=fallback_std, lo=0.0)), 2)
         if n >= 2
         else fallback_std
     )
@@ -1652,14 +1821,19 @@ def compute_phantom_prob(
     Posterior anomaly score in [0.0, 0.99] estimating likelihood that positive
     book stock is phantom/shrunk rather than physically on the shelf.
     """
-    if book_stock <= 0 or avg_daily_units <= 0.10:
+    safe_book = int(safe_float(book_stock, default=0.0))
+    safe_avg = safe_float(avg_daily_units, default=0.0, lo=0.0)
+    safe_days = safe_float(days_since_last_sale, default=0.0, lo=0.0)
+    safe_vr = safe_float(void_refund_ratio, default=0.0, lo=0.0, hi=1.0)
+    if safe_book <= 0 or safe_avg <= 0.10:
         return 0.0
-    quiet_days = max(0.0, days_since_last_sale - 1.5)
-    p_zero_sales = 1.0 - math.exp(-avg_daily_units * quiet_days)
-    stock_pressure = min(1.0, float(book_stock) / max(1.0, avg_daily_units * 14.0))
-    void_signal = min(0.25, max(0.0, void_refund_ratio) * 2.0)
+    quiet_days = max(0.0, safe_days - 1.5)
+    exponent = min(50.0, safe_avg * quiet_days)
+    p_zero_sales = 1.0 - math.exp(-exponent)
+    stock_pressure = min(1.0, float(safe_book) / max(1.0, safe_avg * 14.0))
+    void_signal = min(0.25, safe_vr * 2.0)
     raw = p_zero_sales * (0.72 + 0.28 * stock_pressure) + void_signal
-    return round(min(0.99, max(0.0, raw)), 4)
+    return round(safe_float(raw, default=0.0, lo=0.0, hi=0.99), 4)
 
 
 def solve_optimal_markdown(
@@ -1674,23 +1848,37 @@ def solve_optimal_markdown(
     Search discrete clearance discount tiers (10%..50%) using constant-elasticity demand
     lift to maximize cash recovery before batch expiry.
     """
-    days_window = max(1, int(days_left))
-    base_vel = max(0.05, float(avg_daily_units))
-    base_sold = min(qty_remaining, int(round(base_vel * days_window)))
-    baseline_rev = int(base_sold * sell_price_cents)
+    safe_qty = max(0, int(safe_float(qty_remaining, default=0.0, lo=0.0)))
+    days_window = max(1, int(safe_float(days_left, default=1.0, lo=1.0)))
+    base_vel = safe_float(avg_daily_units, default=0.05, lo=0.05)
+    safe_price = max(0, int(safe_float(sell_price_cents, default=0.0, lo=0.0)))
+    safe_cost = max(0, int(safe_float(unit_cost_cents, default=0.0, lo=0.0)))
+    safe_elast = safe_float(elasticity, default=1.8, lo=0.1, hi=6.0)
+
+    if safe_qty == 0 or safe_price == 0:
+        return {
+            "recommended_discount_bp": 1000,
+            "recommended_promo_price_cents": max(1, int(round(safe_price * 0.9))) if safe_price > 0 else 0,
+            "predicted_clearance_units": 0,
+            "expected_recovery_cents": 0,
+            "baseline_no_promo_recovery_cents": 0,
+        }
+
+    base_sold = min(safe_qty, int(round(base_vel * days_window)))
+    baseline_rev = int(base_sold * safe_price)
 
     best: dict | None = None
     for d_bp in (1000, 1500, 2000, 2500, 3000, 4000, 5000):
         frac = d_bp / 10000.0
-        promo_price = max(1, int(round(sell_price_cents * (1.0 - frac))))
+        promo_price = max(1, int(round(safe_price * (1.0 - frac))))
         # Respect deep cost floor when > 2 days remain
-        if days_window > 2 and promo_price < int(round(unit_cost_cents * 0.65)):
+        if days_window > 2 and promo_price < int(round(safe_cost * 0.65)):
             continue
-        lift = min(7.0, (1.0 / max(0.40, 1.0 - frac)) ** elasticity)
-        pred_units = min(qty_remaining, int(round(base_vel * days_window * lift)))
+        lift = min(7.0, (1.0 / max(0.40, 1.0 - frac)) ** safe_elast)
+        pred_units = min(safe_qty, int(round(base_vel * days_window * lift)))
         expected_rev = int(pred_units * promo_price)
         # Small preference for actually moving higher fraction of expiring stock
-        utility = expected_rev + (pred_units * max(1, int(unit_cost_cents * 0.08)))
+        utility = expected_rev + (pred_units * max(1, int(safe_cost * 0.08)))
         if best is None or utility > best["_utility"]:
             best = {
                 "recommended_discount_bp": d_bp,
@@ -1702,7 +1890,7 @@ def solve_optimal_markdown(
             }
 
     if best is None:
-        promo_price = max(1, int(round(sell_price_cents * 0.8)))
+        promo_price = max(1, int(round(safe_price * 0.8)))
         pred_units = base_sold
         return {
             "recommended_discount_bp": 2000,
@@ -1716,13 +1904,16 @@ def solve_optimal_markdown(
 
 
 def score_rfm_segment(recency_days: float, frequency_60d: int, monetary_cents: int) -> str:
-    if recency_days <= 10.0 and frequency_60d >= 4 and monetary_cents >= 10000:
+    safe_recency = safe_float(recency_days, default=90.0, lo=0.0)
+    safe_freq = max(0, int(safe_float(frequency_60d, default=0.0, lo=0.0)))
+    safe_mon = max(0, int(safe_float(monetary_cents, default=0.0, lo=0.0)))
+    if safe_recency <= 10.0 and safe_freq >= 4 and safe_mon >= 10000:
         return "Champions"
-    if recency_days <= 18.0 and frequency_60d >= 3:
+    if safe_recency <= 18.0 and safe_freq >= 3:
         return "Loyal"
-    if 14.0 <= recency_days <= 32.0 and (frequency_60d >= 1 or monetary_cents >= 4000):
+    if 14.0 <= safe_recency <= 32.0 and (safe_freq >= 1 or safe_mon >= 4000):
         return "At-Risk"
-    if recency_days > 32.0:
+    if safe_recency > 32.0:
         return "Hibernating"
     return "New"
 
@@ -1735,259 +1926,272 @@ def recommend_hourly_lanes(
     max_lanes: int = 8,
 ) -> int:
     """Compute queue-safe checkout lanes targeting <=78% utilization."""
-    predicted_tx = max(0.0, float(predicted_entries)) * conversion_rate
-    cap_per_lane = max(5.0, service_rate_per_lane_hr * 0.78)
+    safe_entries = safe_float(predicted_entries, default=0.0, lo=0.0)
+    safe_conv = safe_float(conversion_rate, default=0.72, lo=0.0, hi=1.0)
+    safe_service = safe_float(service_rate_per_lane_hr, default=22.0, lo=1.0)
+    lo_lanes = max(1, int(min_lanes))
+    hi_lanes = max(lo_lanes, int(max_lanes))
+    predicted_tx = safe_entries * safe_conv
+    cap_per_lane = max(5.0, safe_service * 0.78)
     lanes = int(math.ceil(predicted_tx / cap_per_lane))
-    return max(min_lanes, min(max_lanes, lanes))
+    return max(lo_lanes, min(hi_lanes, lanes))
 
 
 def run_supplier_scorecards(conn: psycopg.Connection) -> dict[str, float]:
     t0 = time.perf_counter()
-    with conn.cursor() as cur:
-        cur.execute("SELECT id::text, default_lead_time_days FROM suppliers")
-        sup_rows = cur.fetchall()
-
-        cur.execute("""
-            SELECT
-                gr.supplier_id::text,
-                GREATEST(0.2, EXTRACT(EPOCH FROM (gr.received_at - COALESCE(po.created_at, gr.received_at - interval '3 days'))) / 86400.0)::float AS lead_days,
-                COALESCE(po.total_cases, 0)::int AS ordered_cases,
-                COALESCE(gl_agg.paid_cases, 0)::int AS received_cases,
-                COALESCE(po.estimated_cost_cents, 0)::bigint AS po_cost_cents,
-                gr.total_invoice_cents::bigint AS inv_cost_cents
-            FROM goods_receipts gr
-            LEFT JOIN purchase_orders po ON po.id = gr.po_id
-            LEFT JOIN (
-                SELECT grn_id, SUM(paid_cases)::int AS paid_cases
-                FROM grn_lines
-                GROUP BY grn_id
-            ) gl_agg ON gl_agg.grn_id = gr.id
-            WHERE gr.received_at >= now() - interval '90 days'
-        """)
-        grn_rows = cur.fetchall()
-
-        cur.execute("""
-            SELECT supplier_id::text, COALESCE(SUM(financial_impact_cents), 0)::bigint
-            FROM grn_variances
-            WHERE created_at >= now() - interval '90 days'
-            GROUP BY supplier_id
-        """)
-        var_map = {str(r[0]): int(r[1]) for r in cur.fetchall()}
-
-        cur.execute("""
-            SELECT supplier_id::text, COUNT(*)::int
-            FROM purchase_orders
-            WHERE created_at >= now() - interval '90 days'
-            GROUP BY supplier_id
-        """)
-        po_cnt_map = {str(r[0]): int(r[1]) for r in cur.fetchall()}
-
-    by_sup: dict[str, list[dict]] = defaultdict(list)
-    for sup_id, lead_days, ord_cases, rec_cases, po_cost, inv_cost in grn_rows:
-        by_sup[str(sup_id)].append({
-            "lead_days": float(lead_days),
-            "ordered_units": int(ord_cases),
-            "received_units": int(rec_cases),
-            "po_cost_cents": int(po_cost),
-            "invoice_cost_cents": int(inv_cost),
-        })
-
-    records = []
-    std_map: dict[str, float] = {}
-    for sup_id, default_lead in sup_rows:
-        deliveries = by_sup.get(str(sup_id), [])
-        m = compute_supplier_otif_metrics(deliveries, int(default_lead))
-        std_map[str(sup_id)] = m["lead_time_std_days"]
-        records.append((
-            str(sup_id),
-            po_cnt_map.get(str(sup_id), len(deliveries)),
-            len(deliveries),
-            m["on_time_rate_pct"],
-            m["in_full_rate_pct"],
-            m["otif_rate_pct"],
-            m["cost_variance_rate_pct"],
-            m["avg_lead_time_days"],
-            m["lead_time_std_days"],
-            var_map.get(str(sup_id), 0),
-            m["grade"],
-        ))
-
-    if records:
+    with conn.transaction():
         with conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO analytics_supplier_scorecards (
-                    supplier_id, po_count_90d, grn_count_90d, on_time_rate_pct,
-                    in_full_rate_pct, otif_rate_pct, cost_variance_rate_pct,
-                    avg_lead_time_days, lead_time_std_days, total_variance_cents, grade, computed_at
-                ) VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-                ON CONFLICT (supplier_id) DO UPDATE SET
-                    po_count_90d = EXCLUDED.po_count_90d,
-                    grn_count_90d = EXCLUDED.grn_count_90d,
-                    on_time_rate_pct = EXCLUDED.on_time_rate_pct,
-                    in_full_rate_pct = EXCLUDED.in_full_rate_pct,
-                    otif_rate_pct = EXCLUDED.otif_rate_pct,
-                    cost_variance_rate_pct = EXCLUDED.cost_variance_rate_pct,
-                    avg_lead_time_days = EXCLUDED.avg_lead_time_days,
-                    lead_time_std_days = EXCLUDED.lead_time_std_days,
-                    total_variance_cents = EXCLUDED.total_variance_cents,
-                    grade = EXCLUDED.grade,
-                    computed_at = now()
-                """,
-                records,
+            cur.execute("SELECT id::text, default_lead_time_days FROM suppliers")
+            sup_rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT
+                    gr.supplier_id::text,
+                    GREATEST(0.2, EXTRACT(EPOCH FROM (gr.received_at - COALESCE(po.created_at, gr.received_at - interval '3 days'))) / 86400.0)::float AS lead_days,
+                    COALESCE(po.total_cases, 0)::int AS ordered_cases,
+                    COALESCE(gl_agg.paid_cases, 0)::int AS received_cases,
+                    COALESCE(po.estimated_cost_cents, 0)::bigint AS po_cost_cents,
+                    gr.total_invoice_cents::bigint AS inv_cost_cents
+                FROM goods_receipts gr
+                LEFT JOIN purchase_orders po ON po.id = gr.po_id
+                LEFT JOIN (
+                    SELECT grn_id, SUM(paid_cases)::int AS paid_cases
+                    FROM grn_lines
+                    GROUP BY grn_id
+                ) gl_agg ON gl_agg.grn_id = gr.id
+                WHERE gr.received_at >= now() - interval '90 days'
+            """)
+            grn_rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT supplier_id::text, COALESCE(SUM(financial_impact_cents), 0)::bigint
+                FROM grn_variances
+                WHERE created_at >= now() - interval '90 days'
+                GROUP BY supplier_id
+            """)
+            var_map = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+
+            cur.execute("""
+                SELECT supplier_id::text, COUNT(*)::int
+                FROM purchase_orders
+                WHERE created_at >= now() - interval '90 days'
+                GROUP BY supplier_id
+            """)
+            po_cnt_map = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+
+            by_sup: dict[str, list[dict]] = defaultdict(list)
+            for sup_id, lead_days, ord_cases, rec_cases, po_cost, inv_cost in grn_rows:
+                by_sup[str(sup_id)].append({
+                    "lead_days": safe_float(lead_days, default=3.0, lo=0.1),
+                    "ordered_units": int(ord_cases),
+                    "received_units": int(rec_cases),
+                    "po_cost_cents": int(po_cost),
+                    "invoice_cost_cents": int(inv_cost),
+                })
+
+            records = []
+            std_map: dict[str, float] = {}
+            active_sup_ids = [str(r[0]) for r in sup_rows]
+            for sup_id, default_lead in sup_rows:
+                deliveries = by_sup.get(str(sup_id), [])
+                m = compute_supplier_otif_metrics(deliveries, int(default_lead))
+                std_map[str(sup_id)] = m["lead_time_std_days"]
+                records.append((
+                    str(sup_id),
+                    po_cnt_map.get(str(sup_id), len(deliveries)),
+                    len(deliveries),
+                    m["on_time_rate_pct"],
+                    m["in_full_rate_pct"],
+                    m["otif_rate_pct"],
+                    m["cost_variance_rate_pct"],
+                    m["avg_lead_time_days"],
+                    m["lead_time_std_days"],
+                    var_map.get(str(sup_id), 0),
+                    m["grade"],
+                ))
+
+            if records:
+                cur.executemany(
+                    """
+                    INSERT INTO analytics_supplier_scorecards (
+                        supplier_id, po_count_90d, grn_count_90d, on_time_rate_pct,
+                        in_full_rate_pct, otif_rate_pct, cost_variance_rate_pct,
+                        avg_lead_time_days, lead_time_std_days, total_variance_cents, grade, computed_at
+                    ) VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                    ON CONFLICT (supplier_id) DO UPDATE SET
+                        po_count_90d = EXCLUDED.po_count_90d,
+                        grn_count_90d = EXCLUDED.grn_count_90d,
+                        on_time_rate_pct = EXCLUDED.on_time_rate_pct,
+                        in_full_rate_pct = EXCLUDED.in_full_rate_pct,
+                        otif_rate_pct = EXCLUDED.otif_rate_pct,
+                        cost_variance_rate_pct = EXCLUDED.cost_variance_rate_pct,
+                        avg_lead_time_days = EXCLUDED.avg_lead_time_days,
+                        lead_time_std_days = EXCLUDED.lead_time_std_days,
+                        total_variance_cents = EXCLUDED.total_variance_cents,
+                        grade = EXCLUDED.grade,
+                        computed_at = now()
+                    """,
+                    records,
+                )
+            cur.execute(
+                "DELETE FROM analytics_supplier_scorecards WHERE supplier_id <> ALL(%s::uuid[])",
+                (active_sup_ids,),
             )
-        conn.commit()
     log_event("supplier_scorecards", suppliers=len(records), elapsed_s=round(time.perf_counter() - t0, 2))
     return std_map
 
 
 def run_phantom_and_markdowns(conn: psycopg.Connection) -> tuple[int, int]:
     t0 = time.perf_counter()
-    with conn.cursor() as cur:
-        cur.execute("""
-            WITH unfolded AS (
-                SELECT product_id, COALESCE(SUM(qty_delta), 0)::int AS delta
-                FROM stock_movements
-                WHERE folded = false
-                GROUP BY product_id
-            ),
-            last_sale AS (
-                SELECT sl.product_id, MAX(s.sold_at) AS max_sold_at
-                FROM sale_lines sl
-                JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
-                GROUP BY sl.product_id
-            ),
-            vr AS (
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("""
+                WITH unfolded AS (
+                    SELECT product_id, COALESCE(SUM(qty_delta), 0)::int AS delta
+                    FROM stock_movements
+                    WHERE folded = false
+                    GROUP BY product_id
+                ),
+                last_sale AS (
+                    SELECT sl.product_id, MAX(s.sold_at) AS max_sold_at
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+                    GROUP BY sl.product_id
+                ),
+                vr AS (
+                    SELECT
+                        sl.product_id,
+                        COUNT(*) FILTER (WHERE s.kind <> 'sale')::float / GREATEST(1, COUNT(*))::float AS vr_ratio
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id
+                    WHERE s.sold_at >= now() - interval '60 days'
+                    GROUP BY sl.product_id
+                )
                 SELECT
-                    sl.product_id,
-                    COUNT(*) FILTER (WHERE s.kind <> 'sale')::float / GREATEST(1, COUNT(*))::float AS vr_ratio
-                FROM sale_lines sl
-                JOIN sales s ON s.id = sl.sale_id
-                WHERE s.sold_at >= now() - interval '60 days'
-                GROUP BY sl.product_id
-            )
-            SELECT
-                p.id::text,
-                COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0) AS on_hand,
-                COALESCE(abc.avg_daily_units, 0)::float AS avg_daily_units,
-                COALESCE(EXTRACT(EPOCH FROM (now() - ls.max_sold_at)) / 86400.0, 25.0)::float AS days_since,
-                COALESCE(vr.vr_ratio, 0.0)::float AS vr_ratio,
-                p.avg_cost_cents::bigint
-            FROM products p
-            LEFT JOIN stock_baselines sb ON sb.product_id = p.id
-            LEFT JOIN unfolded u ON u.product_id = p.id
-            LEFT JOIN analytics_abc_xyz abc ON abc.product_id = p.id
-            LEFT JOIN last_sale ls ON ls.product_id = p.id
-            LEFT JOIN vr ON vr.product_id = p.id
-            WHERE p.active = true
-              AND (COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0)) >= 3
-              AND COALESCE(abc.avg_daily_units, 0) >= 0.25
-        """)
-        cand_rows = cur.fetchall()
+                    p.id::text,
+                    COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0) AS on_hand,
+                    COALESCE(abc.avg_daily_units, 0)::float AS avg_daily_units,
+                    COALESCE(EXTRACT(EPOCH FROM (now() - ls.max_sold_at)) / 86400.0, 25.0)::float AS days_since,
+                    COALESCE(vr.vr_ratio, 0.0)::float AS vr_ratio,
+                    p.avg_cost_cents::bigint
+                FROM products p
+                LEFT JOIN stock_baselines sb ON sb.product_id = p.id
+                LEFT JOIN unfolded u ON u.product_id = p.id
+                LEFT JOIN analytics_abc_xyz abc ON abc.product_id = p.id
+                LEFT JOIN last_sale ls ON ls.product_id = p.id
+                LEFT JOIN vr ON vr.product_id = p.id
+                WHERE p.active = true
+                  AND (COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0)) >= 3
+                  AND COALESCE(abc.avg_daily_units, 0) >= 0.25
+            """)
+            cand_rows = cur.fetchall()
 
-    phantom_scored = []
-    for pid, on_hand, avg_d, days_since, vr_ratio, avg_cost in cand_rows:
-        prob = compute_phantom_prob(int(on_hand), float(avg_d), float(days_since), float(vr_ratio))
-        if prob >= 0.25:
-            risk_val = int(int(on_hand) * int(avg_cost) * prob)
-            phantom_scored.append((
-                pid,
-                int(on_hand),
-                round(float(avg_d), 3),
-                round(float(days_since), 1),
-                round(float(vr_ratio), 4),
-                prob,
-                risk_val,
-            ))
-    phantom_scored.sort(key=lambda r: (r[5], r[6]), reverse=True)
-    phantom_scored = phantom_scored[:80]
+            phantom_scored = []
+            for pid, on_hand, avg_d, days_since, vr_ratio, avg_cost in cand_rows:
+                on_hand_i = max(0, int(safe_float(on_hand, default=0.0, lo=0.0)))
+                avg_d_f = safe_float(avg_d, default=0.0, lo=0.0)
+                days_since_f = safe_float(days_since, default=0.0, lo=0.0)
+                vr_ratio_f = safe_float(vr_ratio, default=0.0, lo=0.0, hi=1.0)
+                avg_cost_i = max(0, int(safe_float(avg_cost, default=0.0, lo=0.0)))
+                prob = compute_phantom_prob(on_hand_i, avg_d_f, days_since_f, vr_ratio_f)
+                if prob >= 0.25:
+                    risk_val = int(on_hand_i * avg_cost_i * prob)
+                    phantom_scored.append((
+                        pid,
+                        on_hand_i,
+                        round(avg_d_f, 3),
+                        round(days_since_f, 1),
+                        round(vr_ratio_f, 4),
+                        prob,
+                        risk_val,
+                    ))
+            phantom_scored.sort(key=lambda r: (r[5], r[6]), reverse=True)
+            phantom_scored = phantom_scored[:80]
 
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM analytics_phantom_stock WHERE status = 'open';")
-        if phantom_scored:
-            cur.executemany(
-                """
-                INSERT INTO analytics_phantom_stock (
-                    product_id, book_stock_units, avg_daily_units, days_since_last_sale,
-                    void_refund_score, phantom_prob, estimated_value_at_risk_cents, status, computed_at
-                ) VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,'open', now())
-                ON CONFLICT (product_id) DO UPDATE SET
-                    book_stock_units = EXCLUDED.book_stock_units,
-                    avg_daily_units = EXCLUDED.avg_daily_units,
-                    days_since_last_sale = EXCLUDED.days_since_last_sale,
-                    void_refund_score = EXCLUDED.void_refund_score,
-                    phantom_prob = EXCLUDED.phantom_prob,
-                    estimated_value_at_risk_cents = EXCLUDED.estimated_value_at_risk_cents,
-                    computed_at = now()
-                """,
-                phantom_scored,
-            )
+            cur.execute("DELETE FROM analytics_phantom_stock WHERE status = 'open';")
+            if phantom_scored:
+                cur.executemany(
+                    """
+                    INSERT INTO analytics_phantom_stock (
+                        product_id, book_stock_units, avg_daily_units, days_since_last_sale,
+                        void_refund_score, phantom_prob, estimated_value_at_risk_cents, status, computed_at
+                    ) VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,'open', now())
+                    ON CONFLICT (product_id) DO UPDATE SET
+                        book_stock_units = EXCLUDED.book_stock_units,
+                        avg_daily_units = EXCLUDED.avg_daily_units,
+                        days_since_last_sale = EXCLUDED.days_since_last_sale,
+                        void_refund_score = EXCLUDED.void_refund_score,
+                        phantom_prob = EXCLUDED.phantom_prob,
+                        estimated_value_at_risk_cents = EXCLUDED.estimated_value_at_risk_cents,
+                        computed_at = now()
+                    """,
+                    phantom_scored,
+                )
 
-        # Near-expiry active/clearance batches within next 21 days
-        cur.execute("""
-            SELECT
-                ib.id::text,
-                ib.product_id::text,
-                GREATEST(1, (ib.best_before_date - CURRENT_DATE)::int) AS days_left,
-                ib.qty_remaining,
-                pb.sell_price_cents::bigint,
-                ib.unit_cost_cents::bigint,
-                COALESCE(abc.avg_daily_units, 0.4)::float AS avg_daily_units
-            FROM inventory_batches ib
-            JOIN product_barcodes pb ON pb.product_id = ib.product_id AND pb.is_primary = true
-            LEFT JOIN analytics_abc_xyz abc ON abc.product_id = ib.product_id
-            WHERE ib.status IN ('active', 'clearance')
-              AND ib.qty_remaining > 0
-              AND ib.best_before_date <= CURRENT_DATE + interval '21 days'
-            ORDER BY ib.best_before_date ASC
-            LIMIT 120
-        """)
-        exp_rows = cur.fetchall()
+            # Near-expiry active/clearance batches within next 21 days
+            cur.execute("""
+                SELECT
+                    ib.id::text,
+                    ib.product_id::text,
+                    GREATEST(1, (ib.best_before_date - CURRENT_DATE)::int) AS days_left,
+                    ib.qty_remaining,
+                    pb.sell_price_cents::bigint,
+                    ib.unit_cost_cents::bigint,
+                    COALESCE(abc.avg_daily_units, 0.4)::float AS avg_daily_units
+                FROM inventory_batches ib
+                JOIN product_barcodes pb ON pb.product_id = ib.product_id AND pb.is_primary = true
+                LEFT JOIN analytics_abc_xyz abc ON abc.product_id = ib.product_id
+                WHERE ib.status IN ('active', 'clearance')
+                  AND ib.qty_remaining > 0
+                  AND ib.best_before_date <= CURRENT_DATE + interval '21 days'
+                ORDER BY ib.best_before_date ASC
+                LIMIT 120
+            """)
+            exp_rows = cur.fetchall()
 
-        md_records = []
-        for batch_id, pid, days_left, qty_rem, sell_cents, unit_cost, avg_d in exp_rows:
-            sol = solve_optimal_markdown(
-                int(qty_rem), int(days_left), float(avg_d), int(sell_cents), int(unit_cost)
-            )
-            md_records.append((
-                batch_id,
-                pid,
-                int(days_left),
-                int(qty_rem),
-                int(sell_cents),
-                int(unit_cost),
-                sol["recommended_discount_bp"],
-                sol["recommended_promo_price_cents"],
-                sol["predicted_clearance_units"],
-                sol["expected_recovery_cents"],
-                sol["baseline_no_promo_recovery_cents"],
-            ))
+            md_records = []
+            for batch_id, pid, days_left, qty_rem, sell_cents, unit_cost, avg_d in exp_rows:
+                sol = solve_optimal_markdown(
+                    int(qty_rem), int(days_left), safe_float(avg_d, default=0.4, lo=0.05), int(sell_cents), int(unit_cost)
+                )
+                md_records.append((
+                    batch_id,
+                    pid,
+                    int(days_left),
+                    int(qty_rem),
+                    int(sell_cents),
+                    int(unit_cost),
+                    sol["recommended_discount_bp"],
+                    sol["recommended_promo_price_cents"],
+                    sol["predicted_clearance_units"],
+                    sol["expected_recovery_cents"],
+                    sol["baseline_no_promo_recovery_cents"],
+                ))
 
-        cur.execute("DELETE FROM analytics_dynamic_markdowns WHERE status = 'recommended';")
-        if md_records:
-            cur.executemany(
-                """
-                INSERT INTO analytics_dynamic_markdowns (
-                    batch_id, product_id, days_left, qty_remaining,
-                    current_sell_price_cents, unit_cost_cents,
-                    recommended_discount_bp, recommended_promo_price_cents,
-                    predicted_clearance_units, expected_recovery_cents,
-                    baseline_no_promo_recovery_cents, status, computed_at
-                ) VALUES (%s::uuid,%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,'recommended', now())
-                ON CONFLICT (batch_id) DO UPDATE SET
-                    days_left = EXCLUDED.days_left,
-                    qty_remaining = EXCLUDED.qty_remaining,
-                    current_sell_price_cents = EXCLUDED.current_sell_price_cents,
-                    recommended_discount_bp = EXCLUDED.recommended_discount_bp,
-                    recommended_promo_price_cents = EXCLUDED.recommended_promo_price_cents,
-                    predicted_clearance_units = EXCLUDED.predicted_clearance_units,
-                    expected_recovery_cents = EXCLUDED.expected_recovery_cents,
-                    baseline_no_promo_recovery_cents = EXCLUDED.baseline_no_promo_recovery_cents,
-                    computed_at = now()
-                """,
-                md_records,
-            )
-    conn.commit()
+            cur.execute("DELETE FROM analytics_dynamic_markdowns WHERE status = 'recommended';")
+            if md_records:
+                cur.executemany(
+                    """
+                    INSERT INTO analytics_dynamic_markdowns (
+                        batch_id, product_id, days_left, qty_remaining,
+                        current_sell_price_cents, unit_cost_cents,
+                        recommended_discount_bp, recommended_promo_price_cents,
+                        predicted_clearance_units, expected_recovery_cents,
+                        baseline_no_promo_recovery_cents, status, computed_at
+                    ) VALUES (%s::uuid,%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,'recommended', now())
+                    ON CONFLICT (batch_id) DO UPDATE SET
+                        days_left = EXCLUDED.days_left,
+                        qty_remaining = EXCLUDED.qty_remaining,
+                        current_sell_price_cents = EXCLUDED.current_sell_price_cents,
+                        recommended_discount_bp = EXCLUDED.recommended_discount_bp,
+                        recommended_promo_price_cents = EXCLUDED.recommended_promo_price_cents,
+                        predicted_clearance_units = EXCLUDED.predicted_clearance_units,
+                        expected_recovery_cents = EXCLUDED.expected_recovery_cents,
+                        baseline_no_promo_recovery_cents = EXCLUDED.baseline_no_promo_recovery_cents,
+                        computed_at = now()
+                    """,
+                    md_records,
+                )
     log_event(
         "phantom_and_markdowns",
         phantom_flagged=len(phantom_scored),
@@ -1999,148 +2203,153 @@ def run_phantom_and_markdowns(conn: psycopg.Connection) -> tuple[int, int]:
 
 def run_loyalty_staffing_and_tasks(conn: psycopg.Connection) -> tuple[int, int, int]:
     t0 = time.perf_counter()
-    with conn.cursor() as cur:
-        # 1. Customer RFM Segmentation
-        cur.execute("""
-            SELECT
-                c.id::text,
-                COALESCE(EXTRACT(EPOCH FROM (now() - MAX(s.sold_at))) / 86400.0, 90.0)::float AS recency_days,
-                COUNT(s.id) FILTER (WHERE s.sold_at >= now() - interval '60 days')::int AS freq_60d,
-                COALESCE(SUM(s.total_cents), c.lifetime_spend_cents)::bigint AS monetary_cents,
-                MAX(s.sold_at) AS latest_visit
-            FROM customers c
-            LEFT JOIN sales s ON s.customer_id = c.id AND s.kind = 'sale'
-            GROUP BY c.id, c.lifetime_spend_cents
-        """)
-        cust_rows = cur.fetchall()
-        rfm_updates = []
-        for cid, rec_days, freq, mon_cents, latest_visit in cust_rows:
-            seg = score_rfm_segment(float(rec_days), int(freq), int(mon_cents))
-            rfm_updates.append((seg, int(freq), int(mon_cents), latest_visit, cid))
-
-        if rfm_updates:
-            cur.executemany(
-                """
-                UPDATE customers
-                SET rfm_segment = %s,
-                    visits_60d = %s,
-                    lifetime_spend_cents = %s,
-                    last_visit_at = COALESCE(%s, last_visit_at)
-                WHERE id = %s::uuid
-                """,
-                rfm_updates,
-            )
-
-        # 2. Hourly Staffing Planner (Today + Tomorrow based on trailing footfall by hour)
-        cur.execute("""
-            SELECT
-                EXTRACT(HOUR FROM bucket_start)::int AS hr,
-                (SUM(entries) / GREATEST(1, COUNT(DISTINCT DATE(bucket_start))))::float AS avg_entries_hr
-            FROM store_footfall
-            WHERE bucket_start >= CURRENT_DATE - interval '28 days'
-              AND EXTRACT(HOUR FROM bucket_start) BETWEEN 8 AND 21
-            GROUP BY EXTRACT(HOUR FROM bucket_start)
-            ORDER BY hr
-        """)
-        hr_footfall = {int(r[0]): float(r[1]) for r in cur.fetchall()}
-
-        cur.execute("SELECT current_setting('TIMEZONE'), CURRENT_DATE::text, (CURRENT_DATE + 1)::text")
-        _, today_str, tomorrow_str = cur.fetchone()
-
-        roster_records = []
-        for target_date in (today_str, tomorrow_str):
-            for hr in range(8, 22):
-                pred_entries = round(hr_footfall.get(hr, 28.0 if 10 <= hr <= 20 else 16.0), 1)
-                pred_tx = round(pred_entries * 0.72, 1)
-                lanes = recommend_hourly_lanes(pred_entries)
-                bucket = "morning" if hr < 12 else ("afternoon" if hr < 17 else "evening")
-                roster_records.append((target_date, hr, bucket, pred_entries, pred_tx, lanes))
-
-        if roster_records:
-            cur.executemany(
-                """
-                INSERT INTO shift_rosters (
-                    plan_date, hour, shift_bucket, predicted_entries, predicted_transactions, recommended_lanes
-                ) VALUES (%s::date,%s,%s,%s,%s,%s)
-                ON CONFLICT (plan_date, hour) DO UPDATE SET
-                    shift_bucket = EXCLUDED.shift_bucket,
-                    predicted_entries = EXCLUDED.predicted_entries,
-                    predicted_transactions = EXCLUDED.predicted_transactions,
-                    recommended_lanes = EXCLUDED.recommended_lanes
-                """,
-                roster_records,
-            )
-
-        # 3. Today's Store Tasks Checklist (restock, cycle_count, expiry_markdown, shelf_tag)
-        cur.execute("SELECT COUNT(*)::int FROM store_tasks WHERE task_date = CURRENT_DATE")
-        existing_tasks = int(cur.fetchone()[0])
-        tasks_inserted = 0
-        if existing_tasks == 0:
-            task_rows = []
+    with conn.transaction():
+        with conn.cursor() as cur:
+            # 1. Customer RFM Segmentation
             cur.execute("""
-                SELECT p.id::text, p.name, p.aisle_location, df.safety_stock_units, df.current_stock_units
-                FROM analytics_demand_forecasts df
-                JOIN products p ON p.id = df.product_id
-                WHERE df.urgency IN ('critical', 'reorder_now')
-                ORDER BY df.current_stock_units ASC
-                LIMIT 6
+                SELECT
+                    c.id::text,
+                    COALESCE(EXTRACT(EPOCH FROM (now() - MAX(s.sold_at))) / 86400.0, 90.0)::float AS recency_days,
+                    COUNT(s.id) FILTER (WHERE s.sold_at >= now() - interval '60 days')::int AS freq_60d,
+                    COALESCE(SUM(s.total_cents), c.lifetime_spend_cents)::bigint AS monetary_cents,
+                    MAX(s.sold_at) AS latest_visit
+                FROM customers c
+                LEFT JOIN sales s ON s.customer_id = c.id AND s.kind = 'sale'
+                GROUP BY c.id, c.lifetime_spend_cents
             """)
-            for pid, name, aisle, safety, cur_stock in cur.fetchall():
-                qty_needed = max(6, int(safety) - int(cur_stock))
-                task_rows.append((
-                    today_str, "morning", "restock", 1,
-                    f"Pre-open replenish: {name}", aisle, pid, qty_needed
-                ))
+            cust_rows = cur.fetchall()
+            rfm_updates = []
+            for cid, rec_days, freq, mon_cents, latest_visit in cust_rows:
+                seg = score_rfm_segment(safe_float(rec_days, default=90.0, lo=0.0), int(freq), int(mon_cents))
+                rfm_updates.append((seg, int(freq), int(mon_cents), latest_visit, cid))
 
-            cur.execute("""
-                SELECT p.id::text, p.name, p.aisle_location, ps.book_stock_units
-                FROM analytics_phantom_stock ps
-                JOIN products p ON p.id = ps.product_id
-                WHERE ps.status = 'open'
-                ORDER BY ps.phantom_prob DESC
-                LIMIT 4
-            """)
-            for pid, name, aisle, book in cur.fetchall():
-                task_rows.append((
-                    today_str, "morning", "cycle_count", 1,
-                    f"Blind physical count: {name} (book={book})", aisle, pid, int(book)
-                ))
-
-            cur.execute("""
-                SELECT p.id::text, p.name, p.aisle_location, dm.qty_remaining, dm.recommended_discount_bp
-                FROM analytics_dynamic_markdowns dm
-                JOIN products p ON p.id = dm.product_id
-                WHERE dm.status = 'recommended'
-                ORDER BY dm.days_left ASC
-                LIMIT 4
-            """)
-            for pid, name, aisle, qty_rem, disc_bp in cur.fetchall():
-                task_rows.append((
-                    today_str, "afternoon", "expiry_markdown", 2,
-                    f"Apply {disc_bp // 100}% markdown sticker: {name}", aisle, pid, int(qty_rem)
-                ))
-
-            cur.execute("SELECT COUNT(*)::int FROM shelf_tag_queue WHERE status = 'pending'")
-            pending_tags = int(cur.fetchone()[0])
-            if pending_tags > 0:
-                task_rows.append((
-                    today_str, "morning", "shelf_tag", 1,
-                    f"Walk aisles & hang {pending_tags} queued 07:30 shelf tags", "ALL", None, pending_tags
-                ))
-
-            if task_rows:
+            if rfm_updates:
                 cur.executemany(
                     """
-                    INSERT INTO store_tasks (
-                        task_date, shift_bucket, task_type, priority,
-                        title, aisle_location, product_id, target_qty
-                    ) VALUES (%s::date,%s,%s,%s,%s,%s,%s::uuid,%s)
+                    UPDATE customers
+                    SET rfm_segment = %s,
+                        visits_60d = %s,
+                        lifetime_spend_cents = %s,
+                        last_visit_at = COALESCE(%s, last_visit_at)
+                    WHERE id = %s::uuid
                     """,
-                    task_rows,
+                    rfm_updates,
                 )
-                tasks_inserted = len(task_rows)
 
-    conn.commit()
+            # 2. Hourly Staffing Planner (Today + Tomorrow based on trailing footfall by hour)
+            cur.execute("""
+                SELECT
+                    EXTRACT(HOUR FROM bucket_start)::int AS hr,
+                    (SUM(entries) / GREATEST(1, COUNT(DISTINCT DATE(bucket_start))))::float AS avg_entries_hr
+                FROM store_footfall
+                WHERE bucket_start >= CURRENT_DATE - interval '28 days'
+                  AND EXTRACT(HOUR FROM bucket_start) BETWEEN 8 AND 21
+                GROUP BY EXTRACT(HOUR FROM bucket_start)
+                ORDER BY hr
+            """)
+            hr_footfall = {int(r[0]): safe_float(r[1], default=20.0, lo=0.0) for r in cur.fetchall()}
+
+            cur.execute("SELECT current_setting('TIMEZONE'), CURRENT_DATE::text, (CURRENT_DATE + 1)::text")
+            tz_row = cur.fetchone()
+            if tz_row is None:
+                return len(rfm_updates), 0, 0
+            _, today_str, tomorrow_str = tz_row
+
+            roster_records = []
+            for target_date in (today_str, tomorrow_str):
+                for hr in range(8, 22):
+                    pred_entries = round(hr_footfall.get(hr, 28.0 if 10 <= hr <= 20 else 16.0), 1)
+                    pred_tx = round(pred_entries * 0.72, 1)
+                    lanes = recommend_hourly_lanes(pred_entries)
+                    bucket = "morning" if hr < 12 else ("afternoon" if hr < 17 else "evening")
+                    roster_records.append((target_date, hr, bucket, pred_entries, pred_tx, lanes))
+
+            if roster_records:
+                cur.executemany(
+                    """
+                    INSERT INTO shift_rosters (
+                        plan_date, hour, shift_bucket, predicted_entries, predicted_transactions, recommended_lanes
+                    ) VALUES (%s::date,%s,%s,%s,%s,%s)
+                    ON CONFLICT (plan_date, hour) DO UPDATE SET
+                        shift_bucket = EXCLUDED.shift_bucket,
+                        predicted_entries = EXCLUDED.predicted_entries,
+                        predicted_transactions = EXCLUDED.predicted_transactions,
+                        recommended_lanes = EXCLUDED.recommended_lanes
+                    """,
+                    roster_records,
+                )
+
+            # 3. Today's Store Tasks Checklist (restock, cycle_count, expiry_markdown, shelf_tag)
+            cur.execute("SELECT COUNT(*)::int FROM store_tasks WHERE task_date = CURRENT_DATE")
+            cnt_row = cur.fetchone()
+            existing_tasks = int(cnt_row[0]) if cnt_row else 0
+            tasks_inserted = 0
+            if existing_tasks == 0:
+                task_rows = []
+                cur.execute("""
+                    SELECT p.id::text, p.name, p.aisle_location, df.safety_stock_units, df.current_stock_units
+                    FROM analytics_demand_forecasts df
+                    JOIN products p ON p.id = df.product_id
+                    WHERE df.urgency IN ('critical', 'reorder_now')
+                    ORDER BY df.current_stock_units ASC
+                    LIMIT 6
+                """)
+                for pid, name, aisle, safety, cur_stock in cur.fetchall():
+                    qty_needed = max(6, int(safety) - int(cur_stock))
+                    task_rows.append((
+                        today_str, "morning", "restock", 1,
+                        f"Pre-open replenish: {name}", aisle, pid, qty_needed
+                    ))
+
+                cur.execute("""
+                    SELECT p.id::text, p.name, p.aisle_location, ps.book_stock_units
+                    FROM analytics_phantom_stock ps
+                    JOIN products p ON p.id = ps.product_id
+                    WHERE ps.status = 'open'
+                    ORDER BY ps.phantom_prob DESC
+                    LIMIT 4
+                """)
+                for pid, name, aisle, book in cur.fetchall():
+                    task_rows.append((
+                        today_str, "morning", "cycle_count", 1,
+                        f"Blind physical count: {name} (book={book})", aisle, pid, int(book)
+                    ))
+
+                cur.execute("""
+                    SELECT p.id::text, p.name, p.aisle_location, dm.qty_remaining, dm.recommended_discount_bp
+                    FROM analytics_dynamic_markdowns dm
+                    JOIN products p ON p.id = dm.product_id
+                    WHERE dm.status = 'recommended'
+                    ORDER BY dm.days_left ASC
+                    LIMIT 4
+                """)
+                for pid, name, aisle, qty_rem, disc_bp in cur.fetchall():
+                    task_rows.append((
+                        today_str, "afternoon", "expiry_markdown", 2,
+                        f"Apply {disc_bp // 100}% markdown sticker: {name}", aisle, pid, int(qty_rem)
+                    ))
+
+                cur.execute("SELECT COUNT(*)::int FROM shelf_tag_queue WHERE status = 'pending'")
+                tag_row = cur.fetchone()
+                pending_tags = int(tag_row[0]) if tag_row else 0
+                if pending_tags > 0:
+                    task_rows.append((
+                        today_str, "morning", "shelf_tag", 1,
+                        f"Walk aisles & hang {pending_tags} queued 07:30 shelf tags", "ALL", None, pending_tags
+                    ))
+
+                if task_rows:
+                    cur.executemany(
+                        """
+                        INSERT INTO store_tasks (
+                            task_date, shift_bucket, task_type, priority,
+                            title, aisle_location, product_id, target_qty
+                        ) VALUES (%s::date,%s,%s,%s,%s,%s,%s::uuid,%s)
+                        """,
+                        task_rows,
+                    )
+                    tasks_inserted = len(task_rows)
+
     log_event(
         "loyalty_staffing_tasks",
         customers_scored=len(rfm_updates),
@@ -2151,18 +2360,530 @@ def run_loyalty_staffing_and_tasks(conn: psycopg.Connection) -> tuple[int, int, 
     return len(rfm_updates), len(roster_records), tasks_inserted
 
 
-def main() -> None:
+# ============================================================================
+# 8. WAVE 2: PROMOTION ROI ATTRIBUTION & 12-CHECK DATA-QUALITY CONTRACTS
+# ============================================================================
+
+
+def compute_promo_roi_metrics(
+    discounted_units: int,
+    discounted_revenue_cents: int,
+    discounted_tax_cents: int,
+    discounted_cogs_cents: int,
+    discount_given_cents: int,
+    promo_active_days: int,
+    baseline_units: int,
+    baseline_days: int,
+) -> dict[str, float | int | str]:
+    """Pure, finite-safe Promotion ROI & Margin Attribution calculator.
+
+    Compares discounted promo daily velocity against non-discounted baseline daily velocity
+    and estimates net profit delta after discount giveaway.
+    """
+    d_units = max(0, int(safe_float(discounted_units, 0.0, lo=0.0)))
+    d_rev = max(0, int(safe_float(discounted_revenue_cents, 0.0, lo=0.0)))
+    d_tax = max(0, int(safe_float(discounted_tax_cents, 0.0, lo=0.0)))
+    d_cogs = max(0, int(safe_float(discounted_cogs_cents, 0.0, lo=0.0)))
+    d_disc = max(0, int(safe_float(discount_given_cents, 0.0, lo=0.0)))
+    p_days = max(1, int(safe_float(promo_active_days, 1.0, lo=1.0)))
+    b_units = max(0, int(safe_float(baseline_units, 0.0, lo=0.0)))
+    b_days = max(1, int(safe_float(baseline_days, 1.0, lo=1.0)))
+
+    promo_daily = safe_float(d_units / p_days, 0.0, lo=0.0)
+    baseline_daily = safe_float(b_units / b_days, 0.0, lo=0.0)
+
+    if baseline_daily > 1e-6:
+        velocity_lift_pct = safe_float(
+            ((promo_daily - baseline_daily) / baseline_daily) * 100.0,
+            default=0.0,
+            lo=-100.0,
+            hi=500.0,
+        )
+    else:
+        velocity_lift_pct = 0.0 if d_units == 0 else 100.0
+
+    net_rev_cents = max(0, d_rev - d_tax)
+    gross_profit_cents = net_rev_cents - d_cogs
+    net_margin_bp = (
+        int(round((gross_profit_cents / net_rev_cents) * 10000.0))
+        if net_rev_cents > 0
+        else 0
+    )
+    net_margin_bp = max(-10000, min(10000, net_margin_bp))
+
+    # Pre-discount gross profit per unit * incremental lifted units minus discount given
+    if d_units > 0:
+        unit_pre_disc_profit = max(
+            0.0, ((net_rev_cents + d_disc) - d_cogs) / float(d_units)
+        )
+        incremental_units = max(0.0, promo_daily - baseline_daily) * float(p_days)
+        est_profit_delta_cents = int(
+            round(incremental_units * unit_pre_disc_profit - float(d_disc))
+        )
+    else:
+        est_profit_delta_cents = 0
+
+    if d_units < 5:
+        verdict = "insufficient_data"
+    elif est_profit_delta_cents > 0 and net_margin_bp >= 800:
+        verdict = "profit_accretive"
+    elif est_profit_delta_cents >= -500 and net_margin_bp >= 500:
+        verdict = "margin_neutral"
+    else:
+        verdict = "margin_dilutive"
+
+    return {
+        "discounted_units_60d": d_units,
+        "discounted_revenue_cents": d_rev,
+        "discount_given_cents": d_disc,
+        "baseline_daily_units": round(baseline_daily, 2),
+        "promo_daily_units": round(promo_daily, 2),
+        "velocity_lift_pct": round(velocity_lift_pct, 1),
+        "net_margin_bp": net_margin_bp,
+        "estimated_profit_delta_cents": est_profit_delta_cents,
+        "verdict": verdict,
+    }
+
+
+def run_promo_roi_attribution(conn: psycopg.Connection) -> int:
+    t0 = time.perf_counter()
+    records = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id::text, name, promo_type, rules_json, daypart_start_hour, daypart_end_hour
+            FROM promotions
+            ORDER BY priority ASC, name ASC
+        """)
+        promos = cur.fetchall()
+
+        for pid, name, promo_type, rules_raw, dp_start, dp_end in promos:
+            rules = rules_raw if isinstance(rules_raw, dict) else {}
+            prod_ids = [str(x) for x in (rules.get("productIds") or []) if x]
+            cat_ids = [str(x) for x in (rules.get("categoryIds") or []) if x]
+
+            dp_clause = ""
+            dp_params: list[object] = []
+            if dp_start is not None and dp_end is not None:
+                dp_clause = " AND EXTRACT(HOUR FROM s.sold_at) >= %s AND EXTRACT(HOUR FROM s.sold_at) < %s"
+                dp_params = [int(dp_start), int(dp_end)]
+
+            if prod_ids:
+                cur.execute(
+                    f"""
+                    SELECT
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::int,
+                      COALESCE(SUM(sl.line_total_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.tax_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.discount_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents > 0))::int,
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents = 0), 0)::int,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents = 0))::int
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+                    WHERE s.sold_at >= CURRENT_DATE - interval '60 days'
+                      AND sl.product_id = ANY(%s::uuid[])
+                      {dp_clause}
+                    """,
+                    [prod_ids, *dp_params],
+                )
+            elif cat_ids:
+                cur.execute(
+                    f"""
+                    SELECT
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::int,
+                      COALESCE(SUM(sl.line_total_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.tax_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      COALESCE(SUM(sl.discount_cents) FILTER (WHERE sl.discount_cents > 0), 0)::bigint,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents > 0))::int,
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE sl.discount_cents = 0), 0)::int,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE sl.discount_cents = 0))::int
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+                    JOIN products p ON p.id = sl.product_id
+                    WHERE s.sold_at >= CURRENT_DATE - interval '60 days'
+                      AND p.category_id = ANY(%s::uuid[])
+                      {dp_clause}
+                    """,
+                    [cat_ids, *dp_params],
+                )
+            else:
+                min_basket = int(safe_float(rules.get("minBasketCents", 0), 0.0, lo=0.0))
+                cur.execute(
+                    f"""
+                    SELECT
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::int,
+                      COALESCE(SUM(sl.line_total_cents) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      COALESCE(SUM(sl.tax_cents) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      COALESCE(SUM(sl.discount_cents) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s), 0)::bigint,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE s.discount_cents > 0 AND s.subtotal_cents >= %s))::int,
+                      COALESCE(SUM(sl.base_units_sold) FILTER (WHERE s.discount_cents = 0 AND s.subtotal_cents >= %s), 0)::int,
+                      GREATEST(1, COUNT(DISTINCT DATE(s.sold_at)) FILTER (WHERE s.discount_cents = 0 AND s.subtotal_cents >= %s))::int
+                    FROM sale_lines sl
+                    JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+                    WHERE s.sold_at >= CURRENT_DATE - interval '60 days'
+                      {dp_clause}
+                    """,
+                    [min_basket] * 8 + dp_params,
+                )
+
+            row = cur.fetchone() or (0, 0, 0, 0, 0, 1, 0, 1)
+            metrics = compute_promo_roi_metrics(
+                discounted_units=int(row[0]),
+                discounted_revenue_cents=int(row[1]),
+                discounted_tax_cents=int(row[2]),
+                discounted_cogs_cents=int(row[3]),
+                discount_given_cents=int(row[4]),
+                promo_active_days=int(row[5]),
+                baseline_units=int(row[6]),
+                baseline_days=int(row[7]),
+            )
+            records.append((
+                pid,
+                name,
+                promo_type,
+                metrics["discounted_units_60d"],
+                metrics["discounted_revenue_cents"],
+                metrics["discount_given_cents"],
+                metrics["baseline_daily_units"],
+                metrics["promo_daily_units"],
+                metrics["velocity_lift_pct"],
+                metrics["net_margin_bp"],
+                metrics["estimated_profit_delta_cents"],
+                metrics["verdict"],
+            ))
+
+        cur.execute("DELETE FROM analytics_promo_roi")
+        if records:
+            cur.executemany(
+                """
+                INSERT INTO analytics_promo_roi (
+                  promotion_id, promotion_name, promo_type,
+                  discounted_units_60d, discounted_revenue_cents, discount_given_cents,
+                  baseline_daily_units, promo_daily_units, velocity_lift_pct,
+                  net_margin_bp, estimated_profit_delta_cents, verdict
+                ) VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                records,
+            )
+
+    log_event(
+        "promo_roi_attribution",
+        promotions_scored=len(records),
+        elapsed_s=round(time.perf_counter() - t0, 2),
+    )
+    return len(records)
+
+
+def evaluate_data_quality_contracts(snapshot: dict[str, int]) -> tuple[bool, list[dict[str, object]]]:
+    """Pure 12-check ML pipeline data-quality contract evaluator."""
+    checks: list[dict[str, object]] = [
+        {
+            "name": "abc_xyz_non_empty",
+            "passed": snapshot.get("abc_xyz_count", 0) > 0,
+            "observed": snapshot.get("abc_xyz_count", 0),
+            "expected": "> 0 SKUs segmented",
+        },
+        {
+            "name": "abc_xyz_valid_classes",
+            "passed": snapshot.get("abc_xyz_invalid_classes", 0) == 0,
+            "observed": snapshot.get("abc_xyz_invalid_classes", 0),
+            "expected": "0 invalid ABC/XYZ classes",
+        },
+        {
+            "name": "abc_xyz_finite_values",
+            "passed": snapshot.get("abc_xyz_non_finite", 0) == 0,
+            "observed": snapshot.get("abc_xyz_non_finite", 0),
+            "expected": "0 NaN/Inf numeric cells",
+        },
+        {
+            "name": "forecasts_finite_and_bounded",
+            "passed": snapshot.get("forecasts_bad_rows", 0) == 0 and snapshot.get("forecasts_count", 0) > 0,
+            "observed": snapshot.get("forecasts_bad_rows", 0),
+            "expected": "0 negative/NaN forecast rows & > 0 total",
+        },
+        {
+            "name": "basket_rules_valid_bounds",
+            "passed": snapshot.get("basket_bad_rows", 0) == 0,
+            "observed": snapshot.get("basket_bad_rows", 0),
+            "expected": "support/conf in [0,1], lift > 0",
+        },
+        {
+            "name": "lp_anomalies_valid_risk",
+            "passed": snapshot.get("lp_bad_rows", 0) == 0,
+            "observed": snapshot.get("lp_bad_rows", 0),
+            "expected": "0 invalid risk levels or NaN z-scores",
+        },
+        {
+            "name": "supplier_scorecards_valid_grades",
+            "passed": snapshot.get("supplier_bad_rows", 0) == 0 and snapshot.get("supplier_count", 0) > 0,
+            "observed": snapshot.get("supplier_bad_rows", 0),
+            "expected": "grade in A..D & OTIF in [0,100]",
+        },
+        {
+            "name": "phantom_stock_valid_prob",
+            "passed": snapshot.get("phantom_bad_rows", 0) == 0,
+            "observed": snapshot.get("phantom_bad_rows", 0),
+            "expected": "phantom_prob in [0,1] finite",
+        },
+        {
+            "name": "dynamic_markdowns_non_negative_recovery",
+            "passed": snapshot.get("markdown_bad_rows", 0) == 0,
+            "observed": snapshot.get("markdown_bad_rows", 0),
+            "expected": "expected_recovery_cents >= 0 & discount_bp in [0,9500]",
+        },
+        {
+            "name": "promo_roi_valid_verdicts",
+            "passed": snapshot.get("promo_roi_bad_rows", 0) == 0,
+            "observed": snapshot.get("promo_roi_bad_rows", 0),
+            "expected": "valid verdicts & finite velocity lift",
+        },
+        {
+            "name": "shift_diagnostics_fresh",
+            "passed": snapshot.get("shift_diag_count", 0) >= 1,
+            "observed": snapshot.get("shift_diag_count", 0),
+            "expected": ">= 1 diagnostics snapshot",
+        },
+        {
+            "name": "inventory_batches_non_negative",
+            "passed": snapshot.get("negative_batches", 0) == 0,
+            "observed": snapshot.get("negative_batches", 0),
+            "expected": "0 negative FEFO batches",
+        },
+    ]
+    all_passed = all(bool(c["passed"]) for c in checks)
+    return all_passed, checks
+
+
+def validate_pipeline_data_quality(conn: psycopg.Connection) -> tuple[bool, list[dict[str, object]]]:
+    t0 = time.perf_counter()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              (SELECT COUNT(*)::int FROM analytics_abc_xyz),
+              (SELECT COUNT(*)::int FROM analytics_abc_xyz
+                WHERE abc_class NOT IN ('A','B','C') OR xyz_class NOT IN ('X','Y','Z')),
+              (SELECT COUNT(*)::int FROM analytics_abc_xyz
+                WHERE demand_cv = 'NaN'::float8 OR demand_cv = 'Infinity'::float8 OR demand_cv = '-Infinity'::float8
+                   OR gmroii = 'NaN'::float8 OR days_of_stock = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_demand_forecasts),
+              (SELECT COUNT(*)::int FROM analytics_demand_forecasts
+                WHERE forecast_14d_units < 0
+                   OR wmape_pct < 0 OR wmape_pct = 'NaN'::float8 OR wmape_pct = 'Infinity'::float8
+                   OR safety_stock_units < 0),
+              (SELECT COUNT(*)::int FROM analytics_basket_rules
+                WHERE support < 0 OR support > 1 OR support = 'NaN'::float8
+                   OR confidence < 0 OR confidence > 1 OR confidence = 'NaN'::float8
+                   OR lift <= 0 OR lift = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_lp_anomalies
+                WHERE risk_level NOT IN ('normal','watch','high')
+                   OR z_score = 'NaN'::float8 OR z_score = 'Infinity'::float8),
+              (SELECT COUNT(*)::int FROM analytics_supplier_scorecards),
+              (SELECT COUNT(*)::int FROM analytics_supplier_scorecards
+                WHERE grade NOT IN ('A','B','C','D')
+                   OR otif_rate_pct < 0 OR otif_rate_pct > 100 OR otif_rate_pct = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_phantom_stock
+                WHERE phantom_prob < 0 OR phantom_prob > 1 OR phantom_prob = 'NaN'::float8),
+              (SELECT COUNT(*)::int FROM analytics_dynamic_markdowns
+                WHERE expected_recovery_cents < 0
+                   OR recommended_discount_bp < 0 OR recommended_discount_bp > 9500),
+              (SELECT COUNT(*)::int FROM analytics_promo_roi
+                WHERE verdict NOT IN ('profit_accretive','margin_neutral','margin_dilutive','insufficient_data')
+                   OR velocity_lift_pct = 'NaN'::float8 OR velocity_lift_pct = 'Infinity'::float8),
+              (SELECT COUNT(*)::int FROM analytics_shift_diagnostics),
+              (SELECT COUNT(*)::int FROM inventory_batches WHERE qty_remaining < 0)
+        """)
+        r = cur.fetchone()
+    assert r is not None
+    snapshot = {
+        "abc_xyz_count": int(r[0]),
+        "abc_xyz_invalid_classes": int(r[1]),
+        "abc_xyz_non_finite": int(r[2]),
+        "forecasts_count": int(r[3]),
+        "forecasts_bad_rows": int(r[4]),
+        "basket_bad_rows": int(r[5]),
+        "lp_bad_rows": int(r[6]),
+        "supplier_count": int(r[7]),
+        "supplier_bad_rows": int(r[8]),
+        "phantom_bad_rows": int(r[9]),
+        "markdown_bad_rows": int(r[10]),
+        "promo_roi_bad_rows": int(r[11]),
+        "shift_diag_count": int(r[12]),
+        "negative_batches": int(r[13]),
+    }
+    dq_passed, checks = evaluate_data_quality_contracts(snapshot)
+    log_event(
+        "data_quality_contracts",
+        dq_passed=dq_passed,
+        passed_count=sum(1 for c in checks if c["passed"]),
+        total_checks=len(checks),
+        elapsed_s=round(time.perf_counter() - t0, 2),
+    )
+    return dq_passed, checks
+
+
+def run_pipeline() -> dict[str, object]:
+    started_at = datetime.now(timezone.utc)
+    t_total = time.perf_counter()
+    stages: list[dict[str, object]] = []
     log_event("pipeline_start", database_configured=bool(DATABASE_URL))
+
+    def _run_stage(name: str, fn):
+        st = time.perf_counter()
+        out = fn()
+        stages.append({"stage": name, "elapsed_s": round(time.perf_counter() - st, 3)})
+        return out
+
     with psycopg.connect(DATABASE_URL) as conn:
-        supplier_std_map = run_supplier_scorecards(conn)
-        run_abc_xyz_and_forecasts(conn, supplier_std_map)
-        run_market_basket(conn)
-        run_loss_prevention_anomalies(conn)
-        run_shift_diagnostics(conn)
-        run_phantom_and_markdowns(conn)
-        run_loyalty_staffing_and_tasks(conn)
-    log_event("pipeline_complete", status="ok")
+        with conn.transaction():
+            supplier_std_map = _run_stage("supplier_scorecards", lambda: run_supplier_scorecards(conn))
+            _run_stage("abc_xyz_and_forecasts", lambda: run_abc_xyz_and_forecasts(conn, supplier_std_map))
+            _run_stage("market_basket", lambda: run_market_basket(conn))
+            _run_stage("loss_prevention_anomalies", lambda: run_loss_prevention_anomalies(conn))
+            _run_stage("shift_diagnostics", lambda: run_shift_diagnostics(conn))
+            _run_stage("phantom_and_markdowns", lambda: run_phantom_and_markdowns(conn))
+            _run_stage("loyalty_staffing_and_tasks", lambda: run_loyalty_staffing_and_tasks(conn))
+            _run_stage("promo_roi_attribution", lambda: run_promo_roi_attribution(conn))
+            dq_passed, dq_checks = _run_stage(
+                "data_quality_contracts", lambda: validate_pipeline_data_quality(conn)
+            )
+            finished_at = datetime.now(timezone.utc)
+            elapsed_total = round(time.perf_counter() - t_total, 3)
+            run_status = "ok" if dq_passed else "dq_failed"
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO analytics_pipeline_runs (
+                      started_at, finished_at, elapsed_sec, status, stages_json, dq_passed, dq_checks_json
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s::jsonb)
+                    """,
+                    (
+                        started_at,
+                        finished_at,
+                        elapsed_total,
+                        run_status,
+                        safe_json_dumps(stages),
+                        dq_passed,
+                        safe_json_dumps(dq_checks),
+                    ),
+                )
+                # Keep latest 50 telemetry records bounded for idempotency
+                cur.execute("""
+                    DELETE FROM analytics_pipeline_runs
+                    WHERE id NOT IN (
+                      SELECT id FROM analytics_pipeline_runs
+                      ORDER BY finished_at DESC
+                      LIMIT 50
+                    )
+                """)
+
+    log_event(
+        "pipeline_complete",
+        status="ok" if dq_passed else "dq_failed",
+        dq_passed=dq_passed,
+        elapsed_s=elapsed_total,
+    )
+    return {
+        "ok": dq_passed,
+        "status": "ok" if dq_passed else "dq_failed",
+        "dq_passed": dq_passed,
+        "elapsed_s": elapsed_total,
+        "stages": stages,
+        "finished_at": finished_at.isoformat(),
+    }
+
+
+def create_worker_server(
+    host: str | None = None,
+    port: int | None = None,
+    worker_token: str | None = None,
+    pipeline_fn=None,
+):
+    """Create a stdlib ThreadingHTTPServer for HTTP-triggered analytics recomputes (H-02)."""
+    import hmac
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    bind_host = host if host is not None else os.environ.get("ANALYTICS_WORKER_HOST", "0.0.0.0")
+    bind_port = port if port is not None else int(os.environ.get("ANALYTICS_WORKER_PORT", "8090"))
+    token = (
+        worker_token if worker_token is not None else os.environ.get("ANALYTICS_WORKER_TOKEN", "")
+    ).strip()
+    execute_pipeline = pipeline_fn or run_pipeline
+    run_lock = threading.Lock()
+
+    class AnalyticsWorkerHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            log_event("worker_http", message=fmt % args)
+
+        def _send_json(self, status_code: int, payload: dict[str, object]) -> None:
+            body = safe_json_dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self) -> bool:
+            if not token:
+                return True
+            auth = self.headers.get("Authorization", "")
+            expected = f"Bearer {token}"
+            return hmac.compare_digest(auth, expected)
+
+        def do_GET(self) -> None:
+            if self.path in ("/health", "/health/live"):
+                self._send_json(200, {"status": "ok", "busy": run_lock.locked()})
+                return
+            self._send_json(404, {"error": "Not found"})
+
+        def do_POST(self) -> None:
+            if self.path != "/recompute":
+                self._send_json(404, {"error": "Not found"})
+                return
+            if not self._authorized():
+                self._send_json(401, {"error": "Unauthorized analytics worker request."})
+                return
+            if not run_lock.acquire(blocking=False):
+                self._send_json(409, {"error": "An analytics recompute is already in progress."})
+                return
+            try:
+                summary = execute_pipeline()
+                status = 200 if summary.get("ok") else 500
+                self._send_json(status, summary)
+            except Exception as exc:  # noqa: BLE001
+                log_event("worker_recompute_error", error=str(exc))
+                self._send_json(500, {"ok": False, "error": "Analytics pipeline failed."})
+            finally:
+                run_lock.release()
+
+    return ThreadingHTTPServer((bind_host, bind_port), AnalyticsWorkerHandler), bool(token)
+
+
+def serve_worker(host: str | None = None, port: int | None = None) -> None:
+    """Run a lightweight stdlib HTTP worker so the Node API can trigger recomputes over HTTP (H-02)."""
+    server, auth_required = create_worker_server(host=host, port=port)
+    bind_host, bind_port = server.server_address[:2]
+    log_event("worker_listen", host=bind_host, port=bind_port, auth_required=auth_required)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main() -> None:
+    if "--serve" in sys.argv[1:]:
+        serve_worker()
+        return
+    summary = run_pipeline()
+    if not summary.get("dq_passed"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+

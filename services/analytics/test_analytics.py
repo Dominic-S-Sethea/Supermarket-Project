@@ -1,16 +1,23 @@
+import json
+import math
 import numpy as np
 
 from run_all import (
+    _mine_basket_subset,
     bootstrap_ci,
     chronological_ridge_attribution,
     compute_did_evaluation,
     compute_phantom_prob,
+    compute_promo_roi_metrics,
     compute_supplier_otif_metrics,
     croston_holdout_wmape,
     croston_sba_forecast,
+    evaluate_data_quality_contracts,
     kmeans_missions,
     recommend_abc_xyz_action,
     recommend_hourly_lanes,
+    safe_float,
+    safe_json_dumps,
     score_cashiers_robust,
     score_rfm_segment,
     solve_optimal_markdown,
@@ -180,3 +187,392 @@ def test_score_rfm_segment_and_recommend_hourly_lanes():
     assert recommend_hourly_lanes(12.0) == 1
     assert recommend_hourly_lanes(90.0) >= 3
     assert recommend_hourly_lanes(999.0, max_lanes=8) == 8
+
+
+# ============================================================================
+# PHASE 3 HARDENING REGRESSION TESTS: SPARSE DATA, NaN/Inf & DEGENERATE INPUTS
+# ============================================================================
+
+
+def test_forecasting_handles_empty_sparse_negative_and_non_finite_series():
+    for bad in [
+        np.array([], dtype=float),
+        np.zeros(60, dtype=float),
+        np.array([5.0], dtype=float),
+        np.array([np.nan, np.inf, -np.inf, -3.0, 2.0] * 12, dtype=float),
+    ]:
+        c_fc = croston_sba_forecast(bad, alpha=np.nan)
+        c_wmape = croston_holdout_wmape(bad)
+        ets_fc, ets_wmape = weekend_ets_forecast(bad, alpha=0.0)
+        for v in (c_fc, c_wmape, ets_fc, ets_wmape):
+            assert math.isfinite(v)
+            assert v >= 0.0
+        assert c_wmape <= 200.0
+        assert ets_wmape <= 200.0
+
+    # Zero-holdout after positive training must stay finite and bounded
+    tail_zero = np.array([4.0] * 46 + [0.0] * 14, dtype=float)
+    ets_fc, ets_wmape = weekend_ets_forecast(tail_zero)
+    assert math.isfinite(ets_fc) and ets_fc >= 0.0
+    assert math.isfinite(ets_wmape) and 0.0 <= ets_wmape <= 200.0
+
+
+def test_kmeans_missions_handles_identical_points_empty_and_nan_without_crashing():
+    # Previously raised ValueError: probabilities do not sum to 1 when all rows were identical
+    identical = np.ones((40, 6), dtype=float) * 7.5
+    labels, centroids, sil, best_k = kmeans_missions(identical, k_candidates=(3, 4))
+    assert len(labels) == 40
+    assert best_k == 1
+    assert sil == 0.0
+    assert np.all(np.isfinite(centroids))
+
+    # Empty & NaN/Inf inputs
+    empty_l, empty_c, empty_s, empty_k = kmeans_missions(np.zeros((0, 6), dtype=float))
+    assert len(empty_l) == 0 and empty_k == 1 and empty_s == 0.0 and empty_c.shape == (1, 6)
+
+    noisy = np.array([[np.nan, np.inf, -np.inf, 1.0, 2.0, 3.0]] * 15 + [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]] * 15)
+    l2, c2, s2, _ = kmeans_missions(noisy, k_candidates=(2, 3))
+    assert len(l2) == 30
+    assert math.isfinite(s2)
+    assert np.all(np.isfinite(c2))
+
+
+def test_chronological_ridge_handles_empty_constant_zero_holdout_and_nan():
+    res_empty = chronological_ridge_attribution(np.zeros((0, 3)), np.zeros(0), ["a", "b", "c"])
+    assert res_empty["drivers"] == []
+
+    # Constant target + NaN/Inf features + zero lam + zero holdout
+    X_bad = np.ones((50, 3), dtype=float)
+    X_bad[0, 0] = np.nan
+    X_bad[1, 1] = np.inf
+    y_zero_holdout = np.array([100.0] * 36 + [0.0] * 14, dtype=float)
+    res = chronological_ridge_attribution(X_bad, y_zero_holdout, ["f1", "f2", "f3"], holdout_days=14, lam=0.0)
+    assert math.isfinite(res["holdoutWmapePct"])
+    assert math.isfinite(res["baselineWmapePct"])
+    assert math.isfinite(res["r2Train"])
+    for drv in res["drivers"]:
+        assert math.isfinite(drv["coefUsdPerSd"])
+        assert math.isfinite(drv["importancePct"])
+    # Ensure strict JSONB compatibility (allow_nan=False)
+    assert json.loads(safe_json_dumps(res))["holdoutWmapePct"] == res["holdoutWmapePct"]
+
+
+def test_did_bootstrap_welch_and_cashier_edge_cases():
+    # Non-finite values in DiD arrays must be filtered cleanly
+    did_nan = compute_did_evaluation(
+        np.array([np.nan, 500.0, 510.0, np.inf]),
+        np.array([620.0, 630.0, -np.inf]),
+        np.array([1000.0, np.nan, 1020.0]),
+        np.array([1010.0, 1030.0]),
+    )
+    serialized = safe_json_dumps(did_nan)
+    assert "NaN" not in serialized and "Infinity" not in serialized
+
+    # Empty arrays
+    did_empty = compute_did_evaluation(np.array([]), np.array([]), np.array([]), np.array([]))
+    assert did_empty["didLiftUsdPerDay"] == 0.0
+    assert did_empty["pValue"] == 1.0
+
+    assert bootstrap_ci(np.array([np.nan, np.inf])) == (0.0, 0.0, 0.0)
+    assert welch_ttest_pvalue(np.array([10.0]), np.array([20.0])) == 1.0
+
+    # Zero-tx and identical cashiers (MAD == 0) must not divide by zero
+    assert score_cashiers_robust([]) == []
+    identical_cashiers = [("C1", 0, 0, 0, 0), ("C2", 0, 0, 0, 0)]
+    scored = score_cashiers_robust(identical_cashiers)
+    assert len(scored) == 2
+    assert all(math.isfinite(r[5]) and math.isfinite(r[6]) for r in scored)
+
+
+def test_otif_phantom_markdown_rfm_lanes_and_json_sanitizer_edge_cases():
+    otif_empty = compute_supplier_otif_metrics([], expected_lead_days=0)
+    assert otif_empty["avg_lead_time_days"] == 1.0
+    assert otif_empty["lead_time_std_days"] >= 0.4
+
+    otif_nan = compute_supplier_otif_metrics(
+        [{"lead_days": float("nan"), "ordered_units": -5, "received_units": 0, "po_cost_cents": -10, "invoice_cost_cents": 0}],
+        expected_lead_days=3,
+    )
+    assert math.isfinite(otif_nan["avg_lead_time_days"])
+
+    assert compute_phantom_prob(10, float("nan"), float("inf"), float("nan")) == 0.0
+    assert 0.0 <= compute_phantom_prob(10, 5.0, 9999.0, 0.5) <= 0.99
+
+    md_zero = solve_optimal_markdown(0, 0, float("nan"), 0, -50, elasticity=float("inf"))
+    assert md_zero["predicted_clearance_units"] == 0
+    assert md_zero["expected_recovery_cents"] == 0
+
+    assert score_rfm_segment(float("nan"), 0, 0) == "Hibernating"
+    assert recommend_hourly_lanes(float("nan"), conversion_rate=float("inf"), min_lanes=4, max_lanes=2) == 4
+    assert _mine_basket_subset([], "all", min_co=2, min_lift=1.2, top_n=10) == []
+
+    # JSONB sanitizer strips NaN/Inf & converts NumPy scalars cleanly
+    raw = {"a": float("nan"), "b": float("inf"), "c": np.float64(-np.inf), "d": np.int64(42), "e": [np.bool_(True)]}
+    parsed = json.loads(safe_json_dumps(raw))
+    assert parsed == {"a": 0.0, "b": 0.0, "c": 0.0, "d": 42, "e": [True]}
+    assert safe_float(float("nan"), default=1.5) == 1.5
+
+
+# ============================================================================
+# WAVE 2 PHASE 3: PROMO ROI ATTRIBUTION & 12-CHECK DATA-QUALITY CONTRACTS
+# ============================================================================
+
+
+def test_promo_roi_profit_accretive_with_strong_velocity_lift():
+    res = compute_promo_roi_metrics(
+        discounted_units=200,
+        discounted_revenue_cents=100_000,
+        discounted_tax_cents=9_000,
+        discounted_cogs_cents=55_000,
+        discount_given_cents=8_000,
+        promo_active_days=10,
+        baseline_units=100,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "profit_accretive"
+    assert res["velocity_lift_pct"] == 100.0
+    assert res["net_margin_bp"] > 3000
+    assert res["estimated_profit_delta_cents"] > 0
+
+
+def test_promo_roi_margin_dilutive_when_discount_destroys_profit():
+    res = compute_promo_roi_metrics(
+        discounted_units=100,
+        discounted_revenue_cents=25_000,
+        discounted_tax_cents=2_000,
+        discounted_cogs_cents=22_000,
+        discount_given_cents=12_000,
+        promo_active_days=10,
+        baseline_units=95,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "margin_dilutive"
+    assert res["estimated_profit_delta_cents"] < 0
+    assert res["net_margin_bp"] < 500
+
+
+def test_promo_roi_insufficient_data_on_low_volume():
+    res = compute_promo_roi_metrics(
+        discounted_units=3,
+        discounted_revenue_cents=1200,
+        discounted_tax_cents=100,
+        discounted_cogs_cents=600,
+        discount_given_cents=200,
+        promo_active_days=2,
+        baseline_units=20,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "insufficient_data"
+
+
+def test_promo_roi_handles_zero_baseline_zero_revenue_and_non_finite():
+    res_zero = compute_promo_roi_metrics(0, 0, 0, 0, 0, 0, 0, 0)
+    assert res_zero["verdict"] == "insufficient_data"
+    assert res_zero["velocity_lift_pct"] == 0.0
+    assert res_zero["net_margin_bp"] == 0
+
+    res_no_base = compute_promo_roi_metrics(
+        discounted_units=50,
+        discounted_revenue_cents=25_000,
+        discounted_tax_cents=2_000,
+        discounted_cogs_cents=12_000,
+        discount_given_cents=1_500,
+        promo_active_days=5,
+        baseline_units=0,
+        baseline_days=0,
+    )
+    assert res_no_base["velocity_lift_pct"] == 100.0
+    assert res_no_base["verdict"] == "profit_accretive"
+
+
+def test_promo_roi_margin_neutral_boundary():
+    res = compute_promo_roi_metrics(
+        discounted_units=100,
+        discounted_revenue_cents=50_000,
+        discounted_tax_cents=4_000,
+        discounted_cogs_cents=40_000,
+        discount_given_cents=200,
+        promo_active_days=10,
+        baseline_units=100,
+        baseline_days=10,
+    )
+    assert res["verdict"] == "margin_neutral"
+    assert res["net_margin_bp"] >= 500
+
+
+def _clean_dq_snapshot() -> dict[str, int]:
+    return {
+        "abc_xyz_count": 3120,
+        "abc_xyz_invalid_classes": 0,
+        "abc_xyz_non_finite": 0,
+        "forecasts_count": 3120,
+        "forecasts_bad_rows": 0,
+        "basket_bad_rows": 0,
+        "lp_bad_rows": 0,
+        "supplier_count": 7,
+        "supplier_bad_rows": 0,
+        "phantom_bad_rows": 0,
+        "markdown_bad_rows": 0,
+        "promo_roi_bad_rows": 0,
+        "shift_diag_count": 1,
+        "negative_batches": 0,
+    }
+
+
+def test_dq_contracts_pass_on_healthy_snapshot():
+    passed, checks = evaluate_data_quality_contracts(_clean_dq_snapshot())
+    assert passed is True
+    assert len(checks) == 12
+    assert all(c["passed"] is True for c in checks)
+
+
+def test_dq_contracts_fail_on_empty_abc_xyz_or_nan_values():
+    snap = _clean_dq_snapshot()
+    snap["abc_xyz_count"] = 0
+    snap["abc_xyz_non_finite"] = 2
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["abc_xyz_non_empty"] is False
+    assert by_name["abc_xyz_finite_values"] is False
+
+
+def test_dq_contracts_fail_on_negative_fefo_batch_and_invalid_phantom_prob():
+    snap = _clean_dq_snapshot()
+    snap["negative_batches"] = 1
+    snap["phantom_bad_rows"] = 3
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["inventory_batches_non_negative"] is False
+    assert by_name["phantom_stock_valid_prob"] is False
+
+
+def test_dq_contracts_fail_on_invalid_supplier_grade_and_basket_bounds():
+    snap = _clean_dq_snapshot()
+    snap["supplier_bad_rows"] = 1
+    snap["basket_bad_rows"] = 4
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["supplier_scorecards_valid_grades"] is False
+    assert by_name["basket_rules_valid_bounds"] is False
+
+
+def test_dq_contracts_fail_on_bad_promo_roi_and_missing_shift_diagnostics():
+    snap = _clean_dq_snapshot()
+    snap["promo_roi_bad_rows"] = 1
+    snap["shift_diag_count"] = 0
+    passed, checks = evaluate_data_quality_contracts(snap)
+    assert passed is False
+    by_name = {c["name"]: c["passed"] for c in checks}
+    assert by_name["promo_roi_valid_verdicts"] is False
+    assert by_name["shift_diagnostics_fresh"] is False
+
+
+def test_markdown_elasticity_never_recommends_below_zero_recovery():
+    sol = solve_optimal_markdown(
+        qty_remaining=100,
+        days_left=1,
+        avg_daily_units=10.0,
+        sell_price_cents=150,
+        unit_cost_cents=140,
+        elasticity=2.5,
+    )
+    assert sol["expected_recovery_cents"] >= 0
+    assert sol["recommended_promo_price_cents"] >= 1
+    assert 0 <= sol["recommended_discount_bp"] <= 9500
+
+
+def test_supplier_otif_handles_partial_and_cost_savings_deliveries():
+    deliveries = [
+        {"lead_days": 3.0, "ordered_units": 100, "received_units": 98, "po_cost_cents": 50_000, "invoice_cost_cents": 49_000},
+        {"lead_days": 2.5, "ordered_units": 100, "received_units": 100, "po_cost_cents": 50_000, "invoice_cost_cents": 50_000},
+    ]
+    res = compute_supplier_otif_metrics(deliveries, expected_lead_days=3)
+    assert res["on_time_rate_pct"] == 100.0
+    assert res["in_full_rate_pct"] == 50.0
+    assert res["otif_rate_pct"] == 50.0
+    assert res["cost_variance_rate_pct"] == 50.0
+    assert res["grade"] in ("C", "D")
+
+
+def test_analytics_http_worker_auth_and_recompute_lock():
+    import threading
+    import urllib.error
+    import urllib.request
+    from run_all import create_worker_server
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_pipeline():
+        calls.append(1)
+        started.set()
+        release.wait(timeout=2.0)
+        return {"ok": True, "status": "ok", "dq_passed": True, "elapsed_s": 0.01}
+
+    server, auth_required = create_worker_server(
+        host="127.0.0.1",
+        port=0,
+        worker_token="test-secret-token",
+        pipeline_fn=fake_pipeline,
+    )
+    assert auth_required is True
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode("utf-8"))
+            assert body == {"status": "ok", "busy": False}
+
+        # Unauthorized recompute -> 401
+        req_unauth = urllib.request.Request(f"http://127.0.0.1:{port}/recompute", method="POST", data=b"")
+        try:
+            urllib.request.urlopen(req_unauth)
+            assert False, "Expected 401 for missing bearer token"
+        except urllib.error.HTTPError as err:
+            assert err.code == 401
+
+        # Authorized recompute in flight + concurrent second recompute -> 409
+        first_result: dict[str, object] = {}
+
+        def invoke_first():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/recompute",
+                method="POST",
+                data=b"",
+                headers={"Authorization": "Bearer test-secret-token"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                first_result["status"] = resp.status
+                first_result["body"] = json.loads(resp.read().decode("utf-8"))
+
+        t1 = threading.Thread(target=invoke_first)
+        t1.start()
+        assert started.wait(timeout=2.0)
+
+        req_conflict = urllib.request.Request(
+            f"http://127.0.0.1:{port}/recompute",
+            method="POST",
+            data=b"",
+            headers={"Authorization": "Bearer test-secret-token"},
+        )
+        try:
+            urllib.request.urlopen(req_conflict)
+            assert False, "Expected 409 while recompute lock is held"
+        except urllib.error.HTTPError as err:
+            assert err.code == 409
+
+        release.set()
+        t1.join(timeout=2.0)
+        assert first_result["status"] == 200
+        assert first_result["body"]["ok"] is True
+        assert len(calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)

@@ -1,5 +1,7 @@
 # SupermarketOS — Mobile Aisle Companion App (Phase 3 Expo Target)
 
+> **Status:** Roadmap specification only — not yet scaffolded as an active workspace package. All endpoints referenced below are live in `@supermarket/api`.
+
 Designed for rugged Android barcode PDAs (Zebra TC2x via DataWedge, Sunmi L2s) and staff smartphones (`expo-camera` / Google ML Kit):
 
 1. **Receive PO & Log Expiry:** Scan outer carton barcodes (`pack_qty = 24 / 30`), enter `paidCases` + `freeBonusCases`, log Best-Before dates → calls `POST /api/purchasing/grn`.

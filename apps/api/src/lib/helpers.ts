@@ -55,7 +55,17 @@ export function parseCsvRows(csvText: string): string[][] {
  * Strip ZPL command prefixes (^, ~) and control characters to prevent ZPL label command injection.
  */
 export function sanitizeZpl(text: string): string {
-  return text.replace(/[\^~\r\n\x00-\x1f]/g, " ").trim();
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const ch = text[i];
+    if (code < 0x20 || ch === "^" || ch === "~") {
+      out += " ";
+    } else {
+      out += ch;
+    }
+  }
+  return out.trim();
 }
 
 /**
@@ -84,7 +94,8 @@ export function buildZplBarcodeCommand(barcode: string): string {
  */
 export function escapeCsvCell(value: unknown): string {
   let str = value === null || value === undefined ? "" : String(value);
-  if (/^[=+\-@\t\r]/.test(str)) {
+  const isPlainSignedNumber = /^-?\d+(?:\.\d+)?$/.test(str);
+  if (!isPlainSignedNumber && (/^[\t\r]/.test(str) || /^\s*[=+\-@]/.test(str))) {
     str = `'${str}`;
   }
   if (/[",\r\n]/.test(str)) {

@@ -1,0 +1,217 @@
+name: SupermarketOS CI
+
+on:
+  push:
+    branches: [main, "overnight/**", "audit/**"]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-typecheck-build:
+    name: Lint, Typecheck & Production Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run Oxlint (zero warnings)
+        run: pnpm lint
+      - name: TypeScript typecheck
+        run: pnpm typecheck
+      - name: Production build (shared, api, web)
+        run: pnpm build
+
+  shared-and-web-tests:
+    name: Shared & Web Unit / Component Tests + Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @supermarket/shared build
+      - name: Run @supermarket/shared tests with coverage thresholds
+        run: pnpm --filter @supermarket/shared test:coverage
+      - name: Run @supermarket/web unit & React component tests
+        run: pnpm --filter @supermarket/web test
+      - name: Collect @supermarket/web coverage report
+        run: pnpm --filter @supermarket/web test:coverage
+
+  analytics-and-rust:
+    name: Python Analytics Tests & Rust ESC/POS Clippy/Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Run Python analytics pytest suite
+        run: uv --directory services/analytics run pytest -v
+      - name: Run Rust Clippy (-D warnings) & ESC/POS unit tests
+        run: |
+          cargo clippy --manifest-path apps/pos/src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path apps/pos/src-tauri/Cargo.toml
+
+  api-integration-and-security:
+    name: API Integration & OWASP Security Suite (Isolated DB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: supermarket
+          POSTGRES_PASSWORD: supermarket_dev_password
+          POSTGRES_DB: supermarket_os_api_ci
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U supermarket -d supermarket_os_api_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+    env:
+      DATABASE_URL: postgres://supermarket:supermarket_dev_password@localhost:5433/supermarket_os_api_ci
+      AUTH_SECRET: ci-test-auth-secret-minimum-thirty-two-characters-long
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @supermarket/shared build
+      - name: Run Drizzle SQL migrations & seed 3,120-SKU catalog
+        run: |
+          pnpm db:migrate
+          pnpm db:seed
+      - name: Run API integration & security test suites
+        run: pnpm --filter @supermarket/api test
+
+  e2e-playwright:
+    name: End-to-End Playwright Suite & Analytics 2x Idempotency (Isolated DB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [lint-typecheck-build]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: supermarket
+          POSTGRES_PASSWORD: supermarket_dev_password
+          POSTGRES_DB: supermarket_os_e2e_ci
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U supermarket -d supermarket_os_e2e_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+    env:
+      DATABASE_URL: postgres://supermarket:supermarket_dev_password@localhost:5433/supermarket_os_e2e_ci
+      AUTH_SECRET: ci-test-auth-secret-minimum-thirty-two-characters-long
+      E2E_NODE_ENV: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
+      - name: Migrate, seed & verify 2x analytics pipeline idempotency
+        run: |
+          pnpm db:migrate
+          pnpm db:seed
+          pnpm analytics:run
+          pnpm analytics:run
+      - name: Build production bundles
+        run: pnpm build
+      - name: Install Playwright Chromium & run E2E suite
+        run: |
+          npx playwright install --with-deps chromium
+          pnpm test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  ops-dr-and-stress:
+    name: Operational Stress, DR Backup-Verify & Docker Smoke
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [lint-typecheck-build, api-integration-and-security]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Boot PostgreSQL 16 container for DR, Stress & Docker Smoke
+        run: |
+          docker run -d --name supermarket-os-postgres \
+            -e POSTGRES_USER=supermarket \
+            -e POSTGRES_PASSWORD=supermarket_dev_password \
+            -e POSTGRES_DB=supermarket_os \
+            -p 5433:5432 postgres:16-alpine
+          for i in $(seq 1 20); do
+            docker exec supermarket-os-postgres pg_isready -U supermarket -d supermarket_os && break
+            sleep 1
+          done
+      - name: Migrate & seed database
+        env:
+          DATABASE_URL: postgres://supermarket:supermarket_dev_password@localhost:5433/supermarket_os
+        run: |
+          pnpm db:migrate
+          pnpm db:seed
+      - name: Run concurrency stress & invariant suite
+        env:
+          DATABASE_URL: postgres://supermarket:supermarket_dev_password@localhost:5433/supermarket_os
+          STRESS_NODE_ENV: production
+          AUTH_SECRET: ci-stress-secret-minimum-thirty-two-characters-long
+        run: pnpm test:stress
+      - name: Verify full PostgreSQL DR backup & isolated restore
+        run: pnpm db:backup-verify
+      - name: Run full containerized Docker smoke test
+        run: pnpm docker:smoke

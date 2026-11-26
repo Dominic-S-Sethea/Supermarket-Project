@@ -1,0 +1,135 @@
+{
+  "uid": "supermarket-os-ops",
+  "title": "SupermarketOS — API, POS, PostgreSQL & Analytics",
+  "tags": ["supermarket-os", "retail", "pos", "fastify", "postgres"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "HTTP Request Rate by Status Class (req/s)",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (status_class) (rate(http_requests_total[5m]))",
+          "legendFormat": "{{status_class}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "API Latency Quantiles (p50 / p95 / p99 ms)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_ms_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_ms_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_ms_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "POS Sales vs Voids & Refunds (rate/5m)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(supermarket_pos_sales_total[5m]) * 60",
+          "legendFormat": "Sales / min"
+        },
+        {
+          "expr": "sum by (kind) (rate(supermarket_pos_reversals_total[5m])) * 60",
+          "legendFormat": "Reversal ({{kind}}) / min"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "PostgreSQL Connection Pool States",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "pg_pool_connections",
+          "legendFormat": "{{state}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Analytics Pipeline DQ Contracts",
+      "gridPos": { "x": 0, "y": 16, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "supermarket_analytics_dq_passed",
+          "legendFormat": "DQ Passed (1=OK)"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Analytics Last Run Age (seconds)",
+      "gridPos": { "x": 6, "y": 16, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "supermarket_analytics_last_run_age_seconds",
+          "legendFormat": "Age (s)"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Active AI SSE Streams",
+      "gridPos": { "x": 12, "y": 16, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "supermarket_sse_active_streams",
+          "legendFormat": "Active SSE"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Auth PIN Lockouts (15m)",
+      "gridPos": { "x": 18, "y": 16, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "increase(supermarket_auth_lockouts_total[15m])",
+          "legendFormat": "Lockouts"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Node.js Memory (RSS & V8 Heap Bytes)",
+      "gridPos": { "x": 0, "y": 21, "w": 24, "h": 7 },
+      "targets": [
+        {
+          "expr": "process_resident_memory_bytes",
+          "legendFormat": "RSS"
+        },
+        {
+          "expr": "nodejs_heap_used_bytes",
+          "legendFormat": "Heap Used"
+        }
+      ]
+    }
+  ]
+}
