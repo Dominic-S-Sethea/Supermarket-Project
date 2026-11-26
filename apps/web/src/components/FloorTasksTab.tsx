@@ -169,6 +169,7 @@ export function FloorTasksTab({
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <input
               id="tasks-date-input"
+              aria-label="Task schedule date"
               type="date"
               className="input mono"
               style={{ padding: "5px 8px" }}
@@ -176,6 +177,7 @@ export function FloorTasksTab({
               onChange={(e) => setDateFilter(e.target.value)}
             />
             <select
+              aria-label="Filter tasks by type"
               className="select"
               value={typeFilter}
               onChange={(e) => setTypeFilter(e.target.value)}
@@ -187,6 +189,7 @@ export function FloorTasksTab({
               <option value="expiry_markdown">Expiry Markdown</option>
             </select>
             <select
+              aria-label="Filter tasks by status"
               className="select"
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
@@ -195,8 +198,14 @@ export function FloorTasksTab({
               <option value="pending">Pending Only</option>
               <option value="completed">Completed</option>
             </select>
-            <button className="btn btn-sm" disabled={loading} onClick={() => void loadTasks()}>
-              <RefreshCw size={13} />
+            <button
+              type="button"
+              className="btn btn-sm"
+              aria-label="Refresh floor tasks"
+              disabled={loading}
+              onClick={() => void loadTasks()}
+            >
+              <RefreshCw size={13} aria-hidden="true" />
             </button>
           </div>
         </div>

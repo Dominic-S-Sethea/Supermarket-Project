@@ -706,6 +706,7 @@ export function AdminAuditView({
             </div>
             <select
               id="audit-action-filter"
+              aria-label="Filter audit logs by action"
               className="select"
               style={{ width: 190 }}
               value={auditAction}
@@ -723,6 +724,7 @@ export function AdminAuditView({
             </select>
             <select
               id="audit-entity-filter"
+              aria-label="Filter audit logs by entity type"
               className="select"
               style={{ width: 170 }}
               value={auditEntity}

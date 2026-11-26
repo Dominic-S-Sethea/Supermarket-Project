@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { formatBp, formatMoney, generateUuidV7 } from "@supermarket/shared/money";
 import { evaluateCart, type CartInputLine, type PromotionRule } from "@supermarket/shared/pricing";
 import {
-  AlertTriangle,
   CheckCircle2,
   CloudOff,
   CreditCard,
@@ -12,16 +11,23 @@ import {
   Play,
   Receipt,
   RefreshCw,
-  RotateCcw,
   ShieldCheck,
   Sparkles,
-  Ticket,
   Trash2,
-  UserCheck,
   Wifi,
-  X,
 } from "lucide-react";
 import { ApiError, apiGet, apiPost } from "../api";
+import { PosLoyaltyCard, type AppliedCoupon, type PosCustomer } from "../components/PosLoyaltyCard";
+import {
+  AgeVerificationModal,
+  DeadLetterModal,
+  OpenShiftModal,
+  RecentReceiptsModal,
+  ShiftCloseModal,
+  type ActiveShiftInfo,
+  type RecentSaleRow,
+  type ZReportSummary,
+} from "../components/PosModals";
 import {
   appendDeadLetterSale,
   classifySaleSyncError,
@@ -43,67 +49,16 @@ type BootstrapBarcode = PosBootstrapSnapshot["barcodes"][number];
 type BootstrapTax = PosBootstrapSnapshot["taxRates"][number];
 type BasketRule = NonNullable<PosBootstrapSnapshot["basketRules"]>[number];
 
-interface PosCustomer {
-  id: string;
-  phone: string;
-  fullName: string;
-  pointsBalance: number;
-  rfmSegment: string;
-}
-
-interface AppliedCoupon {
-  id: string;
-  code: string;
-  discountCents: number;
-  minBasketCents: number;
-  customerId: string | null;
-}
-
-interface RecentSaleLine {
-  id: string;
-  productId: string;
-  productName: string;
-  scannedBarcode: string;
-  packLabel: string;
-  packQty: number;
-  qtyPacks: number;
-  unitPriceCents: number;
-  unitCostCents: number;
-  discountCents: number;
-  taxRateBp: number;
-  taxCents: number;
-  lineTotalCents: number;
-}
-
-interface RecentSalePayment {
-  id: string;
-  method: "cash" | "card" | "mobile_pay" | "voucher";
-  amountCents: number;
-}
-
-interface RecentSaleRow {
-  id: string;
-  registerCode: string;
-  receiptNo: string;
-  kind: "sale" | "refund" | "void";
-  originalSaleId: string | null;
-  customerId: string | null;
-  cashierName: string;
-  totalCents: number;
-  soldAt: string;
-  alreadyVoided: boolean;
-  lines: RecentSaleLine[];
-  payments: RecentSalePayment[];
-}
-
 export function PosTerminalView({
   cashierName = "Elena Morales",
   userRole = "owner",
   isActive = true,
+  catalogRefreshTick = 0,
 }: {
   cashierName?: string;
   userRole?: UserRole;
   isActive?: boolean;
+  catalogRefreshTick?: number;
 }) {
   const canVoidOrRefund = userRole === "owner" || userRole === "manager";
   const [productsMap, setProductsMap] = useState<Map<string, BootstrapProduct>>(new Map());
@@ -135,6 +90,9 @@ export function PosTerminalView({
   const [syncingQueue, setSyncingQueue] = useState(false);
   const [daypartPreview, setDaypartPreview] = useState<"live" | "morning" | "evening">("live");
 
+  // Active Register Shift (hydrated from GET /api/pos/shifts/active — H-17)
+  const [activeShift, setActiveShift] = useState<ActiveShiftInfo | null>(null);
+
   // Loyalty Customer & Single-Use Coupon
   const [customerLookupInput, setCustomerLookupInput] = useState("");
   const [customerResults, setCustomerResults] = useState<PosCustomer[]>([]);
@@ -160,14 +118,10 @@ export function PosTerminalView({
   // Blind Shift Close Modal
   const [showShiftClose, setShowShiftClose] = useState(false);
   const [blindCashInput, setBlindCashInput] = useState("420.00");
+  const [fallbackFloatInput, setFallbackFloatInput] = useState("300.00");
   const [closingShift, setClosingShift] = useState(false);
   const [shiftError, setShiftError] = useState<string | null>(null);
-  const [zReportResult, setZReportResult] = useState<{
-    zReportNo: string;
-    expectedCashCents: number;
-    blindCountedCashCents: number;
-    varianceCents: number;
-  } | null>(null);
+  const [zReportResult, setZReportResult] = useState<ZReportSummary | null>(null);
 
   const [offlineQueue, setOfflineQueue] = useState<QueuedPosSale[]>(() => loadOfflineQueue());
   const [deadLetterQueue, setDeadLetterQueue] = useState<DeadLetterPosSale[]>(() =>
@@ -184,7 +138,7 @@ export function PosTerminalView({
   offlineQueueRef.current = offlineQueue;
   simulatedOfflineRef.current = simulatedOffline;
 
-  // Reset age verification automatically whenever basket becomes empty (prevents carryover to next customer)
+  // Reset age verification automatically whenever basket becomes empty
   useEffect(() => {
     if (cart.length === 0 && ageVerified) {
       setAgeVerified(false);
@@ -202,116 +156,136 @@ export function PosTerminalView({
     }
   }, [isActive, anyModalOpen]);
 
-  // Escape closes modals and restores scanner focus
-  useEffect(() => {
-    if (!anyModalOpen) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setPendingAgeItem(null);
-        setShowShiftClose(false);
-        setShowShiftOpen(false);
-        setShowRecentReceipts(false);
-        setShowDeadLetterModal(false);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [anyModalOpen]);
-
-  const hydrateFromSnapshot = (
-    data: PosBootstrapSnapshot,
-    source: "live" | "indexeddb"
-  ) => {
-    const pMap = new Map(data.products.map((p) => [p.id, p]));
-    const bMap = new Map(data.barcodes.map((b) => [b.barcode, b]));
-    const primMap = new Map<string, BootstrapBarcode>();
-    for (const bc of data.barcodes) {
-      if (bc.isPrimary || !primMap.has(bc.productId)) {
-        primMap.set(bc.productId, bc);
-      }
-    }
-    const tMap = new Map(data.taxRates.map((t) => [t.id, t]));
-    const parsedPromos = mapBootstrapPromotions(data.promotions);
-
-    setProductsMap(pMap);
-    setBarcodesMap(bMap);
-    setPrimaryByProductMap(primMap);
-    setTaxMap(tMap);
-    setPromos(parsedPromos);
-    setBasketRules(data.basketRules ?? []);
-    setSyncedAt(data.syncedAt);
-    setCacheSource(source);
-    setBootstrapError(null);
-
-    const picks: typeof quickItems = [];
-    const findMatching = (prefix: string, packQty: number, badge: string, limit: number) => {
-      let added = 0;
-      for (const bc of data.barcodes) {
-        const p = pMap.get(bc.productId);
-        if (p && p.sku.startsWith(prefix) && bc.packQty === packQty) {
-          picks.push({
-            barcode: bc.barcode,
-            name: p.name,
-            packLabel: bc.packLabel,
-            packQty: bc.packQty,
-            priceCents: bc.sellPriceCents,
-            badge,
-          });
-          added++;
-          if (added >= limit) break;
-        }
-      }
-    };
-
-    findMatching("BEER", 6, "Beer 6-Pack · 18+", 2);
-    findMatching("BEER", 1, "Beer Single · 18+", 1);
-    findMatching("NDLS", 1, "5 for $3.95 Promo", 3);
-    findMatching("NDLS", 5, "5-Pack Bundle", 1);
-    findMatching("SNCK", 1, "Buy 2 Get 1 Free", 3);
-    findMatching("SODA", 6, "Soda 6-Pack", 1);
-    findMatching("ENRG", 1, "Energy Can", 1);
-    setQuickItems(picks);
-  };
-
-  const loadBootstrap = async (signal?: AbortSignal) => {
-    setBootstrapLoading(true);
-    setBootstrapError(null);
-    let hasCached = false;
+  const loadActiveShift = useCallback(async (signal?: AbortSignal) => {
     try {
-      const cached = await loadPosCache();
-      if (cached && !signal?.aborted) {
-        hasCached = true;
-        hydrateFromSnapshot(cached, "indexeddb");
-      }
-      try {
-        const live = await apiGet<PosBootstrapSnapshot>("/api/pos/bootstrap", signal);
-        if (!signal?.aborted) {
-          hydrateFromSnapshot(live, "live");
-          await savePosCache(live);
-        }
-      } catch (err) {
-        if ((err as Error).name === "AbortError") return;
-        if (!hasCached) {
-          setBootstrapError(
-            err instanceof Error
-              ? err.message
-              : "Could not load POS catalog from API or local IndexedDB cache."
-          );
-        }
-      }
-    } finally {
+      const res = await apiGet<{ shift: ActiveShiftInfo | null }>(
+        "/api/pos/shifts/active?registerCode=REG-01",
+        signal
+      );
       if (!signal?.aborted) {
-        setBootstrapLoading(false);
+        setActiveShift(res.shift);
+        if (res.shift) {
+          setFallbackFloatInput((res.shift.openingFloatCents / 100).toFixed(2));
+        }
       }
+    } catch {
+      // ignore shift hydrate errors while offline
     }
-  };
+  }, []);
 
-  // Load persisted IndexedDB cache immediately, then refresh from live API when reachable
+  const hydrateFromSnapshot = useCallback(
+    (data: PosBootstrapSnapshot, source: "live" | "indexeddb") => {
+      const pMap = new Map(data.products.map((p) => [p.id, p]));
+      const bMap = new Map(data.barcodes.map((b) => [b.barcode, b]));
+      const primMap = new Map<string, BootstrapBarcode>();
+      for (const bc of data.barcodes) {
+        if (bc.isPrimary || !primMap.has(bc.productId)) {
+          primMap.set(bc.productId, bc);
+        }
+      }
+      const tMap = new Map(data.taxRates.map((t) => [t.id, t]));
+      const parsedPromos = mapBootstrapPromotions(data.promotions);
+
+      setProductsMap(pMap);
+      setBarcodesMap(bMap);
+      setPrimaryByProductMap(primMap);
+      setTaxMap(tMap);
+      setPromos(parsedPromos);
+      setBasketRules(data.basketRules ?? []);
+      setSyncedAt(data.syncedAt);
+      setCacheSource(source);
+      setBootstrapError(null);
+
+      const picks: {
+        barcode: string;
+        name: string;
+        packLabel: string;
+        packQty: number;
+        priceCents: number;
+        badge: string;
+      }[] = [];
+      const findMatching = (prefix: string, packQty: number, badge: string, limit: number) => {
+        let added = 0;
+        for (const bc of data.barcodes) {
+          const p = pMap.get(bc.productId);
+          if (p && p.sku.startsWith(prefix) && bc.packQty === packQty) {
+            picks.push({
+              barcode: bc.barcode,
+              name: p.name,
+              packLabel: bc.packLabel,
+              packQty: bc.packQty,
+              priceCents: bc.sellPriceCents,
+              badge,
+            });
+            added++;
+            if (added >= limit) break;
+          }
+        }
+      };
+
+      findMatching("BEER", 6, "Beer 6-Pack · 18+", 2);
+      findMatching("BEER", 1, "Beer Single · 18+", 1);
+      findMatching("NDLS", 1, "5 for $3.95 Promo", 3);
+      findMatching("NDLS", 5, "5-Pack Bundle", 1);
+      findMatching("SNCK", 1, "Buy 2 Get 1 Free", 3);
+      findMatching("SODA", 6, "Soda 6-Pack", 1);
+      findMatching("ENRG", 1, "Energy Can", 1);
+      setQuickItems(picks);
+    },
+    []
+  );
+
+  const loadBootstrap = useCallback(
+    async (signal?: AbortSignal) => {
+      setBootstrapLoading(true);
+      setBootstrapError(null);
+      let hasCached = false;
+      try {
+        const cached = await loadPosCache();
+        if (cached && !signal?.aborted) {
+          hasCached = true;
+          hydrateFromSnapshot(cached, "indexeddb");
+        }
+        try {
+          const live = await apiGet<PosBootstrapSnapshot>("/api/pos/bootstrap", signal);
+          if (!signal?.aborted) {
+            hydrateFromSnapshot(live, "live");
+            await savePosCache(live);
+          }
+        } catch (err) {
+          if ((err as Error).name === "AbortError") return;
+          if (!hasCached) {
+            setBootstrapError(
+              err instanceof Error
+                ? err.message
+                : "Could not load POS catalog from API or local IndexedDB cache."
+            );
+          }
+        }
+      } finally {
+        if (!signal?.aborted) {
+          setBootstrapLoading(false);
+        }
+      }
+    },
+    [hydrateFromSnapshot]
+  );
+
+  // Initial load + active shift hydration
   useEffect(() => {
     const controller = new AbortController();
     void loadBootstrap(controller.signal);
+    void loadActiveShift(controller.signal);
     return () => controller.abort();
-  }, []);
+  }, [loadBootstrap, loadActiveShift]);
+
+  // Refresh POS catalog/promos in place whenever AI Copilot executes a price/promo mutation (H-17)
+  useEffect(() => {
+    if (catalogRefreshTick <= 0) return;
+    const controller = new AbortController();
+    void loadBootstrap(controller.signal);
+    return () => controller.abort();
+  }, [catalogRefreshTick, loadBootstrap]);
 
   // Automatically flush offline queue when browser network connectivity returns
   useEffect(() => {
@@ -483,7 +457,6 @@ export function PosTerminalView({
           }
         }
       }
-      // Persist remaining queue synchronously before state update (survives immediate 401 unmount)
       saveOfflineQueue(remaining);
       setOfflineQueue(remaining);
       setDeadLetterQueue(latestDeadLetters);
@@ -637,6 +610,7 @@ export function PosTerminalView({
       const payload: QueuedPosSale = {
         id: saleId,
         registerCode: "REG-01",
+        shiftId: activeShift?.id ?? null,
         receiptNo,
         kind: "sale",
         soldAt: nowIso,
@@ -690,7 +664,6 @@ export function PosTerminalView({
             setSyncError(msg);
             return;
           }
-          // Synchronously persist to localStorage before React unmounts on 401 expiry
           const nextQueue = enqueueOfflineSale(payload);
           setOfflineQueue(nextQueue);
           setReceiptPreview(buildPaperReceipt(receiptNo, saleId, method, "[OFFLINE QUEUED]"));
@@ -725,13 +698,22 @@ export function PosTerminalView({
     }
     setOpeningShift(true);
     try {
-      const res = await apiPost<{ id: string; registerCode: string; openingFloatCents: number }>(
-        "/api/pos/shifts/open",
-        {
-          registerCode: "REG-01",
-          openingFloatCents: Math.round(parsedFloat * 100),
-        }
-      );
+      const res = await apiPost<{
+        id: string;
+        registerCode: string;
+        openingFloatCents: number;
+        openedAt?: string;
+      }>("/api/pos/shifts/open", {
+        registerCode: "REG-01",
+        openingFloatCents: Math.round(parsedFloat * 100),
+      });
+      setActiveShift({
+        id: res.id,
+        registerCode: res.registerCode,
+        openingFloatCents: res.openingFloatCents,
+        openedAt: res.openedAt ?? new Date().toISOString(),
+      });
+      setFallbackFloatInput((res.openingFloatCents / 100).toFixed(2));
       setOpenShiftBanner(
         `Shift active on ${res.registerCode} with opening float ${formatMoney(res.openingFloatCents)}.`
       );
@@ -768,6 +750,7 @@ export function PosTerminalView({
       await apiPost("/api/pos/sales", {
         id: reversalId,
         registerCode: sale.registerCode,
+        shiftId: activeShift?.registerCode === sale.registerCode ? activeShift.id : null,
         receiptNo,
         kind,
         originalSaleId: sale.id,
@@ -818,20 +801,26 @@ export function PosTerminalView({
       setShiftError("Enter a valid non-negative cash count amount.");
       return;
     }
+    let openingFloatCents = activeShift?.openingFloatCents;
+    if (openingFloatCents === undefined) {
+      const parsedFallback = Number(fallbackFloatInput);
+      if (!Number.isFinite(parsedFallback) || parsedFallback < 0) {
+        setShiftError("Enter a valid non-negative opening float amount.");
+        return;
+      }
+      openingFloatCents = Math.round(parsedFallback * 100);
+    }
+
     setClosingShift(true);
     try {
-      const res = await apiPost<{
-        zReportNo: string;
-        expectedCashCents: number;
-        blindCountedCashCents: number;
-        varianceCents: number;
-      }>("/api/pos/shifts/close", {
+      const res = await apiPost<ZReportSummary>("/api/pos/shifts/close", {
         registerCode: "REG-01",
-        openingFloatCents: 30000,
+        openingFloatCents,
         cashDropsCents: 0,
         blindCountedCashCents: Math.round(parsedCash * 100),
       });
       setZReportResult(res);
+      setActiveShift(null);
     } catch (err) {
       setShiftError(err instanceof Error ? err.message : "Failed closing shift");
     } finally {
@@ -843,7 +832,16 @@ export function PosTerminalView({
     <div>
       <header className="page-header">
         <div>
-          <h1>Offline-First POS Checkout Terminal</h1>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <h1>Offline-First POS Checkout Terminal</h1>
+            {activeShift ? (
+              <span className="tag tag-green mono">
+                Shift Active · Float {formatMoney(activeShift.openingFloatCents)}
+              </span>
+            ) : (
+              <span className="tag tag-neutral mono">No Open Shift</span>
+            )}
+          </div>
           <p className="page-subtitle">
             Local cache (
             {cacheSource === "indexeddb"
@@ -860,6 +858,7 @@ export function PosTerminalView({
         <div className="header-actions">
           <select
             id="pos-daypart-select"
+            aria-label="POS promotion clock daypart preview"
             className="select"
             value={daypartPreview}
             onChange={(e) => setDaypartPreview(e.target.value as "live" | "morning" | "evening")}
@@ -871,6 +870,7 @@ export function PosTerminalView({
           </select>
           <button
             id="toggle-offline-sim-btn"
+            type="button"
             className={`btn ${simulatedOffline ? "btn-amber" : ""}`}
             onClick={() => {
               const nextOffline = !simulatedOffline;
@@ -880,60 +880,66 @@ export function PosTerminalView({
               }
             }}
           >
-            {simulatedOffline ? <CloudOff size={14} /> : <Wifi size={14} />}
+            {simulatedOffline ? <CloudOff size={14} aria-hidden="true" /> : <Wifi size={14} aria-hidden="true" />}
             {simulatedOffline ? "Offline Mode Active (Click to Reconnect)" : "Simulate Internet Outage"}
           </button>
           {offlineQueue.length > 0 && !simulatedOffline && (
             <button
               id="flush-offline-queue-btn"
+              type="button"
               className="btn btn-primary"
               disabled={syncingQueue}
               onClick={() => void flushOfflineQueue()}
             >
-              <RefreshCw size={14} />{" "}
+              <RefreshCw size={14} aria-hidden="true" />{" "}
               {syncingQueue ? "Syncing..." : `Sync ${offlineQueue.length} Queued Sale(s)`}
             </button>
           )}
           <button
             id="open-shift-btn"
+            type="button"
             className="btn"
             onClick={() => {
               setShowShiftOpen(true);
               setShiftError(null);
               setOpenShiftBanner(null);
+              void loadActiveShift();
             }}
           >
-            <Play size={14} /> Open Shift
+            <Play size={14} aria-hidden="true" /> Open Shift
           </button>
           <button
             id="recent-receipts-btn"
+            type="button"
             className="btn"
             onClick={() => {
               setShowRecentReceipts(true);
               void loadRecentSales();
             }}
           >
-            <History size={14} /> Receipts
+            <History size={14} aria-hidden="true" /> Receipts
           </button>
           <button
             id="open-shift-close-btn"
+            type="button"
             className="btn"
             onClick={() => {
               setShowShiftClose(true);
               setZReportResult(null);
               setShiftError(null);
+              void loadActiveShift();
             }}
           >
-            <Receipt size={14} /> Blind Close (Z-Report)
+            <Receipt size={14} aria-hidden="true" /> Blind Close (Z-Report)
           </button>
         </div>
       </header>
 
       {bootstrapError && (
-        <div className="banner banner-red" style={{ marginBottom: 12 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
           <span>{bootstrapError}</span>
-          <button className="btn btn-sm" onClick={() => void loadBootstrap()}>
-            <RefreshCw size={12} /> Retry Sync
+          <button type="button" className="btn btn-sm" onClick={() => void loadBootstrap()}>
+            <RefreshCw size={12} aria-hidden="true" /> Retry Sync
           </button>
         </div>
       )}
@@ -941,7 +947,7 @@ export function PosTerminalView({
       {syncError && (
         <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
           <span>{syncError}</span>
-          <button className="btn btn-sm" onClick={() => setSyncError(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setSyncError(null)}>
             Dismiss
           </button>
         </div>
@@ -954,6 +960,7 @@ export function PosTerminalView({
           </span>
           <button
             id="open-dead-letter-modal-btn"
+            type="button"
             className="btn btn-sm"
             onClick={() => setShowDeadLetterModal(true)}
           >
@@ -965,6 +972,7 @@ export function PosTerminalView({
       {(simulatedOffline || offlineQueue.length > 0 || syncMessage) && (
         <div
           className={`banner ${simulatedOffline ? "banner-amber" : "banner-green"}`}
+          role="status"
           style={{ marginBottom: 16 }}
         >
           <span>
@@ -993,6 +1001,7 @@ export function PosTerminalView({
               <input
                 ref={scanRef}
                 id="pos-barcode-input"
+                aria-label="Scan EAN-13 or UPC-A barcode"
                 className="input"
                 placeholder="Scan EAN-13 / UPC-A barcode (USB HID scanner or paste code) + Enter..."
                 value={scanInput}
@@ -1004,9 +1013,9 @@ export function PosTerminalView({
               </button>
             </form>
             {scanError && (
-              <div className="banner banner-red" style={{ marginBottom: 12 }}>
+              <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
                 <span>{scanError}</span>
-                <button className="btn btn-sm" onClick={() => setScanError(null)}>
+                <button type="button" className="btn btn-sm" onClick={() => setScanError(null)}>
                   Dismiss
                 </button>
               </div>
@@ -1034,6 +1043,7 @@ export function PosTerminalView({
                 {quickItems.map((q) => (
                   <button
                     key={q.barcode}
+                    type="button"
                     className="quick-sku-btn"
                     onClick={() => handleScanSubmit(q.barcode)}
                   >
@@ -1056,7 +1066,7 @@ export function PosTerminalView({
               <div className="panel-header" style={{ marginBottom: 8 }}>
                 <h2 className="panel-title">Last 80mm ESC/POS Thermal Receipt</h2>
                 <span className="tag tag-green">
-                  <CheckCircle2 size={12} /> Ready for TCP:9100 / RJ-11 Drawer Kick
+                  <CheckCircle2 size={12} aria-hidden="true" /> Ready for TCP:9100 / RJ-11 Drawer Kick
                 </span>
               </div>
               <div className="thermal-paper">{receiptPreview}</div>
@@ -1070,6 +1080,7 @@ export function PosTerminalView({
             <h2 className="panel-title">Current Basket (Lane 01)</h2>
             {cart.length > 0 && (
               <button
+                type="button"
                 className="btn btn-sm"
                 disabled={submittingSale}
                 onClick={() => {
@@ -1077,7 +1088,7 @@ export function PosTerminalView({
                   setAgeVerified(false);
                 }}
               >
-                <Trash2 size={13} /> Clear
+                <Trash2 size={13} aria-hidden="true" /> Clear
               </button>
             )}
           </div>
@@ -1085,7 +1096,7 @@ export function PosTerminalView({
           {evaluated.requiresAgeCheck && ageVerified && (
             <div className="banner banner-green" style={{ padding: "7px 10px", fontSize: 12 }}>
               <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                <ShieldCheck size={14} /> Alcohol Age Check Verified
+                <ShieldCheck size={14} aria-hidden="true" /> Alcohol Age Check Verified
               </span>
             </div>
           )}
@@ -1120,6 +1131,7 @@ export function PosTerminalView({
                     </div>
                     <div className="qty-stepper" style={{ marginTop: 4 }}>
                       <button
+                        type="button"
                         className="qty-btn"
                         aria-label={`Decrease quantity for ${line.name}`}
                         disabled={submittingSale}
@@ -1141,6 +1153,7 @@ export function PosTerminalView({
                         {line.qtyPacks}
                       </span>
                       <button
+                        type="button"
                         className="qty-btn"
                         aria-label={`Increase quantity for ${line.name}`}
                         disabled={submittingSale}
@@ -1166,7 +1179,7 @@ export function PosTerminalView({
           {upsellSuggestions.length > 0 && (
             <div className="upsell-box">
               <div style={{ fontSize: 11, fontWeight: 700, color: "var(--accent-primary)", display: "flex", alignItems: "center", gap: 5 }}>
-                <Sparkles size={12} /> OFFLINE-SAFE BASKET UPSELLS
+                <Sparkles size={12} aria-hidden="true" /> OFFLINE-SAFE BASKET UPSELLS
               </div>
               {upsellSuggestions.map((u) => (
                 <div key={u.productId} className="upsell-row">
@@ -1180,6 +1193,7 @@ export function PosTerminalView({
                     </div>
                   </div>
                   <button
+                    type="button"
                     className="btn btn-sm"
                     disabled={submittingSale}
                     onClick={() => handleScanSubmit(u.barcode)}
@@ -1191,140 +1205,31 @@ export function PosTerminalView({
             </div>
           )}
 
-          {/* Loyalty Customer & Single-Use Coupon Card */}
-          <div
-            style={{
-              border: "1px solid var(--border-hairline)",
-              borderRadius: "var(--radius-md)",
-              padding: "10px 11px",
-              background: "var(--bg-subtle)",
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
+          <PosLoyaltyCard
+            attachedCustomer={attachedCustomer}
+            customerLookupInput={customerLookupInput}
+            customerResults={customerResults}
+            appliedCoupon={appliedCoupon}
+            couponEligibleNow={couponEligibleNow}
+            couponInput={couponInput}
+            couponFeedback={couponFeedback}
+            validatingCoupon={validatingCoupon}
+            simulatedOffline={simulatedOffline}
+            onCustomerLookupInputChange={setCustomerLookupInput}
+            onLookupCustomer={() => void handleLookupCustomer()}
+            onSelectCustomer={(c) => {
+              setAttachedCustomer(c);
+              setCustomerResults([]);
+              setCustomerLookupInput("");
             }}
-          >
-            {attachedCustomer ? (
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
-                <span style={{ fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
-                  <UserCheck size={14} style={{ color: "var(--accent-primary)" }} />
-                  <strong>{attachedCustomer.fullName}</strong>
-                  <span className="tag tag-blue mono" style={{ fontSize: 10 }}>
-                    {attachedCustomer.pointsBalance} pts
-                  </span>
-                </span>
-                <button
-                  className="btn btn-sm"
-                  aria-label="Detach loyalty customer"
-                  onClick={() => setAttachedCustomer(null)}
-                >
-                  <X size={12} />
-                </button>
-              </div>
-            ) : (
-              <div style={{ display: "flex", gap: 6 }}>
-                <input
-                  id="pos-customer-lookup"
-                  className="input"
-                  style={{ fontSize: 12, padding: "5px 8px" }}
-                  placeholder="Loyalty phone or name..."
-                  value={customerLookupInput}
-                  onChange={(e) => setCustomerLookupInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void handleLookupCustomer();
-                    }
-                  }}
-                />
-                <button
-                  id="pos-customer-lookup-btn"
-                  type="button"
-                  className="btn btn-sm"
-                  disabled={simulatedOffline || !customerLookupInput.trim()}
-                  onClick={() => void handleLookupCustomer()}
-                >
-                  Find
-                </button>
-              </div>
-            )}
-
-            {customerResults.length > 0 && !attachedCustomer && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {customerResults.map((c) => (
-                  <button
-                    key={c.id}
-                    type="button"
-                    className="btn btn-sm"
-                    style={{ justifyContent: "space-between", fontSize: 11.5 }}
-                    onClick={() => {
-                      setAttachedCustomer(c);
-                      setCustomerResults([]);
-                      setCustomerLookupInput("");
-                    }}
-                  >
-                    <span>
-                      {c.fullName} ({c.phone})
-                    </span>
-                    <span className="mono">{c.pointsBalance} pts</span>
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {appliedCoupon ? (
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
-                <span style={{ fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
-                  <Ticket size={14} style={{ color: couponEligibleNow ? "var(--accent-primary)" : "var(--accent-amber)" }} />
-                  <strong className="mono">{appliedCoupon.code}</strong>
-                  <span className={`tag ${couponEligibleNow ? "tag-green" : "tag-amber"} mono`} style={{ fontSize: 10 }}>
-                    {couponEligibleNow
-                      ? `-${formatMoney(appliedCoupon.discountCents)}`
-                      : `Min ${formatMoney(appliedCoupon.minBasketCents)}`}
-                  </span>
-                </span>
-                <button
-                  className="btn btn-sm"
-                  aria-label="Remove coupon"
-                  onClick={() => {
-                    setAppliedCoupon(null);
-                    setCouponFeedback(null);
-                  }}
-                >
-                  <X size={12} />
-                </button>
-              </div>
-            ) : (
-              <div style={{ display: "flex", gap: 6 }}>
-                <input
-                  id="pos-coupon-input"
-                  className="input mono"
-                  style={{ fontSize: 12, padding: "5px 8px" }}
-                  placeholder="Coupon code (e.g., SAVE5-...)..."
-                  value={couponInput}
-                  onChange={(e) => setCouponInput(e.target.value.toUpperCase())}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void handleApplyCoupon();
-                    }
-                  }}
-                />
-                <button
-                  id="pos-apply-coupon-btn"
-                  type="button"
-                  className="btn btn-sm"
-                  disabled={validatingCoupon || simulatedOffline || !couponInput.trim()}
-                  onClick={() => void handleApplyCoupon()}
-                >
-                  {validatingCoupon ? "..." : "Apply"}
-                </button>
-              </div>
-            )}
-
-            {couponFeedback && (
-              <div style={{ fontSize: 11.5, color: "var(--ink-secondary)" }}>{couponFeedback}</div>
-            )}
-          </div>
+            onDetachCustomer={() => setAttachedCustomer(null)}
+            onCouponInputChange={setCouponInput}
+            onApplyCoupon={() => void handleApplyCoupon()}
+            onRemoveCoupon={() => {
+              setAppliedCoupon(null);
+              setCouponFeedback(null);
+            }}
+          />
 
           <div className="totals-box">
             <div className="total-row">
@@ -1345,10 +1250,12 @@ export function PosTerminalView({
               <span>VAT / Excise Tax</span>
               <span className="mono">{formatMoney(evaluated.totalTaxCents)}</span>
             </div>
-            <div className="total-row" style={{ fontSize: 11.5 }}>
-              <span>Live Basket Margin (Cost Snapshot)</span>
-              <span className="mono">{formatBp(evaluated.estimatedMarginBp)}</span>
-            </div>
+            {canVoidOrRefund && (
+              <div className="total-row" style={{ fontSize: 11.5 }}>
+                <span>Live Basket Margin (Cost Snapshot)</span>
+                <span className="mono">{formatBp(evaluated.estimatedMarginBp)}</span>
+              </div>
+            )}
             <div className="total-row grand">
               <span>Total Due</span>
               <span className="mono">{formatMoney(evaluated.grandTotalCents)}</span>
@@ -1358,22 +1265,25 @@ export function PosTerminalView({
           <div className="tender-grid">
             <button
               id="pos-pay-cash-btn"
+              type="button"
               className="btn btn-primary"
               disabled={evaluated.lines.length === 0 || submittingSale}
               onClick={() => void completeSale("cash")}
             >
-              <DollarSign size={14} /> {submittingSale ? "Saving..." : "Cash"}
+              <DollarSign size={14} aria-hidden="true" /> {submittingSale ? "Saving..." : "Cash"}
             </button>
             <button
               id="pos-pay-card-btn"
+              type="button"
               className="btn btn-primary"
               disabled={evaluated.lines.length === 0 || submittingSale}
               onClick={() => void completeSale("card")}
             >
-              <CreditCard size={14} /> Card
+              <CreditCard size={14} aria-hidden="true" /> Card
             </button>
             <button
               id="pos-pay-mobile-btn"
+              type="button"
               className="btn"
               disabled={evaluated.lines.length === 0 || submittingSale}
               onClick={() => void completeSale("mobile_pay")}
@@ -1384,317 +1294,65 @@ export function PosTerminalView({
         </aside>
       </div>
 
-      {/* Alcohol Age Verification Modal */}
-      {pendingAgeItem && (
-        <div className="overlay centered" onClick={() => setPendingAgeItem(null)}>
-          <div className="modal" style={{ maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: "flex", gap: 10, alignItems: "center", color: "var(--accent-amber)" }}>
-              <AlertTriangle size={22} />
-              <h2 style={{ margin: 0, fontSize: 18, color: "var(--ink-primary)" }}>
-                Age Verification Required
-              </h2>
-            </div>
-            <p style={{ margin: 0, color: "var(--ink-secondary)" }}>
-              This SKU belongs to an age-restricted alcohol category. Please verify customer photo ID before proceeding with checkout.
-            </p>
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-              <button className="btn" onClick={() => setPendingAgeItem(null)}>
-                Cancel Scan
-              </button>
-              <button
-                id="confirm-age-check-btn"
-                className="btn btn-primary"
-                onClick={() => {
-                  const item = pendingAgeItem;
-                  setAgeVerified(true);
-                  setPendingAgeItem(null);
-                  addBarcodeToCart(item, true);
-                  scanRef.current?.focus();
-                }}
-              >
-                <ShieldCheck size={14} /> ID Verified — Add to Basket
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <AgeVerificationModal
+        open={Boolean(pendingAgeItem)}
+        onCancel={() => setPendingAgeItem(null)}
+        onConfirm={() => {
+          if (!pendingAgeItem) return;
+          const item = pendingAgeItem;
+          setAgeVerified(true);
+          setPendingAgeItem(null);
+          addBarcodeToCart(item, true);
+          scanRef.current?.focus();
+        }}
+      />
 
-      {/* Open Shift Modal */}
-      {showShiftOpen && (
-        <div className="overlay centered" onClick={() => setShowShiftOpen(false)}>
-          <div className="modal" style={{ maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: 0, fontSize: 18 }}>Open Register Shift (Lane 01)</h2>
-            <p className="page-subtitle" style={{ margin: 0 }}>
-              Record starting drawer float for blind Z-Report reconciliation at end of shift.
-            </p>
-            {shiftError && <div className="banner banner-red">{shiftError}</div>}
-            {openShiftBanner && <div className="banner banner-green">{openShiftBanner}</div>}
-            <div className="field">
-              <label htmlFor="open-float-input">Opening Cash Float ($ USD)</label>
-              <input
-                id="open-float-input"
-                className="input mono"
-                value={openFloatInput}
-                onChange={(e) => setOpenFloatInput(e.target.value)}
-                disabled={openingShift}
-              />
-            </div>
-            <div style={{ display: "flex", gap: 10 }}>
-              <button
-                id="confirm-open-shift-btn"
-                className="btn btn-primary"
-                disabled={openingShift}
-                onClick={() => void handleOpenShift()}
-              >
-                {openingShift ? "Opening..." : "Open Shift on REG-01"}
-              </button>
-              <button className="btn" onClick={() => setShowShiftOpen(false)}>
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <OpenShiftModal
+        open={showShiftOpen}
+        activeShift={activeShift}
+        openFloatInput={openFloatInput}
+        openingShift={openingShift}
+        shiftError={shiftError}
+        openShiftBanner={openShiftBanner}
+        onFloatChange={setOpenFloatInput}
+        onSubmit={() => void handleOpenShift()}
+        onClose={() => setShowShiftOpen(false)}
+      />
 
-      {/* Recent Receipts & Manager Void/Refund Modal */}
-      {showRecentReceipts && (
-        <div className="overlay centered" onClick={() => setShowRecentReceipts(false)}>
-          <div className="modal" style={{ maxWidth: 760, width: "92vw" }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <h2 style={{ margin: 0, fontSize: 18 }}>Recent POS Receipts (Lane Feed)</h2>
-                <p className="page-subtitle" style={{ margin: 0 }}>
-                  {canVoidOrRefund
-                    ? "Managers & Owners can post append-only Voids or Refunds that atomically restock ledger inventory and claw back loyalty points."
-                    : "Read-only receipt feed. Voids and Refunds require Store Manager or Owner login."}
-                </p>
-              </div>
-              <button className="btn btn-sm" onClick={() => setShowRecentReceipts(false)}>
-                <X size={14} /> Close
-              </button>
-            </div>
-            {recentError && <div className="banner banner-red">{recentError}</div>}
-            <div className="table-wrap" style={{ maxHeight: 420, overflowY: "auto" }}>
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Receipt</th>
-                    <th>Type</th>
-                    <th>Cashier &amp; Time</th>
-                    <th className="text-right">Items</th>
-                    <th className="text-right">Total</th>
-                    {canVoidOrRefund && <th className="text-right">Manager Action</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  {loadingRecent ? (
-                    <tr>
-                      <td colSpan={canVoidOrRefund ? 6 : 5}>Loading recent receipts...</td>
-                    </tr>
-                  ) : recentSales.length === 0 ? (
-                    <tr>
-                      <td colSpan={canVoidOrRefund ? 6 : 5} style={{ textAlign: "center", color: "var(--ink-muted)" }}>
-                        No receipts recorded yet.
-                      </td>
-                    </tr>
-                  ) : (
-                    recentSales.map((s) => (
-                      <tr key={s.id}>
-                        <td className="mono" style={{ fontWeight: 600 }}>
-                          {s.receiptNo}
-                        </td>
-                        <td>
-                          <span
-                            className={`tag ${
-                              s.kind === "sale"
-                                ? s.alreadyVoided
-                                  ? "tag-neutral"
-                                  : "tag-green"
-                                : "tag-red"
-                            }`}
-                          >
-                            {s.kind === "sale" && s.alreadyVoided ? "voided" : s.kind}
-                          </span>
-                        </td>
-                        <td>
-                          <div style={{ fontSize: 12.5 }}>{s.cashierName}</div>
-                          <div className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
-                            {new Date(s.soldAt).toLocaleString()}
-                          </div>
-                        </td>
-                        <td className="text-right mono">{s.lines.length}</td>
-                        <td className="text-right mono" style={{ fontWeight: 700 }}>
-                          {s.kind === "sale" ? formatMoney(s.totalCents) : `-${formatMoney(s.totalCents)}`}
-                        </td>
-                        {canVoidOrRefund && (
-                          <td className="text-right">
-                            {s.kind === "sale" && !s.alreadyVoided && s.lines.length > 0 ? (
-                              <div style={{ display: "inline-flex", gap: 6 }}>
-                                <button
-                                  className="btn btn-amber btn-sm"
-                                  disabled={busyReceiptId !== null}
-                                  onClick={() => void handleVoidOrRefund(s, "refund")}
-                                >
-                                  <RotateCcw size={12} /> Refund
-                                </button>
-                                <button
-                                  className="btn btn-sm"
-                                  disabled={busyReceiptId !== null}
-                                  onClick={() => void handleVoidOrRefund(s, "void")}
-                                >
-                                  Void
-                                </button>
-                              </div>
-                            ) : (
-                              <span style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>—</span>
-                            )}
-                          </td>
-                        )}
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
+      <RecentReceiptsModal
+        open={showRecentReceipts}
+        canVoidOrRefund={canVoidOrRefund}
+        loadingRecent={loadingRecent}
+        recentSales={recentSales}
+        recentError={recentError}
+        busyReceiptId={busyReceiptId}
+        onVoidOrRefund={(sale, kind) => void handleVoidOrRefund(sale, kind)}
+        onClose={() => setShowRecentReceipts(false)}
+      />
 
-      {/* Blind Shift Close (Z-Report) Modal */}
-      {showShiftClose && (
-        <div className="overlay centered" onClick={() => setShowShiftClose(false)}>
-          <div className="modal" style={{ maxWidth: 480 }} onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: 0, fontSize: 18 }}>Blind Shift Cash Closeout (Z-Report)</h2>
-            <p className="page-subtitle" style={{ margin: 0 }}>
-              Cashier enters counted drawer cash without seeing the expected system total — prevents skimming overages.
-            </p>
-            {shiftError && <div className="banner banner-red">{shiftError}</div>}
-            <div className="field">
-              <label htmlFor="blind-cash-input">Physical Cash Counted in Drawer ($ USD)</label>
-              <input
-                id="blind-cash-input"
-                className="input mono"
-                value={blindCashInput}
-                onChange={(e) => setBlindCashInput(e.target.value)}
-                disabled={closingShift}
-              />
-            </div>
-            <div style={{ display: "flex", gap: 10 }}>
-              <button
-                className="btn btn-primary"
-                disabled={closingShift}
-                onClick={() => void handleCloseShift()}
-              >
-                {closingShift ? "Closing Shift..." : "Submit Blind Count & Generate Z-Report"}
-              </button>
-              <button className="btn" onClick={() => setShowShiftClose(false)}>
-                Close
-              </button>
-            </div>
-            {zReportResult && (
-              <div className="thermal-paper">
-                {`Z-REPORT: ${zReportResult.zReportNo}
-Expected Cash:  ${formatMoney(zReportResult.expectedCashCents)}
-Blind Counted:  ${formatMoney(zReportResult.blindCountedCashCents)}
-Variance:       ${formatMoney(zReportResult.varianceCents)}`}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+      <ShiftCloseModal
+        open={showShiftClose}
+        activeShift={activeShift}
+        blindCashInput={blindCashInput}
+        fallbackFloatInput={fallbackFloatInput}
+        closingShift={closingShift}
+        shiftError={shiftError}
+        zReportResult={zReportResult}
+        onBlindCashChange={setBlindCashInput}
+        onFallbackFloatChange={setFallbackFloatInput}
+        onSubmit={() => void handleCloseShift()}
+        onClose={() => setShowShiftClose(false)}
+      />
 
-      {/* Quarantined Offline Dead-Letter Queue Modal */}
-      {showDeadLetterModal && (
-        <div className="overlay centered" onClick={() => setShowDeadLetterModal(false)}>
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="dlq-modal-title"
-            style={{ maxWidth: 720, width: "94vw" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <h2 id="dlq-modal-title" style={{ margin: 0, fontSize: 18 }}>
-                  Quarantined Offline Receipts (Dead-Letter Queue)
-                </h2>
-                <p className="page-subtitle" style={{ margin: 0 }}>
-                  Receipts rejected with 4xx validation/conflict errors are preserved locally so paid transactions are never lost.
-                </p>
-              </div>
-              <button
-                className="btn btn-sm"
-                aria-label="Close quarantined receipts dialog"
-                onClick={() => setShowDeadLetterModal(false)}
-              >
-                <X size={14} /> Close
-              </button>
-            </div>
-            {deadLetterQueue.length === 0 ? (
-              <div style={{ color: "var(--ink-secondary)", padding: "12px 0" }}>
-                All quarantined receipts have been resolved.
-              </div>
-            ) : (
-              <div className="stack-md" style={{ gap: 10 }}>
-                {deadLetterQueue.map((entry) => {
-                  const totalCents = entry.sale.lines.reduce((s, l) => s + l.lineTotalCents, 0);
-                  return (
-                    <div key={entry.sale.id} className="triage-box">
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-                        <strong className="mono">{entry.sale.receiptNo}</strong>
-                        <span className="tag tag-red mono">
-                          HTTP {entry.status ?? "ERR"} · {formatMoney(totalCents)}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: 12.5, color: "var(--accent-crimson)", marginTop: 4 }}>
-                        {entry.error}
-                      </div>
-                      <div className="mono" style={{ fontSize: 11, color: "var(--ink-muted)", marginTop: 3 }}>
-                        Sold {new Date(entry.sale.soldAt).toLocaleString()} · {entry.sale.lines.length} line(s)
-                        {entry.sale.couponCode ? ` · Coupon: ${entry.sale.couponCode}` : ""}
-                      </div>
-                      <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                        <button
-                          className="btn btn-primary btn-sm"
-                          disabled={syncingQueue}
-                          onClick={() => void handleRetryDeadLetter(entry, false)}
-                        >
-                          <RefreshCw size={12} /> Retry Sync
-                        </button>
-                        {entry.sale.couponCode && (
-                          <button
-                            className="btn btn-amber btn-sm"
-                            disabled={syncingQueue}
-                            onClick={() => void handleRetryDeadLetter(entry, true)}
-                          >
-                            Retry Without Coupon
-                          </button>
-                        )}
-                        <a
-                          className="btn btn-sm"
-                          href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(entry, null, 2))}`}
-                          download={`${entry.sale.receiptNo}-quarantined.json`}
-                        >
-                          Export JSON
-                        </a>
-                        {canVoidOrRefund && (
-                          <button
-                            className="btn btn-danger btn-sm"
-                            onClick={() => handleDismissDeadLetter(entry.sale.id)}
-                          >
-                            Dismiss (Reconciled)
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+      <DeadLetterModal
+        open={showDeadLetterModal}
+        entries={deadLetterQueue}
+        syncingQueue={syncingQueue}
+        canVoidOrRefund={canVoidOrRefund}
+        onRetry={(entry, stripCoupon) => void handleRetryDeadLetter(entry, stripCoupon)}
+        onDismiss={handleDismissDeadLetter}
+        onClose={() => setShowDeadLetterModal(false)}
+      />
     </div>
   );
 }

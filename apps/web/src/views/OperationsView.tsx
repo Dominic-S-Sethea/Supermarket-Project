@@ -7,6 +7,7 @@ import { FloorTasksTab } from "../components/FloorTasksTab";
 import { PurchaseOrdersTab, type ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
 import { ShelfIntegrityTab } from "../components/ShelfIntegrityTab";
 import { SupplierMatchTab } from "../components/SupplierMatchTab";
+import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
 interface MarginAlert {
   id: string;
@@ -84,6 +85,14 @@ interface ParsedInvoiceResponse {
 
 type OpsSubTab = "receiving" | "orders" | "shelf" | "tasks" | "suppliers";
 
+function resolveOpsSubTab(canManage: boolean): OpsSubTab {
+  const fromUrl = readQueryParam("sub") as OpsSubTab | null;
+  const allowed: OpsSubTab[] = canManage
+    ? ["receiving", "orders", "shelf", "tasks", "suppliers"]
+    : ["receiving", "shelf", "tasks"];
+  return fromUrl && allowed.includes(fromUrl) ? fromUrl : "receiving";
+}
+
 export function OperationsView({
   suppliers,
   userRole = "owner",
@@ -94,7 +103,7 @@ export function OperationsView({
   onCountsChanged?: () => void;
 }) {
   const canManage = userRole === "owner" || userRole === "manager";
-  const [subTab, setSubTab] = useState<OpsSubTab>("receiving");
+  const [subTab, setSubTab] = useState<OpsSubTab>(() => resolveOpsSubTab(canManage));
 
   const [marginAlerts, setMarginAlerts] = useState<MarginAlert[]>([]);
   const [expiryBatches, setExpiryBatches] = useState<ExpiryBatch[]>([]);
@@ -123,6 +132,17 @@ export function OperationsView({
   const [scanningInvoice, setScanningInvoice] = useState(false);
   const [scannedInvoice, setScannedInvoice] = useState<ParsedInvoiceResponse | null>(null);
 
+  const selectSubTab = (next: OpsSubTab) => {
+    setSubTab(next);
+    syncQueryParam("sub", next, { push: true });
+  };
+
+  useEffect(() => {
+    const onPopState = () => setSubTab(resolveOpsSubTab(canManage));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [canManage]);
+
   // Keep supplier selection hydrated once metadata arrives asynchronously
   useEffect(() => {
     if (!supplierId && suppliers.length > 0) {
@@ -130,23 +150,33 @@ export function OperationsView({
     }
   }, [suppliers, supplierId]);
 
-  const loadAll = async (days = horizonDays, signal?: AbortSignal) => {
+  const loadMarginAlerts = async (signal?: AbortSignal) => {
+    if (!canManage) {
+      setMarginAlerts([]);
+      return;
+    }
+    try {
+      const ma = await apiGet<{ alerts: MarginAlert[] }>("/api/inventory/margin-alerts", signal);
+      if (!signal?.aborted) setMarginAlerts(ma.alerts);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading margin alerts");
+      }
+    }
+  };
+
+  const loadExpiryBatches = async (days = horizonDays, signal?: AbortSignal) => {
     setLoading(true);
     setErrorMsg(null);
     try {
-      const [ma, exp] = await Promise.all([
-        canManage
-          ? apiGet<{ alerts: MarginAlert[] }>("/api/inventory/margin-alerts", signal)
-          : Promise.resolve({ alerts: [] }),
-        apiGet<{ items: ExpiryBatch[] }>(`/api/inventory/expiry-alerts?days=${days}`, signal),
-      ]);
-      if (signal?.aborted) return;
-      setMarginAlerts(ma.alerts);
-      setExpiryBatches(exp.items);
-      onCountsChanged?.();
+      const exp = await apiGet<{ items: ExpiryBatch[] }>(
+        `/api/inventory/expiry-alerts?days=${days}`,
+        signal
+      );
+      if (!signal?.aborted) setExpiryBatches(exp.items);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        setErrorMsg(err instanceof Error ? err.message : "Failed loading operations data");
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading FEFO expiry batches");
       }
     } finally {
       if (!signal?.aborted) {
@@ -155,11 +185,22 @@ export function OperationsView({
     }
   };
 
+  const refreshAfterMutation = async () => {
+    await Promise.all([loadMarginAlerts(), loadExpiryBatches(horizonDays)]);
+    onCountsChanged?.();
+  };
+
   useEffect(() => {
     const controller = new AbortController();
-    void loadAll(horizonDays, controller.signal);
+    void loadMarginAlerts(controller.signal);
     return () => controller.abort();
-  }, [horizonDays, canManage]);
+  }, [canManage]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadExpiryBatches(horizonDays, controller.signal);
+    return () => controller.abort();
+  }, [horizonDays]);
 
   // Searchable 3,120-SKU picker for GRN receiving (manager/owner only)
   useEffect(() => {
@@ -211,7 +252,7 @@ export function OperationsView({
       setFeedback(
         `Updated ${sku} shelf price to ${formatMoney(res.newSellPriceCents)} (scaled ${res.updatedPackTiers ?? 1} barcode tiers) and resolved alert.`
       );
-      await loadAll();
+      await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating price");
     } finally {
@@ -237,7 +278,7 @@ export function OperationsView({
           ? `Marked batch for ${sku} as 30% Clearance Markdown.`
           : `Wrote off expired ${sku} batch to immutable spoilage ledger.`
       );
-      await loadAll();
+      await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating batch");
     } finally {
@@ -293,7 +334,7 @@ export function OperationsView({
       setFeedback(
         `Posted GRN${linkedLabel} (+${paidUnits + freeUnits} base units added to ledger, effective cost ${formatMoney(effectiveUnitCost)}/unit). Margin alerts: ${res.marginAlertsTriggered}${res.variancesDetected ? `, 3-way variances detected: ${res.variancesDetected}` : ""}.`
       );
-      await loadAll();
+      await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed posting GRN");
     } finally {
@@ -314,7 +355,7 @@ export function OperationsView({
     setFeedback(
       `Loaded ${draft.poNumber} (${draft.sku} — ${draft.productName}, ${draft.paidCases} cs) into the GRN Receiving form for 3-way PO matching.`
     );
-    setSubTab("receiving");
+    selectSubTab("receiving");
   };
 
   const handleInvoiceFileUpload = async (file: File) => {
@@ -412,51 +453,56 @@ export function OperationsView({
         <div className="subtab-bar" role="tablist">
           <button
             id="ops-subtab-receiving"
+            type="button"
             role="tab"
             aria-selected={subTab === "receiving"}
             className={`subtab-btn ${subTab === "receiving" ? "active" : ""}`}
-            onClick={() => setSubTab("receiving")}
+            onClick={() => selectSubTab("receiving")}
           >
-            <PackageCheck size={14} /> Receiving &amp; FEFO
+            <PackageCheck size={14} aria-hidden="true" /> Receiving &amp; FEFO
           </button>
           {canManage && (
             <button
               id="ops-subtab-orders"
+              type="button"
               role="tab"
               aria-selected={subTab === "orders"}
               className={`subtab-btn ${subTab === "orders" ? "active" : ""}`}
-              onClick={() => setSubTab("orders")}
+              onClick={() => selectSubTab("orders")}
             >
-              <FileText size={14} /> Purchase Orders
+              <FileText size={14} aria-hidden="true" /> Purchase Orders
             </button>
           )}
           <button
             id="ops-subtab-shelf"
+            type="button"
             role="tab"
             aria-selected={subTab === "shelf"}
             className={`subtab-btn ${subTab === "shelf" ? "active" : ""}`}
-            onClick={() => setSubTab("shelf")}
+            onClick={() => selectSubTab("shelf")}
           >
-            <Ghost size={14} /> Shelf Integrity &amp; 07:30 Tags
+            <Ghost size={14} aria-hidden="true" /> Shelf Integrity &amp; 07:30 Tags
           </button>
           <button
             id="ops-subtab-tasks"
+            type="button"
             role="tab"
             aria-selected={subTab === "tasks"}
             className={`subtab-btn ${subTab === "tasks" ? "active" : ""}`}
-            onClick={() => setSubTab("tasks")}
+            onClick={() => selectSubTab("tasks")}
           >
-            <ClipboardList size={14} /> Daily Floor Tasks
+            <ClipboardList size={14} aria-hidden="true" /> Daily Floor Tasks
           </button>
           {canManage && (
             <button
               id="ops-subtab-suppliers"
+              type="button"
               role="tab"
               aria-selected={subTab === "suppliers"}
               className={`subtab-btn ${subTab === "suppliers" ? "active" : ""}`}
-              onClick={() => setSubTab("suppliers")}
+              onClick={() => selectSubTab("suppliers")}
             >
-              <Award size={14} /> Supplier OTIF &amp; 3-Way Match
+              <Award size={14} aria-hidden="true" /> Supplier OTIF &amp; 3-Way Match
             </button>
           )}
         </div>
@@ -748,9 +794,11 @@ export function OperationsView({
                   </div>
                 )}
                 <div className="field">
-                  <label>Supplier &amp; Invoice #</label>
+                  <label htmlFor="grn-supplier-select">Supplier &amp; Invoice #</label>
                   <div className="form-grid">
                     <select
+                      id="grn-supplier-select"
+                      aria-label="Supplier"
                       className="select"
                       value={supplierId}
                       onChange={(e) => setSupplierId(e.target.value)}
@@ -767,6 +815,8 @@ export function OperationsView({
                       )}
                     </select>
                     <input
+                      id="grn-invoice-input"
+                      aria-label="Supplier invoice number"
                       className="input mono"
                       value={invoiceNo}
                       onChange={(e) => setInvoiceNo(e.target.value)}
@@ -776,9 +826,9 @@ export function OperationsView({
                 </div>
 
                 <div className="field">
-                  <label>Search &amp; Select Any of 3,120+ SKUs</label>
+                  <label htmlFor="grn-sku-search">Search &amp; Select Any of 3,120+ SKUs</label>
                   <div className="search-box" style={{ maxWidth: "100%", marginBottom: 6 }}>
-                    <Search size={14} className="search-icon" />
+                    <Search size={14} className="search-icon" aria-hidden="true" />
                     <input
                       id="grn-sku-search"
                       className="input"
@@ -788,6 +838,8 @@ export function OperationsView({
                     />
                   </div>
                   <select
+                    id="grn-product-select"
+                    aria-label="Select product SKU for goods receipt"
                     className="select"
                     value={selectedProdId}
                     onChange={(e) => setSelectedProdId(e.target.value)}
@@ -808,8 +860,9 @@ export function OperationsView({
 
                 <div className="form-grid">
                   <div className="field">
-                    <label>Units per Case</label>
+                    <label htmlFor="grn-case-qty">Units per Case</label>
                     <input
+                      id="grn-case-qty"
                       className="input mono"
                       type="number"
                       min={1}
@@ -819,8 +872,9 @@ export function OperationsView({
                     />
                   </div>
                   <div className="field">
-                    <label>Invoice Line Total ($)</label>
+                    <label htmlFor="grn-invoice-total">Invoice Line Total ($)</label>
                     <input
+                      id="grn-invoice-total"
                       className="input mono"
                       value={invoiceTotalUsd}
                       onChange={(e) => setInvoiceTotalUsd(e.target.value)}
@@ -828,8 +882,9 @@ export function OperationsView({
                     />
                   </div>
                   <div className="field">
-                    <label>Paid Cases</label>
+                    <label htmlFor="grn-paid-cases">Paid Cases</label>
                     <input
+                      id="grn-paid-cases"
                       className="input mono"
                       type="number"
                       min={0}
@@ -839,8 +894,9 @@ export function OperationsView({
                     />
                   </div>
                   <div className="field">
-                    <label>Free Bonus Cases</label>
+                    <label htmlFor="grn-free-cases">Free Bonus Cases</label>
                     <input
+                      id="grn-free-cases"
                       className="input mono"
                       type="number"
                       min={0}
@@ -852,8 +908,9 @@ export function OperationsView({
                 </div>
 
                 <div className="field">
-                  <label>Carton Best-Before Date (FEFO Batch)</label>
+                  <label htmlFor="grn-best-before">Carton Best-Before Date (FEFO Batch)</label>
                   <input
+                    id="grn-best-before"
                     className="input mono"
                     type="date"
                     value={bestBefore}
@@ -881,6 +938,7 @@ export function OperationsView({
 
                 <button
                   id="post-grn-btn"
+                  type="button"
                   className="btn btn-primary"
                   disabled={busyAction !== null || !supplierId || !selectedProdId}
                   onClick={() => void handlePostGrn()}
@@ -908,6 +966,7 @@ export function OperationsView({
             </p>
           </div>
           <select
+            aria-label="FEFO expiry alert horizon"
             className="select"
             value={horizonDays}
             onChange={(e) => setHorizonDays(Number(e.target.value))}

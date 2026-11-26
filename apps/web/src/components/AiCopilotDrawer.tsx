@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Plus, Send, Sparkles, Terminal, X } from "lucide-react";
-import { apiGet, apiPost, formatApiErrorPayload } from "../api";
+import { apiGet, apiPost, formatApiErrorPayload, triggerUnauthorized } from "../api";
+import { SlideDrawer } from "./AccessibleDialog";
 
 interface ToolTrace {
   tool: string;
@@ -82,6 +83,12 @@ export function AiCopilotDrawer({
 
   const streamAbortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const conversationIdRef = useRef<string | null>(conversationId);
+  const sendingRef = useRef(sending);
+  const sendMessageRef = useRef<(text?: string) => Promise<void>>(async () => {});
+
+  conversationIdRef.current = conversationId;
+  sendingRef.current = sending;
 
   const abortActiveStream = () => {
     if (streamAbortRef.current) {
@@ -113,16 +120,10 @@ export function AiCopilotDrawer({
     }
     const controller = new AbortController();
     void loadStatusAndHistory(controller.signal);
-
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
     return () => {
       controller.abort();
-      window.removeEventListener("keydown", onKeyDown);
     };
-  }, [open, onClose]);
+  }, [open]);
 
   useEffect(() => {
     return () => {
@@ -131,15 +132,14 @@ export function AiCopilotDrawer({
   }, []);
 
   useEffect(() => {
-    if (open && initialPrompt && !sending) {
-      const p = initialPrompt;
-      onConsumeInitialPrompt?.();
-      void sendMessage(p);
-    }
-  }, [open, initialPrompt]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    messagesEndRef.current?.scrollIntoView({
+      behavior: prefersReducedMotion ? "auto" : "smooth",
+      block: "end",
+    });
   }, [messages.length, streamingText, liveTools.length]);
 
   const loadConversation = async (id: string) => {
@@ -163,7 +163,7 @@ export function AiCopilotDrawer({
 
   const sendMessage = async (text = input) => {
     const clean = text.trim();
-    if (!clean || sending) return;
+    if (!clean || sendingRef.current) return;
     abortActiveStream();
     const controller = new AbortController();
     streamAbortRef.current = controller;
@@ -241,11 +241,15 @@ export function AiCopilotDrawer({
         credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          conversationId: conversationId ?? undefined,
+          conversationId: conversationIdRef.current ?? undefined,
           message: clean,
         }),
         signal: controller.signal,
       });
+      if (res.status === 401) {
+        triggerUnauthorized();
+        return;
+      }
       if (!res.ok || !res.body) {
         const errBody = await res.text().catch(() => "");
         throw new Error(formatApiErrorPayload(errBody, res.status, "POST", "/api/ai/chat/stream"));
@@ -294,6 +298,16 @@ export function AiCopilotDrawer({
     }
   };
 
+  sendMessageRef.current = sendMessage;
+
+  useEffect(() => {
+    if (open && initialPrompt && !sendingRef.current) {
+      const p = initialPrompt;
+      onConsumeInitialPrompt?.();
+      void sendMessageRef.current(p);
+    }
+  }, [open, initialPrompt, onConsumeInitialPrompt]);
+
   const handleActionDecision = async (actionId: string, decision: "execute" | "reject") => {
     if (busyActionId) return;
     setError(null);
@@ -314,203 +328,213 @@ export function AiCopilotDrawer({
     }
   };
 
-  if (!open) return null;
-
   return (
-    <div className="overlay" onClick={onClose}>
-      <aside className="drawer ai-drawer" onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <Sparkles size={17} color="var(--accent-primary)" />
-              <h2 style={{ margin: 0, fontSize: 18 }}>Store Manager AI Copilot</h2>
-            </div>
-            <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
-              <span className={`tag mono ${geminiConfigured ? "tag-green" : "tag-blue"}`}>
-                {geminiConfigured ? `Gemini SSE: ${modelName}` : "Local Tool SSE Mode"}
-              </span>
-              <span className="tag tag-neutral">Human-in-the-Loop Guarded</span>
-            </div>
+    <SlideDrawer
+      open={open}
+      onClose={onClose}
+      labelledBy="ai-copilot-drawer-title"
+      className="ai-drawer"
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Sparkles size={17} color="var(--accent-primary)" aria-hidden="true" />
+            <h2 id="ai-copilot-drawer-title" style={{ margin: 0, fontSize: 18 }}>
+              Store Manager AI Copilot
+            </h2>
           </div>
-          <div style={{ display: "flex", gap: 6 }}>
-            <button
-              className="btn btn-sm"
-              onClick={() => {
-                abortActiveStream();
-                setSending(false);
-                setConversationId(null);
-                setMessages([]);
-                setActions([]);
-                setStreamingText("");
-                setLiveTools([]);
-                setError(null);
-              }}
-            >
-              <Plus size={13} /> New
-            </button>
-            <button className="btn btn-sm" aria-label="Close AI Copilot" onClick={onClose}>
-              <X size={15} />
-            </button>
+          <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+            <span className={`tag mono ${geminiConfigured ? "tag-green" : "tag-blue"}`}>
+              {geminiConfigured ? `Gemini SSE: ${modelName}` : "Local Tool SSE Mode"}
+            </span>
+            <span className="tag tag-neutral">Human-in-the-Loop Guarded</span>
           </div>
         </div>
-
-        {conversations.length > 0 && (
-          <select
-            className="select"
-            value={conversationId ?? ""}
-            onChange={(e) => {
-              if (e.target.value) void loadConversation(e.target.value);
+        <div style={{ display: "flex", gap: 6 }}>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => {
+              abortActiveStream();
+              setSending(false);
+              setConversationId(null);
+              setMessages([]);
+              setActions([]);
+              setStreamingText("");
+              setLiveTools([]);
+              setError(null);
             }}
           >
-            <option value="">Recent Copilot Threads ({conversations.length})...</option>
-            {conversations.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.title}
-              </option>
+            <Plus size={13} aria-hidden="true" /> New
+          </button>
+          <button type="button" className="btn btn-sm" aria-label="Close AI Copilot" onClick={onClose}>
+            <X size={15} aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+
+      {conversations.length > 0 && (
+        <select
+          className="select"
+          aria-label="Recent AI Copilot threads"
+          value={conversationId ?? ""}
+          onChange={(e) => {
+            if (e.target.value) void loadConversation(e.target.value);
+          }}
+        >
+          <option value="">Recent Copilot Threads ({conversations.length})...</option>
+          {conversations.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.title}
+            </option>
+          ))}
+        </select>
+      )}
+
+      {error && (
+        <div className="banner banner-red" role="alert">
+          <span>{error}</span>
+          <button type="button" className="btn btn-sm" onClick={() => setError(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      <div className="ai-messages">
+        {messages.length === 0 && !sending ? (
+          <div className="stack-md" style={{ gap: 10 }}>
+            <p className="panel-desc">
+              Ask about live sales, margin erosion, FEFO expiry batches, reorder POs, cashier anomalies, or promotional bundles. Write actions stage approval cards before touching PostgreSQL.
+            </p>
+            {STARTER_PROMPTS.map((prompt) => (
+              <button
+                key={prompt}
+                type="button"
+                className="quick-sku-btn"
+                onClick={() => void sendMessage(prompt)}
+              >
+                <span style={{ fontWeight: 600, fontSize: 12.5 }}>{prompt}</span>
+              </button>
             ))}
-          </select>
-        )}
-
-        {error && (
-          <div className="banner banner-red">
-            <span>{error}</span>
-            <button className="btn btn-sm" onClick={() => setError(null)}>
-              Dismiss
-            </button>
           </div>
-        )}
-
-        <div className="ai-messages">
-          {messages.length === 0 && !sending ? (
-            <div className="stack-md" style={{ gap: 10 }}>
-              <p className="panel-desc">
-                Ask about live sales, margin erosion, FEFO expiry batches, reorder POs, cashier anomalies, or promotional bundles. Write actions stage approval cards before touching PostgreSQL.
-              </p>
-              {STARTER_PROMPTS.map((prompt) => (
-                <button
-                  key={prompt}
-                  className="quick-sku-btn"
-                  onClick={() => void sendMessage(prompt)}
-                >
-                  <span style={{ fontWeight: 600, fontSize: 12.5 }}>{prompt}</span>
-                </button>
-              ))}
-            </div>
-          ) : (
-            messages.map((m) => (
-              <div key={m.id} className={`ai-bubble ${m.role}`}>
-                <div className="ai-bubble-role">
-                  {m.role === "user" ? "You" : "SupermarketOS Copilot"}
-                </div>
-                <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{m.content}</div>
-                {m.toolCallsJson && m.toolCallsJson.length > 0 && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 8 }}>
-                    {m.toolCallsJson.map((t, idx) => (
-                      <span key={`${t.tool}-${idx}`} className="tag tag-neutral mono" style={{ fontSize: 10.5 }}>
-                        <Terminal size={10} /> {t.tool}: {t.summary}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))
-          )}
-          {sending && (
-            <div className="ai-bubble assistant">
+        ) : (
+          messages.map((m) => (
+            <div key={m.id} className={`ai-bubble ${m.role}`}>
               <div className="ai-bubble-role">
-                SupermarketOS Copilot · <span className="mono">STREAMING</span>
+                {m.role === "user" ? "You" : "SupermarketOS Copilot"}
               </div>
-              {liveTools.length > 0 && (
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
-                  {liveTools.map((t, idx) => (
-                    <span key={`live-${t.tool}-${idx}`} className="tag tag-blue mono" style={{ fontSize: 10.5 }}>
-                      <Terminal size={10} /> {t.tool}: {t.summary}
+              <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{m.content}</div>
+              {m.toolCallsJson && m.toolCallsJson.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 8 }}>
+                  {m.toolCallsJson.map((t, idx) => (
+                    <span key={`${t.tool}-${idx}`} className="tag tag-neutral mono" style={{ fontSize: 10.5 }}>
+                      <Terminal size={10} aria-hidden="true" /> {t.tool}: {t.summary}
                     </span>
                   ))}
                 </div>
               )}
-              <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
-                {streamingText || "Running store tools & streaming response..."}
-              </div>
             </div>
-          )}
-          <div ref={messagesEndRef} />
-        </div>
-
-        {actions.length > 0 && (
-          <div className="stack-md" style={{ gap: 8 }}>
-            <div className="kpi-label">Proposed Store Actions (Approval Required)</div>
-            {actions.map((a) => (
-              <div key={a.id} className="ai-action-card">
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                  <strong style={{ fontSize: 13 }}>{a.title}</strong>
-                  <span
-                    className={`tag ${
-                      a.status === "executed"
-                        ? "tag-green"
-                        : a.status === "rejected"
-                          ? "tag-red"
-                          : "tag-amber"
-                    }`}
-                  >
-                    {a.status.toUpperCase()}
+          ))
+        )}
+        {sending && (
+          <div className="ai-bubble assistant" aria-live="polite">
+            <div className="ai-bubble-role">
+              SupermarketOS Copilot · <span className="mono">STREAMING</span>
+            </div>
+            {liveTools.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
+                {liveTools.map((t, idx) => (
+                  <span key={`live-${t.tool}-${idx}`} className="tag tag-blue mono" style={{ fontSize: 10.5 }}>
+                    <Terminal size={10} aria-hidden="true" /> {t.tool}: {t.summary}
                   </span>
-                </div>
-                <div style={{ fontSize: 12, color: "var(--ink-secondary)", marginTop: 4 }}>
-                  {a.summary}
-                </div>
-                {a.status === "pending" && (
-                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                    <button
-                      id={`approve-ai-action-${a.id}`}
-                      className="btn btn-primary btn-sm"
-                      disabled={busyActionId !== null}
-                      onClick={() => void handleActionDecision(a.id, "execute")}
-                    >
-                      <Check size={13} />{" "}
-                      {busyActionId === a.id ? "Applying..." : "Approve & Execute"}
-                    </button>
-                    <button
-                      className="btn btn-sm"
-                      disabled={busyActionId !== null}
-                      onClick={() => void handleActionDecision(a.id, "reject")}
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                )}
+                ))}
               </div>
-            ))}
+            )}
+            <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
+              {streamingText || "Running store tools & streaming response..."}
+            </div>
           </div>
         )}
+        <div ref={messagesEndRef} />
+      </div>
 
-        <form
-          className="pos-scan-bar"
-          style={{ marginBottom: 0, marginTop: "auto" }}
-          onSubmit={(e) => {
-            e.preventDefault();
-            void sendMessage();
-          }}
+      {actions.length > 0 && (
+        <div className="stack-md" style={{ gap: 8, maxHeight: "30vh", overflowY: "auto" }}>
+          <div className="kpi-label">Proposed Store Actions (Approval Required)</div>
+          {actions.map((a) => (
+            <div key={a.id} className="ai-action-card">
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <strong style={{ fontSize: 13 }}>{a.title}</strong>
+                <span
+                  className={`tag ${
+                    a.status === "executed"
+                      ? "tag-green"
+                      : a.status === "rejected"
+                        ? "tag-red"
+                        : "tag-amber"
+                  }`}
+                >
+                  {a.status.toUpperCase()}
+                </span>
+              </div>
+              <div style={{ fontSize: 12, color: "var(--ink-secondary)", marginTop: 4 }}>
+                {a.summary}
+              </div>
+              {a.status === "pending" && (
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <button
+                    id={`approve-ai-action-${a.id}`}
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    disabled={busyActionId !== null}
+                    onClick={() => void handleActionDecision(a.id, "execute")}
+                  >
+                    <Check size={13} aria-hidden="true" />{" "}
+                    {busyActionId === a.id ? "Applying..." : "Approve & Execute"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    disabled={busyActionId !== null}
+                    onClick={() => void handleActionDecision(a.id, "reject")}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <form
+        className="pos-scan-bar"
+        style={{ marginBottom: 0, marginTop: "auto" }}
+        onSubmit={(e) => {
+          e.preventDefault();
+          void sendMessage();
+        }}
+      >
+        <input
+          id="ai-copilot-input"
+          aria-label="Ask AI Store Copilot"
+          className="input"
+          style={{ fontSize: 13, minWidth: 0 }}
+          placeholder="Ask about margins, POs, expiry, or promos..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={sending}
+        />
+        <button
+          id="ai-copilot-send-btn"
+          type="submit"
+          aria-label="Send message to AI Copilot"
+          className="btn btn-primary"
+          disabled={sending || !input.trim()}
         >
-          <input
-            id="ai-copilot-input"
-            className="input"
-            style={{ fontSize: 13 }}
-            placeholder="Ask about margins, POs, expiry, or promos..."
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            disabled={sending}
-          />
-          <button
-            id="ai-copilot-send-btn"
-            type="submit"
-            className="btn btn-primary"
-            disabled={sending || !input.trim()}
-          >
-            <Send size={14} />
-          </button>
-        </form>
-      </aside>
-    </div>
+          <Send size={14} aria-hidden="true" />
+        </button>
+      </form>
+    </SlideDrawer>
   );
 }

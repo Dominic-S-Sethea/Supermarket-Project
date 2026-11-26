@@ -3,6 +3,7 @@ import type { UserRole } from "@supermarket/shared/dtos";
 import { formatBp, formatMoney } from "@supermarket/shared/money";
 import { ArrowRight, Download, RefreshCw, Sparkles } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { SalesTrendChart, type DailyTrendPoint } from "../components/SalesTrendChart";
 
 interface BriefingBullet {
   severity: "critical" | "warning" | "info";
@@ -39,12 +40,7 @@ interface OverviewData {
     totalBarcodes: number;
     inventoryCostValueCents: number;
   };
-  dailyTrend: {
-    day: string;
-    receipts: number;
-    salesCents: number;
-    profitCents: number;
-  }[];
+  dailyTrend: DailyTrendPoint[];
   hourlyTraffic: {
     hour: number;
     receipts: number;
@@ -85,24 +81,38 @@ export function OverviewView({
   const [overview, setOverview] = useState<OverviewData | null>(null);
   const [depts, setDepts] = useState<DeptRow[]>([]);
   const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
+  const [briefingWarning, setBriefingWarning] = useState<string | null>(null);
   const [refreshingBriefing, setRefreshingBriefing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
-  const load = async (windowDays: number, signal?: AbortSignal) => {
+  const loadBriefing = async (signal?: AbortSignal) => {
+    setBriefingWarning(null);
+    try {
+      const br = await apiGet<DailyBriefing>("/api/ai/briefing", signal);
+      if (!signal?.aborted) setBriefing(br);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setBriefingWarning(
+          err instanceof Error
+            ? `Morning AI briefing unavailable: ${err.message}`
+            : "Morning AI briefing is temporarily unavailable."
+        );
+      }
+    }
+  };
+
+  const loadOverview = async (windowDays: number, signal?: AbortSignal) => {
     setLoading(true);
     setErrorMsg(null);
     try {
-      const [ov, dp, br] = await Promise.all([
+      const [ov, dp] = await Promise.all([
         apiGet<OverviewData>(`/api/analytics/overview?days=${windowDays}`, signal),
         apiGet<{ departments: DeptRow[] }>("/api/analytics/departments", signal),
-        apiGet<DailyBriefing>("/api/ai/briefing", signal).catch(() => null),
       ]);
       if (signal?.aborted) return;
       setOverview(ov);
       setDepts(dp.departments);
-      if (br) setBriefing(br);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
         setErrorMsg(err instanceof Error ? err.message : "Failed loading store overview analytics.");
@@ -116,12 +126,14 @@ export function OverviewView({
 
   const handleRefreshBriefing = async () => {
     setRefreshingBriefing(true);
-    setErrorMsg(null);
+    setBriefingWarning(null);
     try {
       const br = await apiPost<DailyBriefing>("/api/ai/briefing/refresh", {});
       setBriefing(br);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed refreshing AI morning briefing.");
+      setBriefingWarning(
+        err instanceof Error ? err.message : "Failed refreshing AI morning briefing."
+      );
     } finally {
       setRefreshingBriefing(false);
     }
@@ -129,9 +141,15 @@ export function OverviewView({
 
   useEffect(() => {
     const controller = new AbortController();
-    void load(days, controller.signal);
+    void loadOverview(days, controller.signal);
     return () => controller.abort();
   }, [days]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadBriefing(controller.signal);
+    return () => controller.abort();
+  }, []);
 
   if (loading && !overview) {
     return <div className="panel">Loading store analytics from PostgreSQL...</div>;
@@ -140,12 +158,12 @@ export function OverviewView({
   if (!overview) {
     return (
       <div className="panel stack-md" style={{ gap: 12 }}>
-        <div className="banner banner-red">
+        <div className="banner banner-red" role="alert">
           <span>{errorMsg ?? "Unable to load store executive overview."}</span>
         </div>
         <div>
-          <button className="btn btn-primary" onClick={() => void load(days)}>
-            <RefreshCw size={14} /> Retry Loading Overview
+          <button type="button" className="btn btn-primary" onClick={() => void loadOverview(days)}>
+            <RefreshCw size={14} aria-hidden="true" /> Retry Loading Overview
           </button>
         </div>
       </div>
@@ -153,34 +171,11 @@ export function OverviewView({
   }
 
   const { kpis, dailyTrend, hourlyTraffic, paymentMix } = overview;
-  const maxSales = Math.max(1, ...dailyTrend.map((d) => d.salesCents));
   const maxHourReceipts = Math.max(1, ...hourlyTraffic.map((h) => h.receipts));
   const totalPayCents = Math.max(
     1,
     paymentMix.reduce((s, p) => s + p.totalCents, 0)
   );
-
-  // SVG chart dimensions
-  const chartW = 720;
-  const chartH = 210;
-  const padL = 56;
-  const padR = 14;
-  const padT = 16;
-  const padB = 28;
-  const plotW = chartW - padL - padR;
-  const plotH = chartH - padT - padB;
-
-  const barStep = dailyTrend.length > 0 ? plotW / dailyTrend.length : plotW;
-  const barW = Math.max(4, barStep * 0.62);
-
-  const profitPoints = dailyTrend
-    .map((d, i) => {
-      const x = padL + i * barStep + barStep / 2;
-      const rawY = padT + plotH - (d.profitCents / maxSales) * plotH;
-      const y = Math.min(padT + plotH, Math.max(padT, rawY));
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
 
   return (
     <div>
@@ -196,6 +191,7 @@ export function OverviewView({
         <div className="header-actions">
           <select
             id="overview-window-select"
+            aria-label="Analytics time window"
             className="select"
             value={days}
             onChange={(e) => setDays(Number(e.target.value))}
@@ -206,11 +202,15 @@ export function OverviewView({
           </select>
           <button
             id="overview-refresh-btn"
+            type="button"
             className="btn"
             disabled={loading}
-            onClick={() => void load(days)}
+            onClick={() => {
+              void loadOverview(days);
+              void loadBriefing();
+            }}
           >
-            <RefreshCw size={14} /> {loading ? "Refreshing..." : "Refresh"}
+            <RefreshCw size={14} aria-hidden="true" /> {loading ? "Refreshing..." : "Refresh"}
           </button>
           <a
             id="export-accounting-csv-link"
@@ -218,16 +218,25 @@ export function OverviewView({
             href={`/api/exports/accounting.csv?days=${days}`}
             download={`supermarket-os-accounting-journal-${days}d.csv`}
           >
-            <Download size={14} /> Export Accounting CSV
+            <Download size={14} aria-hidden="true" /> Export Accounting CSV
           </a>
         </div>
       </header>
 
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 16 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 16 }}>
           <span>{errorMsg}</span>
-          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
+          </button>
+        </div>
+      )}
+
+      {briefingWarning && (
+        <div className="banner banner-amber" role="status" style={{ marginBottom: 16 }}>
+          <span>{briefingWarning}</span>
+          <button type="button" className="btn btn-sm" onClick={() => void loadBriefing()}>
+            <RefreshCw size={12} aria-hidden="true" /> Retry Briefing
           </button>
         </div>
       )}
@@ -237,7 +246,7 @@ export function OverviewView({
           <div className="panel-header" style={{ marginBottom: 10 }}>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <Sparkles size={15} color="var(--accent-primary)" />
+                <Sparkles size={15} color="var(--accent-primary)" aria-hidden="true" />
                 <h2 className="panel-title">AI Morning Executive Briefing ({briefing.briefingDate})</h2>
                 <span className="tag tag-green mono">{briefing.model}</span>
               </div>
@@ -248,11 +257,12 @@ export function OverviewView({
             {(userRole === "owner" || userRole === "manager") && (
               <button
                 id="refresh-ai-briefing-btn"
+                type="button"
                 className="btn btn-sm"
                 disabled={refreshingBriefing}
                 onClick={() => void handleRefreshBriefing()}
               >
-                <RefreshCw size={13} /> {refreshingBriefing ? "Refreshing..." : "Refresh Digest"}
+                <RefreshCw size={13} aria-hidden="true" /> {refreshingBriefing ? "Refreshing..." : "Refresh Digest"}
               </button>
             )}
           </div>
@@ -283,11 +293,12 @@ export function OverviewView({
                   </div>
                   {canInspect && onNavigate && (
                     <button
+                      type="button"
                       className="btn btn-sm"
                       style={{ width: "fit-content", marginTop: "auto" }}
                       onClick={() => onNavigate(b.targetTab)}
                     >
-                      Inspect <ArrowRight size={12} />
+                      Inspect <ArrowRight size={12} aria-hidden="true" />
                     </button>
                   )}
                 </div>
@@ -337,98 +348,7 @@ export function OverviewView({
       </section>
 
       <div className="grid-asymmetric">
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2 className="panel-title">Daily Sales &amp; Gross Profit Trend</h2>
-              <p className="panel-desc">
-                Bars = daily gross sales (notice Fri/Sat beverage &amp; snack surges); Emerald line = net gross profit.
-              </p>
-            </div>
-            {hoveredIdx !== null && dailyTrend[hoveredIdx] && (
-              <div className="tag tag-green mono">
-                {dailyTrend[hoveredIdx].day}: {formatMoney(dailyTrend[hoveredIdx].salesCents)} (
-                {dailyTrend[hoveredIdx].receipts} tx)
-              </div>
-            )}
-          </div>
-          {dailyTrend.length === 0 ? (
-            <div style={{ color: "var(--ink-muted)", padding: "24px 0", textAlign: "center" }}>
-              No completed sales recorded in the last {days} days.
-            </div>
-          ) : (
-            <svg viewBox={`0 0 ${chartW} ${chartH}`} className="chart-svg" role="img" aria-label="Daily sales and profit trend">
-              {[0, 0.25, 0.5, 0.75, 1].map((t) => {
-                const y = padT + plotH - t * plotH;
-                return (
-                  <g key={t}>
-                    <line
-                      x1={padL}
-                      y1={y}
-                      x2={chartW - padR}
-                      y2={y}
-                      stroke="hsl(36, 14%, 89%)"
-                      strokeDasharray={t === 0 ? undefined : "3 3"}
-                    />
-                    <text
-                      x={padL - 8}
-                      y={y + 4}
-                      textAnchor="end"
-                      fontSize="10"
-                      fill="hsl(215, 10%, 54%)"
-                      fontFamily="JetBrains Mono, monospace"
-                    >
-                      ${Math.round((maxSales * t) / 100)}
-                    </text>
-                  </g>
-                );
-              })}
-              {dailyTrend.map((d, i) => {
-                const x = padL + i * barStep + (barStep - barW) / 2;
-                const h = (d.salesCents / maxSales) * plotH;
-                const y = padT + plotH - h;
-                const isHover = hoveredIdx === i;
-                return (
-                  <g
-                    key={d.day}
-                    onMouseEnter={() => setHoveredIdx(i)}
-                    onMouseLeave={() => setHoveredIdx(null)}
-                    style={{ cursor: "pointer" }}
-                  >
-                    <rect
-                      x={x}
-                      y={y}
-                      width={barW}
-                      height={Math.max(1, h)}
-                      rx={2}
-                      fill={isHover ? "hsl(158, 62%, 27%)" : "hsl(158, 30%, 76%)"}
-                    />
-                    {(i === 0 || i === Math.floor(dailyTrend.length / 2) || i === dailyTrend.length - 1) && (
-                      <text
-                        x={x + barW / 2}
-                        y={chartH - 7}
-                        textAnchor="middle"
-                        fontSize="10"
-                        fill="hsl(215, 10%, 50%)"
-                        fontFamily="JetBrains Mono, monospace"
-                      >
-                        {d.day.slice(5)}
-                      </text>
-                    )}
-                  </g>
-                );
-              })}
-              {profitPoints && (
-                <polyline
-                  fill="none"
-                  stroke="hsl(158, 64%, 24%)"
-                  strokeWidth="2.2"
-                  points={profitPoints}
-                />
-              )}
-            </svg>
-          )}
-        </section>
+        <SalesTrendChart dailyTrend={dailyTrend} days={days} />
 
         <section className="panel">
           <div className="panel-header">

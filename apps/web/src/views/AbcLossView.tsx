@@ -83,32 +83,47 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
     data: TriageResult;
   } | null>(null);
 
-  const loadData = async (segmentFilter = selectedSegment, signal?: AbortSignal) => {
+  const loadAbc = async (segmentFilter = selectedSegment, signal?: AbortSignal) => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const qs = segmentFilter ? `?segment=${encodeURIComponent(segmentFilter)}` : "";
-      const [abc, lp] = await Promise.all([
-        apiGet<{ matrix: MatrixCell[]; skus: AbcSkuRow[] }>(`/api/analytics/abc-xyz${qs}`, signal),
-        apiGet<{
-          cashierAnomalies: CashierAnomaly[];
-          deadStockTraps: DeadStockRow[];
-        }>("/api/analytics/loss-prevention", signal),
-      ]);
+      const abc = await apiGet<{ matrix: MatrixCell[]; skus: AbcSkuRow[] }>(
+        `/api/analytics/abc-xyz${qs}`,
+        signal
+      );
       if (signal?.aborted) return;
       setMatrix(abc.matrix);
       setSkus(abc.skus);
-      setCashiers(lp.cashierAnomalies);
-      setDeadStock(lp.deadStockTraps);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        setErrorMsg(err instanceof Error ? err.message : "Failed loading ABC-XYZ & Loss Prevention data.");
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading ABC-XYZ segmentation data.");
       }
     } finally {
       if (!signal?.aborted) {
         setLoading(false);
       }
     }
+  };
+
+  const loadLossPrevention = async (signal?: AbortSignal) => {
+    try {
+      const lp = await apiGet<{
+        cashierAnomalies: CashierAnomaly[];
+        deadStockTraps: DeadStockRow[];
+      }>("/api/analytics/loss-prevention", signal);
+      if (signal?.aborted) return;
+      setCashiers(lp.cashierAnomalies);
+      setDeadStock(lp.deadStockTraps);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading Loss Prevention analytics.");
+      }
+    }
+  };
+
+  const loadData = async (segmentFilter = selectedSegment, signal?: AbortSignal) => {
+    await Promise.all([loadAbc(segmentFilter, signal), loadLossPrevention(signal)]);
   };
 
   const runCashierTriage = async (c: CashierAnomaly) => {
@@ -140,9 +155,15 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
 
   useEffect(() => {
     const controller = new AbortController();
-    void loadData(selectedSegment, controller.signal);
+    void loadAbc(selectedSegment, controller.signal);
     return () => controller.abort();
   }, [selectedSegment]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadLossPrevention(controller.signal);
+    return () => controller.abort();
+  }, []);
 
   const cellMap = new Map(matrix.map((m) => [m.segment, m]));
   const totalDeadCapital = deadStock.reduce((s, d) => s + d.tiedCapitalCents, 0);

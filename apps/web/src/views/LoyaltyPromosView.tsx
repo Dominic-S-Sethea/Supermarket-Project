@@ -13,6 +13,7 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
 interface CustomerRow {
   id: string;
@@ -87,6 +88,12 @@ interface PromoRoiRow {
 }
 
 type LoyaltySubTab = "customers" | "coupons" | "promotions";
+const LOYALTY_SUBTABS: readonly LoyaltySubTab[] = ["customers", "coupons", "promotions"];
+
+function resolveLoyaltySubTab(): LoyaltySubTab {
+  const fromUrl = readQueryParam("sub") as LoyaltySubTab | null;
+  return fromUrl && LOYALTY_SUBTABS.includes(fromUrl) ? fromUrl : "customers";
+}
 
 function rfmBadgeClass(seg: string): string {
   const s = seg.toLowerCase();
@@ -98,7 +105,7 @@ function rfmBadgeClass(seg: string): string {
 
 export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole }) {
   const canManage = userRole === "owner" || userRole === "manager";
-  const [subTab, setSubTab] = useState<LoyaltySubTab>("customers");
+  const [subTab, setSubTab] = useState<LoyaltySubTab>(() => resolveLoyaltySubTab());
 
   const [customers, setCustomers] = useState<CustomerRow[]>([]);
   const [custSummary, setCustSummary] = useState<CustomerSummary | null>(null);
@@ -111,6 +118,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
 
   const [promos, setPromos] = useState<PromoRow[]>([]);
   const [promoRoi, setPromoRoi] = useState<PromoRoiRow[]>([]);
+  const [promoRoiWarning, setPromoRoiWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -139,55 +147,116 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
   const [promoDiscountPct, setPromoDiscountPct] = useState(15);
   const [promoDaypart, setPromoDaypart] = useState<"all" | "morning" | "evening">("all");
 
-  const loadAll = async (signal?: AbortSignal) => {
+  const selectSubTab = (next: LoyaltySubTab) => {
+    setSubTab(next);
+    syncQueryParam("sub", next, { push: true });
+  };
+
+  useEffect(() => {
+    const onPopState = () => setSubTab(resolveLoyaltySubTab());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  const loadCustomers = async (signal?: AbortSignal) => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const custQs = new URLSearchParams();
       if (custSearch.trim()) custQs.set("search", custSearch.trim());
       if (segFilter !== "all") custQs.set("segment", segFilter);
-      const cpQs = couponFilter !== "all" ? `?status=${encodeURIComponent(couponFilter)}` : "";
-
-      const [cRes, cpRes, pRes, roiRes] = await Promise.all([
-        apiGet<{ summary: CustomerSummary; customers: CustomerRow[] }>(
-          `/api/loyalty/customers${custQs.toString() ? `?${custQs.toString()}` : ""}`,
-          signal
-        ),
-        apiGet<{ summary: CouponSummary; coupons: CouponRow[] }>(
-          `/api/loyalty/coupons${cpQs}`,
-          signal
-        ),
-        apiGet<{ promotions: PromoRow[] }>("/api/promotions", signal),
-        apiGet<{ items: PromoRoiRow[] }>("/api/analytics/promo-roi", signal).catch(() => ({
-          items: [],
-        })),
-      ]);
+      const cRes = await apiGet<{ summary: CustomerSummary; customers: CustomerRow[] }>(
+        `/api/loyalty/customers${custQs.toString() ? `?${custQs.toString()}` : ""}`,
+        signal
+      );
       if (signal?.aborted) return;
       setCustomers(cRes.customers);
       setCustSummary(cRes.summary);
-      setCoupons(cpRes.coupons);
-      setCouponSummary(cpRes.summary);
-      setPromos(pRes.promotions);
-      setPromoRoi(roiRes.items);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        setErrorMsg(err instanceof Error ? err.message : "Failed loading loyalty & promotions");
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading loyalty customers");
       }
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
   };
 
+  const loadCoupons = async (signal?: AbortSignal) => {
+    try {
+      const cpQs = couponFilter !== "all" ? `?status=${encodeURIComponent(couponFilter)}` : "";
+      const cpRes = await apiGet<{ summary: CouponSummary; coupons: CouponRow[] }>(
+        `/api/loyalty/coupons${cpQs}`,
+        signal
+      );
+      if (signal?.aborted) return;
+      setCoupons(cpRes.coupons);
+      setCouponSummary(cpRes.summary);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading loyalty coupons");
+      }
+    }
+  };
+
+  const loadPromos = async (signal?: AbortSignal) => {
+    try {
+      const pRes = await apiGet<{ promotions: PromoRow[] }>("/api/promotions", signal);
+      if (!signal?.aborted) setPromos(pRes.promotions);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading promotions");
+      }
+    }
+  };
+
+  const loadPromoRoi = async (signal?: AbortSignal) => {
+    setPromoRoiWarning(null);
+    try {
+      const roiRes = await apiGet<{ items: PromoRoiRow[] }>("/api/analytics/promo-roi", signal);
+      if (!signal?.aborted) setPromoRoi(roiRes.items);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setPromoRoiWarning(
+          err instanceof Error
+            ? `Promotion ROI analytics unavailable: ${err.message}`
+            : "Promotion ROI analytics unavailable."
+        );
+      }
+    }
+  };
+
+  const loadAll = async (signal?: AbortSignal) => {
+    await Promise.all([
+      loadCustomers(signal),
+      loadCoupons(signal),
+      loadPromos(signal),
+      loadPromoRoi(signal),
+    ]);
+  };
+
   useEffect(() => {
     const controller = new AbortController();
     const timer = setTimeout(() => {
-      void loadAll(controller.signal);
+      void loadCustomers(controller.signal);
     }, 120);
     return () => {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [custSearch, segFilter, couponFilter]);
+  }, [custSearch, segFilter]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadCoupons(controller.signal);
+    return () => controller.abort();
+  }, [couponFilter]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadPromos(controller.signal);
+    void loadPromoRoi(controller.signal);
+    return () => controller.abort();
+  }, []);
 
   const handleEnrollCustomer = async () => {
     if (busy) return;
@@ -207,7 +276,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       setNewPhone("");
       setNewName("");
       setNewEmail("");
-      await loadAll();
+      await loadCustomers();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed enrolling customer");
     } finally {
@@ -238,7 +307,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
         `Issued single-use coupon ${res.coupon.code} (${formatMoney(res.coupon.discountCents)} off, min basket ${formatMoney(res.coupon.minBasketCents)}).`
       );
       setCouponCode("");
-      await loadAll();
+      await loadCoupons();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed issuing coupon");
     } finally {
@@ -284,7 +353,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       });
       setFeedback(`Created active promotion "${promoName.trim()}" and synced to POS catalog.`);
       setPromoName("");
-      await loadAll();
+      await Promise.all([loadPromos(), loadPromoRoi()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed creating promotion");
     } finally {
@@ -301,7 +370,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       setFeedback(
         `${promo.active ? "Paused" : "Activated"} promotion "${promo.name}".`
       );
-      await loadAll();
+      await loadPromos();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed toggling promotion");
     } finally {
@@ -324,39 +393,51 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
         <div className="subtab-bar" role="tablist">
           <button
             id="loyalty-subtab-customers"
+            type="button"
             role="tab"
             aria-selected={subTab === "customers"}
             className={`subtab-btn ${subTab === "customers" ? "active" : ""}`}
-            onClick={() => setSubTab("customers")}
+            onClick={() => selectSubTab("customers")}
           >
-            <Users size={14} /> Customers ({custSummary?.totalCustomers ?? 0})
+            <Users size={14} aria-hidden="true" /> Customers ({custSummary?.totalCustomers ?? 0})
           </button>
           <button
             id="loyalty-subtab-coupons"
+            type="button"
             role="tab"
             aria-selected={subTab === "coupons"}
             className={`subtab-btn ${subTab === "coupons" ? "active" : ""}`}
-            onClick={() => setSubTab("coupons")}
+            onClick={() => selectSubTab("coupons")}
           >
-            <Ticket size={14} /> Coupons ({couponSummary?.activeCount ?? 0} Active)
+            <Ticket size={14} aria-hidden="true" /> Coupons ({couponSummary?.activeCount ?? 0} Active)
           </button>
           <button
             id="loyalty-subtab-promotions"
+            type="button"
             role="tab"
             aria-selected={subTab === "promotions"}
             className={`subtab-btn ${subTab === "promotions" ? "active" : ""}`}
-            onClick={() => setSubTab("promotions")}
+            onClick={() => selectSubTab("promotions")}
           >
-            <Tag size={14} /> Promotions ({activePromoCount} Active)
+            <Tag size={14} aria-hidden="true" /> Promotions ({activePromoCount} Active)
           </button>
         </div>
       </header>
 
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 14 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
           <span>{errorMsg}</span>
-          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
+          </button>
+        </div>
+      )}
+
+      {promoRoiWarning && (
+        <div className="banner banner-amber" role="status" style={{ marginBottom: 14 }}>
+          <span>{promoRoiWarning}</span>
+          <button type="button" className="btn btn-sm" onClick={() => void loadPromoRoi()}>
+            Retry ROI
           </button>
         </div>
       )}
@@ -423,6 +504,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                   />
                 </div>
                 <select
+                  aria-label="Filter customers by RFM segment"
                   className="select"
                   value={segFilter}
                   onChange={(e) => setSegFilter(e.target.value)}
@@ -434,8 +516,14 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                     </option>
                   ))}
                 </select>
-                <button className="btn btn-sm" disabled={loading} onClick={() => void loadAll()}>
-                  <RefreshCw size={13} />
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  aria-label="Refresh loyalty and promotions data"
+                  disabled={loading}
+                  onClick={() => void loadAll()}
+                >
+                  <RefreshCw size={13} aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -559,6 +647,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 </p>
               </div>
               <select
+                aria-label="Filter coupons by status"
                 className="select"
                 value={couponFilter}
                 onChange={(e) => setCouponFilter(e.target.value)}
@@ -699,8 +788,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 </div>
                 <div className="form-grid">
                   <div className="field">
-                    <label>Target RFM Segment (Tag)</label>
+                    <label htmlFor="coupon-rfm-segment-select">Target RFM Segment (Tag)</label>
                     <select
+                      id="coupon-rfm-segment-select"
                       className="select"
                       value={couponSegment}
                       onChange={(e) => setCouponSegment(e.target.value)}
@@ -712,8 +802,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                     </select>
                   </div>
                   <div className="field">
-                    <label>Valid Days</label>
+                    <label htmlFor="coupon-valid-days-input">Valid Days</label>
                     <input
+                      id="coupon-valid-days-input"
                       className="input mono"
                       type="number"
                       min={1}
@@ -837,8 +928,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                 </div>
                 <div className="form-grid">
                   <div className="field">
-                    <label>Promo Type</label>
+                    <label htmlFor="promo-type-select">Promo Type</label>
                     <select
+                      id="promo-type-select"
                       className="select"
                       value={promoType}
                       onChange={(e) =>
@@ -860,8 +952,9 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                     </select>
                   </div>
                   <div className="field">
-                    <label>Daypart Window</label>
+                    <label htmlFor="promo-daypart-select">Daypart Window</label>
                     <select
+                      id="promo-daypart-select"
                       className="select"
                       value={promoDaypart}
                       onChange={(e) =>

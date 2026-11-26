@@ -243,6 +243,7 @@ export function StaffingRosterTab({
                   <td>
                     {canOperate ? (
                       <select
+                        aria-label={`Assign cashier for ${String(slot.hour).padStart(2, "0")}:00 slot`}
                         className="select"
                         style={{ fontSize: 12, padding: "4px 8px" }}
                         disabled={busyId !== null}

@@ -12,7 +12,9 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { ModalDialog } from "../components/AccessibleDialog";
 import { StaffingRosterTab } from "../components/StaffingRosterTab";
+import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
 interface ShiftRow {
   shiftKey: string;
@@ -185,6 +187,14 @@ interface DiagnosticsPayload {
   experiments: ShiftExperiment[];
 }
 
+type ShiftSubTab = "oos" | "queue" | "missions" | "experiments" | "roster";
+const SHIFT_SUBTABS: readonly ShiftSubTab[] = ["oos", "queue", "missions", "experiments", "roster"];
+
+function resolveShiftSubTab(): ShiftSubTab {
+  const fromUrl = readQueryParam("sub") as ShiftSubTab | null;
+  return fromUrl && SHIFT_SUBTABS.includes(fromUrl) ? fromUrl : "oos";
+}
+
 export function ShiftDiagnosticsView({
   userRole = "owner",
   onAskCopilot,
@@ -196,8 +206,19 @@ export function ShiftDiagnosticsView({
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ kind: "green" | "amber" | "red"; text: string } | null>(null);
-  const [subTab, setSubTab] = useState<"oos" | "queue" | "missions" | "experiments" | "roster">("oos");
+  const [subTab, setSubTab] = useState<ShiftSubTab>(() => resolveShiftSubTab());
   const [hoverHour, setHoverHour] = useState<number | null>(null);
+
+  const selectSubTab = (next: ShiftSubTab) => {
+    setSubTab(next);
+    syncQueryParam("sub", next, { push: true });
+  };
+
+  useEffect(() => {
+    const onPopState = () => setSubTab(resolveShiftSubTab());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   // Footfall log modal state
   const [showFootfallModal, setShowFootfallModal] = useState(false);
@@ -640,8 +661,20 @@ export function ShiftDiagnosticsView({
                     return (
                       <g
                         key={h.hour}
+                        tabIndex={0}
+                        role="button"
+                        aria-label={`${String(h.hour).padStart(2, "0")}:00 — ${h.walkIns} walk-ins, ${h.receipts} receipts, ${h.conversionPct}% conversion`}
                         onMouseEnter={() => setHoverHour(h.hour)}
-                        onMouseLeave={() => setHoverHour(null)}
+                        onMouseLeave={() => setHoverHour((curr) => (curr === h.hour ? null : curr))}
+                        onFocus={() => setHoverHour(h.hour)}
+                        onBlur={() => setHoverHour((curr) => (curr === h.hour ? null : curr))}
+                        onClick={() => setHoverHour((curr) => (curr === h.hour ? null : h.hour))}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setHoverHour((curr) => (curr === h.hour ? null : h.hour));
+                          }
+                        }}
                         style={{ cursor: "pointer" }}
                       >
                         <rect
@@ -665,9 +698,9 @@ export function ShiftDiagnosticsView({
                           y={chartH - 8}
                           textAnchor="middle"
                           fontSize="10"
-                          fill={h.hour < 12 ? "hsl(28, 84%, 32%)" : "hsl(215, 10%, 50%)"}
+                          fill={h.hour < 12 ? "hsl(28, 84%, 32%)" : "hsl(215, 14%, 40%)"}
                           fontWeight={h.hour < 12 ? "700" : "400"}
-                          fontFamily="JetBrains Mono, monospace"
+                          fontFamily="var(--font-mono)"
                         >
                           {String(h.hour).padStart(2, "0")}
                         </text>
@@ -732,36 +765,51 @@ export function ShiftDiagnosticsView({
           <div className="subtab-bar" role="tablist">
             <button
               id="subtab-oos"
+              type="button"
+              role="tab"
+              aria-selected={subTab === "oos"}
               className={`subtab-btn ${subTab === "oos" ? "active" : ""}`}
-              onClick={() => setSubTab("oos")}
+              onClick={() => selectSubTab("oos")}
             >
               Morning OOS &amp; Restock Lag ({oosList.length})
             </button>
             <button
               id="subtab-queue"
+              type="button"
+              role="tab"
+              aria-selected={subTab === "queue"}
               className={`subtab-btn ${subTab === "queue" ? "active" : ""}`}
-              onClick={() => setSubTab("queue")}
+              onClick={() => selectSubTab("queue")}
             >
               Checkout Queue Saturation
             </button>
             <button
               id="subtab-missions"
+              type="button"
+              role="tab"
+              aria-selected={subTab === "missions"}
               className={`subtab-btn ${subTab === "missions" ? "active" : ""}`}
-              onClick={() => setSubTab("missions")}
+              onClick={() => selectSubTab("missions")}
             >
               K-Means Missions &amp; Morning Basket ({missions.length})
             </button>
             <button
               id="subtab-experiments"
+              type="button"
+              role="tab"
+              aria-selected={subTab === "experiments"}
               className={`subtab-btn ${subTab === "experiments" ? "active" : ""}`}
-              onClick={() => setSubTab("experiments")}
+              onClick={() => selectSubTab("experiments")}
             >
               DiD Impact Trials ({data?.experiments.length ?? 0})
             </button>
             <button
               id="subtab-roster"
+              type="button"
+              role="tab"
+              aria-selected={subTab === "roster"}
               className={`subtab-btn ${subTab === "roster" ? "active" : ""}`}
-              onClick={() => setSubTab("roster")}
+              onClick={() => selectSubTab("roster")}
             >
               Hourly Lane Staffing Roster
             </button>
@@ -1070,6 +1118,7 @@ export function ShiftDiagnosticsView({
                       <div className="field">
                         <label>Intervention</label>
                         <select
+                          aria-label="Experiment intervention type"
                           className="select"
                           value={expType}
                           onChange={(e) => setExpType(e.target.value)}
@@ -1164,68 +1213,80 @@ export function ShiftDiagnosticsView({
         </>
       )}
 
-      {showFootfallModal && canOperate && (
-        <div className="overlay centered" onClick={() => setShowFootfallModal(false)}>
-          <div className="modal" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: 0, fontSize: 18 }}>Log 15-Minute Door Footfall Counter</h2>
-            <p className="panel-desc">
-              Simulates or records IR/Wi-Fi people-counter telemetry for the current 15-minute bucket.
-            </p>
-            <form className="stack-md" onSubmit={(e) => void handleLogFootfall(e)}>
-              <div className="form-grid">
-                <div className="field">
-                  <label>Door Walk-In Entries</label>
-                  <input
-                    type="number"
-                    min={0}
-                    className="input"
-                    value={ffEntries}
-                    onChange={(e) => setFfEntries(e.target.value)}
-                  />
-                </div>
-                <div className="field">
-                  <label>Open Checkout Lanes</label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={16}
-                    className="input"
-                    value={ffLanes}
-                    onChange={(e) => setFfLanes(e.target.value)}
-                  />
-                </div>
-                <div className="field">
-                  <label>Avg Dwell Time (sec)</label>
-                  <input
-                    type="number"
-                    min={30}
-                    className="input"
-                    value={ffDwell}
-                    onChange={(e) => setFfDwell(e.target.value)}
-                  />
-                </div>
-                <div className="field" style={{ justifyContent: "flex-end" }}>
-                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-                    <input
-                      type="checkbox"
-                      checked={ffRain}
-                      onChange={(e) => setFfRain(e.target.checked)}
-                    />
-                    Rainy Weather Window
-                  </label>
-                </div>
+      {canOperate && (
+        <ModalDialog
+          open={showFootfallModal}
+          onClose={() => setShowFootfallModal(false)}
+          labelledBy="footfall-modal-title"
+          style={{ maxWidth: 460 }}
+        >
+          <h2 id="footfall-modal-title" style={{ margin: 0, fontSize: 18 }}>
+            Log 15-Minute Door Footfall Counter
+          </h2>
+          <p className="panel-desc">
+            Simulates or records IR/Wi-Fi people-counter telemetry for the current 15-minute bucket.
+          </p>
+          <form className="stack-md" onSubmit={(e) => void handleLogFootfall(e)}>
+            <div className="form-grid">
+              <div className="field">
+                <label htmlFor="ff-entries-input">Door Walk-In Entries</label>
+                <input
+                  id="ff-entries-input"
+                  type="number"
+                  min={0}
+                  className="input"
+                  value={ffEntries}
+                  onChange={(e) => setFfEntries(e.target.value)}
+                />
               </div>
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-                <button type="button" className="btn" onClick={() => setShowFootfallModal(false)}>
-                  Cancel
-                </button>
-                <button type="submit" className="btn btn-primary" disabled={busyAction !== null}>
-                  <Plus size={14} /> Save Counter Bucket
-                </button>
+              <div className="field">
+                <label htmlFor="ff-lanes-input">Open Checkout Lanes</label>
+                <input
+                  id="ff-lanes-input"
+                  type="number"
+                  min={1}
+                  max={16}
+                  className="input"
+                  value={ffLanes}
+                  onChange={(e) => setFfLanes(e.target.value)}
+                />
               </div>
-            </form>
-          </div>
-        </div>
+              <div className="field">
+                <label htmlFor="ff-dwell-input">Avg Dwell Time (sec)</label>
+                <input
+                  id="ff-dwell-input"
+                  type="number"
+                  min={30}
+                  className="input"
+                  value={ffDwell}
+                  onChange={(e) => setFfDwell(e.target.value)}
+                />
+              </div>
+              <div className="field" style={{ justifyContent: "flex-end" }}>
+                <label
+                  htmlFor="ff-rain-checkbox"
+                  style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}
+                >
+                  <input
+                    id="ff-rain-checkbox"
+                    type="checkbox"
+                    checked={ffRain}
+                    onChange={(e) => setFfRain(e.target.checked)}
+                  />
+                  Rainy Weather Window
+                </label>
+              </div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button type="button" className="btn" onClick={() => setShowFootfallModal(false)}>
+                Cancel
+              </button>
+              <button type="submit" className="btn btn-primary" disabled={busyAction !== null}>
+                <Plus size={14} aria-hidden="true" /> Save Counter Bucket
+              </button>
+            </div>
+          </form>
+        </ModalDialog>
       )}
     </div>
   );

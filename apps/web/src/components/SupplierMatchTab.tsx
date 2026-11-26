@@ -320,6 +320,7 @@ export function SupplierMatchTab({
           </div>
           <select
             id="variance-status-filter"
+            aria-label="Filter 3-way dock variances by status"
             className="select"
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}

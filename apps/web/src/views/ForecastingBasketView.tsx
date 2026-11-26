@@ -71,29 +71,20 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [ordersWarning, setOrdersWarning] = useState<string | null>(null);
 
-  const loadData = async (u = urgency, signal?: AbortSignal) => {
+  const loadForecasts = async (u = urgency, signal?: AbortSignal) => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const qs = u ? `?urgency=${encodeURIComponent(u)}` : "";
-      const [fc, br, poRes, metaRes] = await Promise.all([
-        apiGet<{ supplierDraftPos: DraftPo[]; items: ForecastRow[] }>(
-          `/api/analytics/forecasts${qs}`,
-          signal
-        ),
-        apiGet<{ rules: BasketRule[] }>("/api/analytics/basket-rules", signal),
-        apiGet<{ orders: PersistedPo[] }>("/api/purchasing/orders", signal).catch(() => ({
-          orders: [],
-        })),
-        apiGet<{ suppliers: SupplierOption[] }>("/api/meta", signal),
-      ]);
+      const fc = await apiGet<{ supplierDraftPos: DraftPo[]; items: ForecastRow[] }>(
+        `/api/analytics/forecasts${qs}`,
+        signal
+      );
       if (signal?.aborted) return;
       setDraftPos(fc.supplierDraftPos);
       setForecasts(fc.items);
-      setBasketRules(br.rules);
-      setOrders(poRes.orders);
-      setSuppliers(metaRes.suppliers);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
         setErrorMsg(err instanceof Error ? err.message : "Failed loading forecasts");
@@ -105,11 +96,50 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
     }
   };
 
+  const loadOrders = async (signal?: AbortSignal) => {
+    setOrdersWarning(null);
+    try {
+      const poRes = await apiGet<{ orders: PersistedPo[] }>("/api/purchasing/orders", signal);
+      if (!signal?.aborted) setOrders(poRes.orders);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setOrdersWarning(
+          err instanceof Error
+            ? `Saved purchase orders could not be loaded: ${err.message}`
+            : "Saved purchase orders could not be loaded."
+        );
+      }
+    }
+  };
+
+  const loadBasketAndMeta = async (signal?: AbortSignal) => {
+    try {
+      const [br, metaRes] = await Promise.all([
+        apiGet<{ rules: BasketRule[] }>("/api/analytics/basket-rules", signal),
+        apiGet<{ suppliers: SupplierOption[] }>("/api/meta", signal),
+      ]);
+      if (signal?.aborted) return;
+      setBasketRules(br.rules);
+      setSuppliers(metaRes.suppliers);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setErrorMsg(err instanceof Error ? err.message : "Failed loading market basket rules");
+      }
+    }
+  };
+
   useEffect(() => {
     const controller = new AbortController();
-    void loadData(urgency, controller.signal);
+    void loadForecasts(urgency, controller.signal);
     return () => controller.abort();
   }, [urgency]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadBasketAndMeta(controller.signal);
+    void loadOrders(controller.signal);
+    return () => controller.abort();
+  }, []);
 
   const handleApproveDraftPo = async (po: DraftPo) => {
     if (!canManage || busyKey) return;
@@ -138,7 +168,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
         })),
       });
       setFeedback(`Persisted PO ${created.poNumber} for ${po.supplierName} (${po.totalCases} cases).`);
-      await loadData(urgency);
+      await loadOrders();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed saving Purchase Order");
     } finally {
@@ -152,7 +182,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
     setBusyKey(`po-${poId}-${status}`);
     try {
       await apiPatch(`/api/purchasing/orders/${poId}/status`, { status });
-      await loadData(urgency);
+      await loadOrders();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating PO status");
     } finally {
@@ -172,10 +202,19 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
       </header>
 
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 14 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
           <span>{errorMsg}</span>
-          <button className="btn btn-sm" onClick={() => setErrorMsg(null)}>
+          <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
+          </button>
+        </div>
+      )}
+
+      {ordersWarning && (
+        <div className="banner banner-amber" role="status" style={{ marginBottom: 14 }}>
+          <span>{ordersWarning}</span>
+          <button type="button" className="btn btn-sm" onClick={() => void loadOrders()}>
+            Retry POs
           </button>
         </div>
       )}
@@ -326,6 +365,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
             </p>
           </div>
           <select
+            aria-label="Filter forecasts by reorder urgency"
             className="select"
             value={urgency}
             onChange={(e) => setUrgency(e.target.value)}

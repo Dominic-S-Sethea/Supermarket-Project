@@ -18,6 +18,10 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
 }
 
+export function triggerUnauthorized(): void {
+  unauthorizedHandler?.();
+}
+
 export function formatApiErrorPayload(
   rawText: string,
   status: number,

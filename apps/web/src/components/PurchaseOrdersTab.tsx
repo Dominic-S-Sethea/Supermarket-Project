@@ -216,6 +216,7 @@ export function PurchaseOrdersTab({
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <select
                 id="po-status-filter"
+                aria-label="Filter purchase orders by status"
                 className="select"
                 style={{ width: 155 }}
                 value={statusFilter}
