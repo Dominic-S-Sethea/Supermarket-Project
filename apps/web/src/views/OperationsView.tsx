@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { computeEffectiveUnitCostCents, formatBp, formatMoney } from "@supermarket/shared/money";
-import { AlertTriangle, Award, Check, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Award, Check, ChefHat, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
 import type { ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
 import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
@@ -9,6 +9,9 @@ import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
 const FloorTasksTab = lazy(() =>
   import("../components/FloorTasksTab").then((m) => ({ default: m.FloorTasksTab }))
+);
+const FreshProductionTab = lazy(() =>
+  import("../components/FreshProductionTab").then((m) => ({ default: m.FreshProductionTab }))
 );
 const PurchaseOrdersTab = lazy(() =>
   import("../components/PurchaseOrdersTab").then((m) => ({ default: m.PurchaseOrdersTab }))
@@ -94,13 +97,13 @@ interface ParsedInvoiceResponse {
   };
 }
 
-type OpsSubTab = "receiving" | "orders" | "shelf" | "tasks" | "suppliers";
+type OpsSubTab = "receiving" | "production" | "orders" | "shelf" | "tasks" | "suppliers";
 
 function resolveOpsSubTab(canManage: boolean): OpsSubTab {
   const fromUrl = readQueryParam("sub") as OpsSubTab | null;
   const allowed: OpsSubTab[] = canManage
-    ? ["receiving", "orders", "shelf", "tasks", "suppliers"]
-    : ["receiving", "shelf", "tasks"];
+    ? ["receiving", "production", "orders", "shelf", "tasks", "suppliers"]
+    : ["receiving", "production", "shelf", "tasks"];
   return fromUrl && allowed.includes(fromUrl) ? fromUrl : "receiving";
 }
 
@@ -479,6 +482,16 @@ export function OperationsView({
                   </>
                 ),
               },
+              {
+                id: "production" as const,
+                elementId: "ops-subtab-production",
+                panelId: "ops-panel-production",
+                label: (
+                  <>
+                    <ChefHat size={14} aria-hidden="true" /> Bakery &amp; Deli BOM
+                  </>
+                ),
+              },
               ...(canManage
                 ? [
                     {
@@ -535,7 +548,7 @@ export function OperationsView({
       {!canManage && (
         <div className="banner banner-amber" style={{ marginBottom: 14 }}>
           <span>
-            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, phantom stock blind counts, 07:30 shelf tag batch printing, and daily floor checklist completion are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
+            Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, bakery &amp; deli production batch logging, phantom stock blind counts, 07:30 shelf tag batch printing, and daily floor checklist completion are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
           </span>
         </div>
       )}
@@ -563,7 +576,18 @@ export function OperationsView({
         id={`ops-panel-${subTab}`}
         aria-labelledby={`ops-subtab-${subTab}`}
       >
-      {subTab === "orders" && canManage ? (
+      {subTab === "production" ? (
+        <Suspense fallback={<div className="panel">Loading Bakery &amp; Deli BOM Production...</div>}>
+          <FreshProductionTab
+            onFeedback={(msg) => {
+              setErrorMsg(null);
+              setFeedback(msg);
+              onCountsChanged?.();
+            }}
+            onError={(msg) => setErrorMsg(msg)}
+          />
+        </Suspense>
+      ) : subTab === "orders" && canManage ? (
         <Suspense fallback={<div className="panel">Loading Purchase Orders...</div>}>
           <PurchaseOrdersTab
             onReceiveAgainstPo={handleReceiveAgainstPo}

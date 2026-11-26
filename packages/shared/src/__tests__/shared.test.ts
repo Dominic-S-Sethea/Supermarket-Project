@@ -1,17 +1,25 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildScaleBarcode,
   buildValidEan13,
   computeEffectiveUnitCostCents,
+  computeLegalUnitPrice,
   computeMarginBp,
   computeMovingWeightedAvgCostCents,
   computeNetMarginBp,
   computeSuggestedSellPriceCents,
   computeTaxCents,
+  computeWeightedPriceCents,
   CreateGrnSchema,
   CreatePromotionSchema,
+  CreateRecipeSchema,
+  deriveWeightFromPriceGrams,
   evaluateCart,
+  formatMeasure,
   formatMoney,
   generateUuidV7,
+  parseScaleBarcode,
+  RecallProductSchema,
   validateBarcode,
   type CartInputLine,
   type PromotionRule,
@@ -633,4 +641,96 @@ describe("money and Zod schema edge cases", () => {
     }
   });
 });
+
+describe("Milestone 1: Fresh produce, scale barcodes (GS1 20-29), weighted pricing & EU unit price", () => {
+  it("builds and parses GS1 prefix 20-24 embedded-weight and prefix 25-29 embedded-price barcodes", () => {
+    const weightBc = buildScaleBarcode("weight", "4011", 425);
+    expect(weightBc).toHaveLength(13);
+    expect(validateBarcode(weightBc).valid).toBe(true);
+    const parsedW = parseScaleBarcode(weightBc);
+    expect(parsedW).not.toBeNull();
+    expect(parsedW?.kind).toBe("weight");
+    expect(parsedW?.pluCandidates).toContain("4011");
+    expect(parsedW?.weightGrams).toBe(425);
+    expect(parsedW?.embeddedPriceCents).toBeNull();
+
+    const priceBc = buildScaleBarcode("price", "20010", 1245);
+    const parsedP = parseScaleBarcode(priceBc);
+    expect(parsedP?.kind).toBe("price");
+    expect(parsedP?.pluCandidates).toContain("20010");
+    expect(parsedP?.embeddedPriceCents).toBe(1245);
+    expect(parsedP?.weightGrams).toBeNull();
+
+    // Corrupt check digit or non-2x prefix must return null
+    const badCheck = `${weightBc.slice(0, 12)}${(Number(weightBc[12]) + 1) % 10}`;
+    expect(parseScaleBarcode(badCheck)).toBeNull();
+    expect(parseScaleBarcode(buildValidEan13("885", 12345))).toBeNull();
+  });
+
+  it("computes exact integer weighted line prices, derived weight, measures, and EU legal unit prices", () => {
+    expect(computeWeightedPriceCents(425, 199)).toBe(85);
+    expect(computeWeightedPriceCents(500, 2490)).toBe(1245);
+    expect(deriveWeightFromPriceGrams(1245, 2490)).toBe(500);
+    expect(formatMeasure(425, "weight_g")).toBe("0.425 kg");
+    expect(formatMeasure(750, "volume_ml")).toBe("0.750 L");
+    expect(formatMeasure(12, "each", "can")).toBe("12 can");
+
+    expect(computeLegalUnitPrice(199, 1000, "g", "weight_g")).toBe("$1.99 / kg");
+    expect(computeLegalUnitPrice(150, 330, "ml", "each")).toBe("$4.55 / L");
+    expect(computeLegalUnitPrice(95, 150, "g", "each")).toBe("$0.63 / 100g");
+    expect(computeLegalUnitPrice(240, 500, "g", "each", "€")).toBe("€4.80 / kg");
+  });
+
+  it("evaluates variable-weight lines accurately in evaluateCart with exact integer tax & cost", () => {
+    const bananaLine: CartInputLine = {
+      lineKey: "fresh-4011",
+      productId: "p-banana",
+      categoryId: "cat-produce",
+      sku: "PROD-4011",
+      name: "Cavendish Bananas",
+      scannedBarcode: buildScaleBarcode("weight", "4011", 425),
+      packLabel: "0.425 kg (Net)",
+      packQty: 1,
+      qtyPacks: 1,
+      unitMode: "weight_g",
+      weightGrams: 425,
+      tareGrams: 15,
+      unitPriceCents: 199, // $1.99 / kg
+      unitCostCents: 110,  // $1.10 / kg
+      taxRateBp: 700,      // 7% EU reduced food VAT inclusive
+      taxInclusive: true,
+      requiresAgeCheck: false,
+    };
+    const res = evaluateCart([bananaLine], []);
+    expect(res.grandTotalCents).toBe(85);
+    expect(res.totalCostCents).toBe(47);
+    expect(res.lines[0].baseUnitsSold).toBe(425);
+    expect(res.lines[0].unitMode).toBe("weight_g");
+    expect(res.lines[0].weightGrams).toBe(425);
+    expect(res.lines[0].tareGrams).toBe(15);
+    expect(res.totalTaxCents).toBe(computeTaxCents(85, 700, true).taxCents);
+  });
+
+  it("validates RecallProductSchema and CreateRecipeSchema", () => {
+    expect(RecallProductSchema.safeParse({ recalled: true, reason: "ok" }).success).toBe(false);
+    expect(
+      RecallProductSchema.safeParse({ recalled: true, reason: "Salmonella lot 26B recall" }).success
+    ).toBe(true);
+    expect(RecallProductSchema.safeParse({ recalled: false }).success).toBe(true);
+
+    expect(
+      CreateRecipeSchema.safeParse({
+        code: "BAKE-SD01",
+        name: "Artisan Sourdough Loaf (10-Loaf Bake)",
+        outputProductId: "01950000-0000-7000-8000-000000000010",
+        expectedYieldBaseUnits: 10,
+        shelfLifeDays: 2,
+        ingredients: [
+          { ingredientProductId: "01950000-0000-7000-8000-000000000011", qtyBaseUnits: 5000 },
+        ],
+      }).success
+    ).toBe(true);
+  });
+});
+
 

@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { buildValidEan13 } from "@supermarket/shared/barcodes";
 import type { UserRole } from "@supermarket/shared/dtos";
-import { formatBp, formatMoney } from "@supermarket/shared/money";
-import { Search, Sparkles, Upload } from "lucide-react";
-import { apiDelete, apiGet, apiPost } from "../api";
+import { computeLegalUnitPrice, formatBp, formatMeasure, formatMoney } from "@supermarket/shared/money";
+import { Download, Search, Sparkles, Upload } from "lucide-react";
+import { apiDelete, apiGet, apiPatch, apiPost } from "../api";
 import {
   CatalogCsvImportModal,
   CatalogInspectorDrawer,
@@ -27,9 +27,11 @@ BAD-MRG2,Below Cost Error Item,TestBrand,${buildValidEan13("885", 700105)},1,Sin
 export function CatalogView({
   departments,
   userRole = "owner",
+  onCatalogChanged,
 }: {
   departments: DepartmentOption[];
   userRole?: UserRole;
+  onCatalogChanged?: () => void;
 }) {
   const canEditCatalog = userRole === "owner" || userRole === "manager";
   const canCycleCount =
@@ -59,6 +61,7 @@ export function CatalogView({
   const [drawerBusy, setDrawerBusy] = useState(false);
   const [zplOutput, setZplOutput] = useState<string | null>(null);
   const [cycleQty, setCycleQty] = useState("");
+  const [recallReasonInput, setRecallReasonInput] = useState("");
 
   // CSV Import Wizard modal
   const [showImport, setShowImport] = useState(false);
@@ -71,6 +74,7 @@ export function CatalogView({
     setSelected(item);
     setZplOutput(null);
     setDrawerNotice(null);
+    setRecallReasonInput(item.recallReason ?? "");
     setNewBc(buildValidEan13("887", Math.floor(100000 + Math.random() * 899999)));
   };
 
@@ -238,6 +242,45 @@ export function CatalogView({
     }
   };
 
+  const handleToggleRecall = async (productId: string, recalled: boolean) => {
+    if (drawerBusy) return;
+    setDrawerNotice(null);
+    if (recalled && recallReasonInput.trim().length < 3) {
+      setDrawerNotice({ kind: "red", text: "Enter a recall reason (at least 3 characters)." });
+      return;
+    }
+    setDrawerBusy(true);
+    try {
+      const res = await apiPatch<{
+        product: { id: string; sku: string; recalled: boolean; recallReason: string | null };
+      }>(`/api/products/${productId}/recall`, {
+        recalled,
+        reason: recalled ? recallReasonInput.trim() : null,
+      });
+      setSelected((prev) =>
+        prev && prev.id === productId
+          ? { ...prev, recalled: res.product.recalled, recallReason: res.product.recallReason }
+          : prev
+      );
+      if (!recalled) setRecallReasonInput("");
+      setDrawerNotice({
+        kind: "green",
+        text: recalled
+          ? `Food-safety recall ACTIVE on ${res.product.sku}. POS checkout is now hard-blocked across all lanes.`
+          : `Cleared food-safety recall on ${res.product.sku}. Item re-enabled for POS checkout.`,
+      });
+      await loadProducts(page);
+      onCatalogChanged?.();
+    } catch (err) {
+      setDrawerNotice({
+        kind: "red",
+        text: err instanceof Error ? err.message : "Failed updating food-safety recall status",
+      });
+    } finally {
+      setDrawerBusy(false);
+    }
+  };
+
   const handlePreviewCsv = async () => {
     if (importBusy) return;
     setImportNotice(null);
@@ -272,6 +315,7 @@ export function CatalogView({
       setPreview(null);
       setPage(1);
       await loadProducts(1);
+      onCatalogChanged?.();
     } catch (err) {
       setImportNotice({
         kind: "red",
@@ -290,23 +334,35 @@ export function CatalogView({
         <div>
           <h1>Catalog &amp; Multi-UOM Barcodes</h1>
           <p className="page-subtitle">
-            Search <strong className="mono">{data.total.toLocaleString()}</strong> packaged SKUs by name, SKU, brand, or any Single / 6-Pack / Case barcode.
+            Search <strong className="mono">{data.total.toLocaleString()}</strong> packaged &amp; fresh SKUs by name, SKU, brand, PLU, or any Single / Multi-Pack / Case barcode.
           </p>
         </div>
-        {canEditCatalog && (
+        {(canEditCatalog || canCycleCount) && (
           <div className="header-actions">
-            <button
-              id="open-csv-wizard-btn"
-              type="button"
-              className="btn btn-primary"
-              onClick={() => {
-                setShowImport(true);
-                setPreview(null);
-                setImportNotice(null);
-              }}
-            >
-              <Upload size={14} aria-hidden="true" /> Bulk CSV Onboarding Wizard
-            </button>
+            {canCycleCount && (
+              <a
+                id="export-scale-plu-btn"
+                className="btn"
+                href="/api/exports/scale-plu.csv"
+                download="scale-plu.csv"
+              >
+                <Download size={14} aria-hidden="true" /> Scale PLU CSV
+              </a>
+            )}
+            {canEditCatalog && (
+              <button
+                id="open-csv-wizard-btn"
+                type="button"
+                className="btn btn-primary"
+                onClick={() => {
+                  setShowImport(true);
+                  setPreview(null);
+                  setImportNotice(null);
+                }}
+              >
+                <Upload size={14} aria-hidden="true" /> Bulk CSV Onboarding Wizard
+              </button>
+            )}
           </div>
         )}
       </header>
@@ -441,109 +497,137 @@ export function CatalogView({
                   </td>
                 </tr>
               ) : (
-                data.items.map((item) => (
-                  <tr
-                    key={item.id}
-                    className="clickable"
-                    onClick={(e) => {
-                      if ((e.target as HTMLElement).closest("button, a, input, select")) return;
-                      openInspector(item);
-                    }}
-                  >
-                    <td>
-                      <div className="mono" style={{ fontWeight: 600 }}>
-                        {item.sku}
-                      </div>
-                      <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
-                        Aisle {item.aisleLocation}
-                      </div>
-                    </td>
-                    <td>
-                      <div>
-                        <button
-                          type="button"
-                          className="table-row-btn"
-                          aria-label={`Inspect ${item.name} (${item.sku})`}
-                          onClick={() => openInspector(item)}
-                        >
-                          {item.name}
-                        </button>{" "}
-                        {item.requiresAgeCheck && <span className="tag tag-amber">18+/21+</span>}
-                        {typeof item.similarityScore === "number" && (
-                          <span className="tag tag-green mono" style={{ marginLeft: 4 }}>
-                            {Math.round(item.similarityScore * 100)}% match
-                          </span>
+                data.items.map((item) => {
+                  const isMeasured = item.unitMode === "weight_g" || item.unitMode === "volume_ml";
+                  const legalUnitPrice = computeLegalUnitPrice(
+                    item.primarySellPriceCents,
+                    item.netContentAmount ?? null,
+                    item.netContentUnit ?? null,
+                    item.unitMode ?? "each"
+                  );
+                  const lowStock = isMeasured ? item.onHandUnits <= 1000 : item.onHandUnits <= 12;
+                  return (
+                    <tr
+                      key={item.id}
+                      className="clickable"
+                      onClick={(e) => {
+                        if ((e.target as HTMLElement).closest("button, a, input, select")) return;
+                        openInspector(item);
+                      }}
+                    >
+                      <td>
+                        <div className="mono" style={{ fontWeight: 600 }}>
+                          {item.sku}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                          Aisle {item.aisleLocation}
+                          {item.pluCode ? ` · PLU ${item.pluCode}` : ""}
+                        </div>
+                      </td>
+                      <td>
+                        <div>
+                          <button
+                            type="button"
+                            className="table-row-btn"
+                            aria-label={`Inspect ${item.name} (${item.sku})`}
+                            onClick={() => openInspector(item)}
+                          >
+                            {item.name}
+                          </button>{" "}
+                          {item.recalled && <span className="tag tag-red">RECALLED</span>}
+                          {item.requiresAgeCheck && <span className="tag tag-amber">18+/21+</span>}
+                          {typeof item.similarityScore === "number" && (
+                            <span className="tag tag-green mono" style={{ marginLeft: 4 }}>
+                              {Math.round(item.similarityScore * 100)}% match
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 12, color: "var(--ink-secondary)" }}>
+                          {item.brand} · {item.categoryName}
+                          {Array.isArray(item.allergens) && item.allergens.length > 0 && (
+                            <span className="mono" style={{ marginLeft: 6, fontSize: 11, color: "var(--accent-amber-ink)" }}>
+                              [{item.allergens.map((a) => a.toUpperCase()).join(", ")}]
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td>{item.departmentName}</td>
+                      <td>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {item.barcodes.map((b) => (
+                            <span key={b.id} className="tag tag-neutral mono">
+                              {isMeasured ? (item.unitMode === "volume_ml" ? "1L" : "1kg") : `${b.packQty}×`} (
+                              {formatMoney(b.sellPriceCents)})
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                      <td className="text-right mono">
+                        {typeof item.avgCostCents === "number" ? formatMoney(item.avgCostCents) : "—"}
+                      </td>
+                      <td className="text-right mono">
+                        <div style={{ fontWeight: 600 }}>{formatMoney(item.primarySellPriceCents)}</div>
+                        {legalUnitPrice && (
+                          <div style={{ fontSize: 10.5, color: "var(--ink-muted)" }}>{legalUnitPrice}</div>
                         )}
-                      </div>
-                      <div style={{ fontSize: 12, color: "var(--ink-secondary)" }}>
-                        {item.brand} · {item.categoryName}
-                      </div>
-                    </td>
-                    <td>{item.departmentName}</td>
-                    <td>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                        {item.barcodes.map((b) => (
-                          <span key={b.id} className="tag tag-neutral mono">
-                            {b.packQty}× ({formatMoney(b.sellPriceCents)})
+                      </td>
+                      <td className="text-right">
+                        {typeof item.marginBp === "number" ? (
+                          <span
+                            className={`tag mono ${
+                              item.marginBp < (item.minMarginBp ?? 0)
+                                ? "tag-red"
+                                : item.marginBp >= 2600
+                                  ? "tag-green"
+                                  : "tag-neutral"
+                            }`}
+                          >
+                            {formatBp(item.marginBp)}
                           </span>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="text-right mono">
-                      {typeof item.avgCostCents === "number" ? formatMoney(item.avgCostCents) : "—"}
-                    </td>
-                    <td className="text-right mono" style={{ fontWeight: 600 }}>
-                      {formatMoney(item.primarySellPriceCents)}
-                    </td>
-                    <td className="text-right">
-                      {typeof item.marginBp === "number" ? (
+                        ) : (
+                          <span style={{ color: "var(--ink-muted)" }}>—</span>
+                        )}
+                      </td>
+                      <td className="text-right mono">
                         <span
-                          className={`tag mono ${
-                            item.marginBp < (item.minMarginBp ?? 0)
-                              ? "tag-red"
-                              : item.marginBp >= 2600
+                          style={{
+                            fontWeight: 600,
+                            color: lowStock ? "var(--accent-crimson)" : "inherit",
+                          }}
+                        >
+                          {isMeasured
+                            ? formatMeasure(item.onHandUnits, item.unitMode)
+                            : item.onHandUnits}
+                        </span>
+                        {!isMeasured && (
+                          <>
+                            {" "}
+                            <span style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                              {item.baseUnitLabel}s
+                            </span>
+                          </>
+                        )}
+                      </td>
+                      <td>
+                        {item.segment ? (
+                          <span
+                            className={`tag mono ${
+                              item.segment.startsWith("A")
                                 ? "tag-green"
-                                : "tag-neutral"
-                          }`}
-                        >
-                          {formatBp(item.marginBp)}
-                        </span>
-                      ) : (
-                        <span style={{ color: "var(--ink-muted)" }}>—</span>
-                      )}
-                    </td>
-                    <td className="text-right mono">
-                      <span
-                        style={{
-                          fontWeight: 600,
-                          color: item.onHandUnits <= 12 ? "var(--accent-crimson)" : "inherit",
-                        }}
-                      >
-                        {item.onHandUnits}
-                      </span>{" "}
-                      <span style={{ fontSize: 11, color: "var(--ink-muted)" }}>
-                        {item.baseUnitLabel}s
-                      </span>
-                    </td>
-                    <td>
-                      {item.segment ? (
-                        <span
-                          className={`tag mono ${
-                            item.segment.startsWith("A")
-                              ? "tag-green"
-                              : item.segment.startsWith("B")
-                                ? "tag-blue"
-                                : "tag-neutral"
-                          }`}
-                        >
-                          {item.segment}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                  </tr>
-                ))
+                                : item.segment.startsWith("B")
+                                  ? "tag-blue"
+                                  : "tag-neutral"
+                            }`}
+                          >
+                            {item.segment}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -587,15 +671,18 @@ export function CatalogView({
         newPackQty={newPackQty}
         newPackPrice={newPackPrice}
         cycleQty={cycleQty}
+        recallReasonInput={recallReasonInput}
         onNewBcChange={setNewBc}
         onNewPackLabelChange={setNewPackLabel}
         onNewPackQtyChange={setNewPackQty}
         onNewPackPriceChange={setNewPackPrice}
         onCycleQtyChange={setCycleQty}
+        onRecallReasonChange={setRecallReasonInput}
         onAddBarcode={() => void handleAddBarcode()}
         onDeleteBarcode={(barcodeId) => void handleDeleteBarcode(barcodeId)}
         onGenerateZpl={(productId) => void handleGenerateZpl(productId)}
         onCycleCount={() => void handleCycleCount()}
+        onToggleRecall={(productId, recalled) => void handleToggleRecall(productId, recalled)}
         onClose={() => setSelected(null)}
       />
 

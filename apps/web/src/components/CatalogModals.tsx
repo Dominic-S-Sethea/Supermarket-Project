@@ -1,5 +1,12 @@
-import { computeNetMarginBp, formatBp, formatMoney } from "@supermarket/shared/money";
-import { Barcode, Plus, Printer, X } from "lucide-react";
+import type { UnitMode } from "@supermarket/shared/dtos";
+import {
+  computeLegalUnitPrice,
+  computeNetMarginBp,
+  formatBp,
+  formatMeasure,
+  formatMoney,
+} from "@supermarket/shared/money";
+import { AlertTriangle, Barcode, Plus, Printer, ShieldAlert, X } from "lucide-react";
 import { ModalDialog, SlideDrawer } from "./AccessibleDialog";
 
 export interface CatalogBarcodeItem {
@@ -21,6 +28,16 @@ export interface CatalogProductItem {
   categoryName: string;
   aisleLocation: string;
   baseUnitLabel: string;
+  unitMode?: UnitMode;
+  pluCode?: string | null;
+  defaultTareGrams?: number;
+  netContentAmount?: number | null;
+  netContentUnit?: "g" | "ml" | "ea" | null;
+  allergens?: string[];
+  ingredientsText?: string | null;
+  recalled?: boolean;
+  recallReason?: string | null;
+  recalledAt?: string | null;
   avgCostCents?: number;
   minMarginBp?: number;
   taxRateBp?: number;
@@ -77,15 +94,18 @@ export function CatalogInspectorDrawer({
   newPackQty,
   newPackPrice,
   cycleQty,
+  recallReasonInput,
   onNewBcChange,
   onNewPackLabelChange,
   onNewPackQtyChange,
   onNewPackPriceChange,
   onCycleQtyChange,
+  onRecallReasonChange,
   onAddBarcode,
   onDeleteBarcode,
   onGenerateZpl,
   onCycleCount,
+  onToggleRecall,
   onClose,
 }: {
   selected: CatalogProductItem | null;
@@ -99,17 +119,32 @@ export function CatalogInspectorDrawer({
   newPackQty: number;
   newPackPrice: string;
   cycleQty: string;
+  recallReasonInput: string;
   onNewBcChange: (val: string) => void;
   onNewPackLabelChange: (val: string) => void;
   onNewPackQtyChange: (val: number) => void;
   onNewPackPriceChange: (val: string) => void;
   onCycleQtyChange: (val: string) => void;
+  onRecallReasonChange: (val: string) => void;
   onAddBarcode: () => void;
   onDeleteBarcode: (barcodeId: string) => void;
   onGenerateZpl: (productId: string) => void;
   onCycleCount: () => void;
+  onToggleRecall: (productId: string, recalled: boolean) => void;
   onClose: () => void;
 }) {
+  const unitMode: UnitMode = selected?.unitMode ?? "each";
+  const isMeasured = unitMode === "weight_g" || unitMode === "volume_ml";
+  const legalUnitPrice = selected
+    ? computeLegalUnitPrice(
+        selected.primarySellPriceCents,
+        selected.netContentAmount ?? null,
+        selected.netContentUnit ?? null,
+        unitMode
+      )
+    : null;
+  const allergens = selected?.allergens ?? [];
+
   return (
     <SlideDrawer
       open={Boolean(selected)}
@@ -120,14 +155,17 @@ export function CatalogInspectorDrawer({
         <>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
             <div>
-              <div className="mono" style={{ fontSize: 12, color: "var(--ink-muted)" }}>
-                {selected.sku} · Aisle {selected.aisleLocation}
+              <div className="mono" style={{ fontSize: 12, color: "var(--ink-muted)", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                <span>{selected.sku} · Aisle {selected.aisleLocation}</span>
+                {selected.pluCode && <span className="tag tag-blue">PLU {selected.pluCode}</span>}
+                {selected.recalled && <span className="tag tag-red">RECALLED · POS BLOCKED</span>}
               </div>
               <h2 id="catalog-inspector-title" style={{ margin: "4px 0 0", fontSize: 19 }}>
                 {selected.name}
               </h2>
               <div style={{ fontSize: 13, color: "var(--ink-secondary)", marginTop: 2 }}>
                 {selected.brand} · {selected.departmentName} / {selected.categoryName}
+                {legalUnitPrice ? ` · ${legalUnitPrice}` : ""}
               </div>
             </div>
             <button type="button" className="btn btn-sm" aria-label="Close inspector" onClick={onClose}>
@@ -144,22 +182,63 @@ export function CatalogInspectorDrawer({
             </div>
           )}
 
+          {selected.recalled && (
+            <div className="banner banner-red" role="alert">
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <AlertTriangle size={15} aria-hidden="true" />
+                <strong>Active Food-Safety Recall:</strong>{" "}
+                {selected.recallReason ?? "Blocked across all checkout lanes."}
+              </span>
+            </div>
+          )}
+
           <div className="kpi-strip" style={{ marginBottom: 0 }}>
             <div className="kpi-tile">
               <div className="kpi-label">Live Ledger Stock</div>
               <div className="kpi-value" style={{ fontSize: 20 }}>
-                {selected.onHandUnits} {selected.baseUnitLabel}s
+                {isMeasured
+                  ? formatMeasure(selected.onHandUnits, unitMode)
+                  : `${selected.onHandUnits} ${selected.baseUnitLabel}s`}
               </div>
             </div>
             {typeof selected.avgCostCents === "number" && (
               <div className="kpi-tile">
-                <div className="kpi-label">Avg Base Cost (MWAC)</div>
+                <div className="kpi-label">
+                  Avg Cost ({isMeasured ? (unitMode === "volume_ml" ? "per L" : "per kg") : "MWAC"})
+                </div>
                 <div className="kpi-value" style={{ fontSize: 20 }}>
                   {formatMoney(selected.avgCostCents)}
                 </div>
               </div>
             )}
           </div>
+
+          {(allergens.length > 0 || selected.ingredientsText || (selected.defaultTareGrams ?? 0) > 0) && (
+            <div className="panel" style={{ background: "var(--bg-canvas)", padding: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>
+                EU Reg 1169/2011 Allergen, Ingredients &amp; Scale Metadata
+              </div>
+              {allergens.length > 0 && (
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 6 }}>
+                  {allergens.map((a) => (
+                    <span key={a} className="tag tag-amber mono" style={{ fontSize: 10.5 }}>
+                      {a.toUpperCase()}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {selected.ingredientsText && (
+                <div style={{ fontSize: 12, color: "var(--ink-secondary)", marginBottom: 4 }}>
+                  <strong>Ingredients:</strong> {selected.ingredientsText}
+                </div>
+              )}
+              <div className="mono" style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+                Measure: {unitMode}
+                {(selected.defaultTareGrams ?? 0) > 0 ? ` · Default Tare: ${selected.defaultTareGrams}g` : ""}
+                {legalUnitPrice ? ` · Legal Unit Price: ${legalUnitPrice}` : ""}
+              </div>
+            </div>
+          )}
 
           <div>
             <div className="panel-header" style={{ marginBottom: 8 }}>
@@ -321,12 +400,12 @@ export function CatalogInspectorDrawer({
                 Quick Blind Cycle Count (Ledger Adjustment)
               </h3>
               <p className="panel-desc" style={{ marginBottom: 10 }}>
-                Enter physical shelf count in base units ({selected.baseUnitLabel}s). System posts an immutable count variance entry.
+                Enter physical shelf count in base units ({isMeasured ? (unitMode === "volume_ml" ? "ml" : "grams") : `${selected.baseUnitLabel}s`}). System posts an immutable count variance entry.
               </p>
               <div style={{ display: "flex", gap: 8 }}>
                 <input
                   id="catalog-cycle-count-input"
-                  aria-label={`Physical count in ${selected.baseUnitLabel}s`}
+                  aria-label={`Physical count in ${isMeasured ? (unitMode === "volume_ml" ? "ml" : "grams") : `${selected.baseUnitLabel}s`}`}
                   className="input mono"
                   type="number"
                   min={0}
@@ -345,6 +424,52 @@ export function CatalogInspectorDrawer({
                   Post Adjustment
                 </button>
               </div>
+            </div>
+          )}
+
+          {canEditCatalog && (
+            <div className="panel" style={{ background: "var(--bg-canvas)" }}>
+              <h3 className="panel-title" style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                <ShieldAlert size={15} aria-hidden="true" style={{ color: "var(--accent-crimson)" }} />
+                Food-Safety Recall POS-Block
+              </h3>
+              <p className="panel-desc" style={{ marginBottom: 10 }}>
+                Immediately locks this SKU from being sold across every POS checkout lane and logs an immutable audit entry.
+              </p>
+              {selected.recalled ? (
+                <button
+                  id="clear-recall-btn"
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={drawerBusy}
+                  onClick={() => onToggleRecall(selected.id, false)}
+                >
+                  Clear Food-Safety Recall &amp; Re-Enable Sale
+                </button>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div className="field">
+                    <label htmlFor="recall-reason-input">Recall Lot / Regulatory Notice Reason</label>
+                    <input
+                      id="recall-reason-input"
+                      className="input"
+                      placeholder="e.g. Supplier Lot #884 undeclared allergen / Listeria advisory"
+                      value={recallReasonInput}
+                      onChange={(e) => onRecallReasonChange(e.target.value)}
+                      disabled={drawerBusy}
+                    />
+                  </div>
+                  <button
+                    id="activate-recall-btn"
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    disabled={drawerBusy || recallReasonInput.trim().length < 3}
+                    onClick={() => onToggleRecall(selected.id, true)}
+                  >
+                    <ShieldAlert size={13} aria-hidden="true" /> Activate Instant POS Recall Block
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </>

@@ -200,6 +200,42 @@ export async function applyDatabaseConstraintsAndViews() {
             OR (daypart_start_hour BETWEEN 0 AND 23 AND daypart_end_hour BETWEEN 1 AND 24)
           );
       END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_products_unit_mode_valid'
+      ) THEN
+        ALTER TABLE products
+          ADD CONSTRAINT chk_products_unit_mode_valid CHECK (
+            unit_mode IN ('each', 'weight_g', 'volume_ml') AND default_tare_grams >= 0
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_sale_lines_weight_valid'
+      ) THEN
+        ALTER TABLE sale_lines
+          ADD CONSTRAINT chk_sale_lines_weight_valid CHECK (
+            (weight_grams IS NULL OR weight_grams >= 1) AND (tare_grams IS NULL OR tare_grams >= 0)
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_recipes_valid'
+      ) THEN
+        ALTER TABLE recipes
+          ADD CONSTRAINT chk_recipes_valid CHECK (
+            expected_yield_base_units >= 1 AND shelf_life_days >= 1
+          );
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_production_batches_valid'
+      ) THEN
+        ALTER TABLE production_batches
+          ADD CONSTRAINT chk_production_batches_valid CHECK (
+            batch_multiplier >= 1 AND expected_output_units >= 1 AND actual_output_units >= 1 AND trim_waste_units >= 0
+          );
+      END IF;
     END $$;
   `);
 

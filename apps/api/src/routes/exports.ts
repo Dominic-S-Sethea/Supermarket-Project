@@ -42,10 +42,17 @@ export async function exportRoutes(app: FastifyInstance) {
           d.name AS department_name,
           c.name AS category_name,
           p.aisle_location,
+          p.unit_mode,
           COALESCE(ax.segment, 'UNSCORED') AS abc_xyz_segment,
           (COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::int AS on_hand_units,
           p.avg_cost_cents::bigint AS avg_cost_cents,
-          (GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0)) * p.avg_cost_cents)::bigint AS valuation_cents
+          (
+            CASE
+              WHEN p.unit_mode IN ('weight_g', 'volume_ml')
+                THEN ROUND((GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::numeric * p.avg_cost_cents) / 1000.0)
+              ELSE GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0)) * p.avg_cost_cents
+            END
+          )::bigint AS valuation_cents
         FROM products p
         JOIN categories c ON c.id = p.category_id
         JOIN departments d ON d.id = c.department_id
@@ -65,8 +72,9 @@ export async function exportRoutes(app: FastifyInstance) {
           "Department",
           "Category",
           "Aisle",
+          "UnitMode",
           "ABC_XYZ",
-          "OnHandUnits",
+          "OnHandBaseUnits",
           "AvgCostUSD",
           "ValuationUSD",
         ],
@@ -77,6 +85,7 @@ export async function exportRoutes(app: FastifyInstance) {
           r.department_name,
           r.category_name,
           r.aisle_location,
+          r.unit_mode,
           r.abc_xyz_segment,
           Number(r.on_hand_units ?? 0),
           toUsd(r.avg_cost_cents),
@@ -239,6 +248,79 @@ export async function exportRoutes(app: FastifyInstance) {
     );
     return csv;
   });
+
+  // 4b. Department Counter Scale PLU Sync CSV (Hobart / Mettler-Toledo / Digi + EU 14 Allergens)
+  app.get(
+    "/api/exports/scale-plu.csv",
+    { preHandler: [requireRole(["owner", "manager", "stock_clerk"]), exportLimiter] },
+    async (_req, reply) => {
+      const res = await db.execute(sql`
+        SELECT
+          p.plu_code,
+          p.sku,
+          p.name,
+          d.name AS department_name,
+          p.unit_mode,
+          p.default_tare_grams,
+          p.expiry_alert_days,
+          p.allergens_json,
+          p.ingredients_text,
+          p.recalled,
+          pb.barcode AS primary_barcode,
+          pb.sell_price_cents::bigint AS sell_price_cents
+        FROM products p
+        JOIN categories c ON c.id = p.category_id
+        JOIN departments d ON d.id = c.department_id
+        JOIN product_barcodes pb ON pb.product_id = p.id AND pb.is_primary = true
+        WHERE p.active = true AND (p.plu_code IS NOT NULL OR p.unit_mode IN ('weight_g', 'volume_ml'))
+        ORDER BY p.plu_code ASC NULLS LAST, p.sku ASC
+      `);
+
+      const toPrice = (v: unknown) => (Number(v ?? 0) / 100).toFixed(2);
+      const csv = buildCsvDocument(
+        [
+          "PLU",
+          "SKU",
+          "ProductName",
+          "Department",
+          "UnitMode",
+          "PricePerKgOrEach",
+          "TareGrams",
+          "ShelfLifeDays",
+          "EUAllergens",
+          "Ingredients",
+          "RecalledBlock",
+          "PrimaryBarcode",
+        ],
+        (res.rows as Record<string, unknown>[]).map((r) => {
+          const allergens = Array.isArray(r.allergens_json)
+            ? (r.allergens_json as string[]).map((a) => a.toUpperCase()).join("; ")
+            : "";
+          return [
+            r.plu_code ?? "",
+            r.sku,
+            r.name,
+            r.department_name,
+            r.unit_mode,
+            toPrice(r.sell_price_cents),
+            Number(r.default_tare_grams ?? 0),
+            Number(r.expiry_alert_days ?? 3),
+            allergens,
+            r.ingredients_text ?? "",
+            r.recalled ? "BLOCKED_RECALL" : "OK",
+            r.primary_barcode ?? "",
+          ];
+        })
+      );
+
+      reply.header("Content-Type", "text/csv; charset=utf-8");
+      reply.header(
+        "Content-Disposition",
+        `attachment; filename="supermarket-os-scale-plu-${new Date().toISOString().slice(0, 10)}.csv"`
+      );
+      return csv;
+    }
+  );
 
   // 5. Machine-readable OpenAPI 3.1 Contract Spec (auto-merges 100% of live Fastify routes - M-11)
   app.get(

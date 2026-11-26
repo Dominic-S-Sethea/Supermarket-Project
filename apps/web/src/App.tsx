@@ -109,6 +109,7 @@ export function App() {
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [copilotInitialPrompt, setCopilotInitialPrompt] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [posCatalogTick, setPosCatalogTick] = useState(0);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   const loadMetaAndAlerts = useCallback(async (currentUser: SessionUser) => {
@@ -593,6 +594,7 @@ export function App() {
                 key={`cat-${refreshTick}`}
                 departments={meta.departments}
                 userRole={user.role}
+                onCatalogChanged={() => setPosCatalogTick((t) => t + 1)}
               />
             )}
             {/* Keep PosTerminalView mounted across tab switches so active basket & offline state persist;
@@ -603,7 +605,7 @@ export function App() {
                   cashierName={user.fullName}
                   userRole={user.role}
                   isActive={activeTab === "pos"}
-                  catalogRefreshTick={refreshTick}
+                  catalogRefreshTick={refreshTick + posCatalogTick}
                 />
               </div>
             )}

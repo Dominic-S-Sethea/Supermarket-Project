@@ -36,9 +36,9 @@ export const PosScanBar = memo(function PosScanBar({
       <input
         ref={inputRef}
         id="pos-barcode-input"
-        aria-label="Scan EAN-13 or UPC-A barcode"
+        aria-label="Scan EAN-13, UPC-A, GS1 scale barcode, or 4-5 digit PLU"
         className="input"
-        placeholder="Scan EAN-13 / UPC-A barcode (USB HID scanner or paste code) + Enter..."
+        placeholder="Scan EAN-13 / GS1 scale barcode (20-29) or type 4-5 digit PLU (e.g. 4011) + Enter..."
         value={scanInput}
         onChange={(e) => setScanInput(e.target.value)}
       />

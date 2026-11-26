@@ -3,13 +3,16 @@ import {
   ApplyDynamicMarkdownSchema,
   CompleteFloorTaskSchema,
   computeSuggestedSellPriceCents,
+  computeWeightedPriceCents,
+  CreateRecipeSchema,
   formatMoney,
   GenerateStaffingPlanSchema,
   generateUuidV7,
+  LogProductionBatchSchema,
   PrintShelfTagBatchSchema,
   UpdateStaffingPlanSchema,
 } from "@supermarket/shared";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   analyticsDynamicMarkdowns,
@@ -20,8 +23,11 @@ import {
   departments,
   inventoryBatches,
   productBarcodes,
+  productionBatches,
   products,
   promotions,
+  recipeIngredients,
+  recipes,
   sales,
   shelfTagQueue,
   shiftRosters,
@@ -1031,6 +1037,383 @@ ${buildZplBarcodeCommand(r.barcode)}
         return reply.status(result.errorStatus).send({ error: result.error });
       }
       return { task: result.task, stockVarianceUnits: result.stockVarianceUnits };
+    }
+  );
+
+  // ============================================================================
+  // FRESH PRODUCTION BILL-OF-MATERIALS (BAKERY, BUTCHER & DELI YIELD)
+  // ============================================================================
+  app.get(
+    "/api/operations/recipes",
+    { preHandler: [requireRole(["owner", "manager", "stock_clerk"])] },
+    async () => {
+      const [recipeRows, ingRows, batchRows] = await Promise.all([
+        db
+          .select({
+            id: recipes.id,
+            code: recipes.code,
+            name: recipes.name,
+            outputProductId: recipes.outputProductId,
+            outputSku: products.sku,
+            outputName: products.name,
+            outputUnitMode: products.unitMode,
+            outputBaseUnitLabel: products.baseUnitLabel,
+            expectedYieldBaseUnits: recipes.expectedYieldBaseUnits,
+            shelfLifeDays: recipes.shelfLifeDays,
+            notes: recipes.notes,
+            active: recipes.active,
+          })
+          .from(recipes)
+          .innerJoin(products, eq(recipes.outputProductId, products.id))
+          .where(eq(recipes.active, true))
+          .orderBy(asc(recipes.code)),
+        db
+          .select({
+            id: recipeIngredients.id,
+            recipeId: recipeIngredients.recipeId,
+            ingredientProductId: recipeIngredients.ingredientProductId,
+            sku: products.sku,
+            name: products.name,
+            unitMode: products.unitMode,
+            baseUnitLabel: products.baseUnitLabel,
+            avgCostCents: products.avgCostCents,
+            qtyBaseUnits: recipeIngredients.qtyBaseUnits,
+            onHandUnits: sql<number>`(coalesce(${stockBaselines.quantity}, 0) + coalesce((
+              SELECT sum(sm.qty_delta)
+              FROM stock_movements sm
+              WHERE sm.product_id = ${products.id} AND sm.folded = false
+            ), 0))::int`,
+          })
+          .from(recipeIngredients)
+          .innerJoin(products, eq(recipeIngredients.ingredientProductId, products.id))
+          .leftJoin(stockBaselines, eq(products.id, stockBaselines.productId)),
+        db
+          .select({
+            id: productionBatches.id,
+            recipeId: productionBatches.recipeId,
+            recipeCode: recipes.code,
+            recipeName: recipes.name,
+            outputProductId: productionBatches.outputProductId,
+            outputSku: products.sku,
+            outputName: products.name,
+            outputUnitMode: products.unitMode,
+            lotCode: productionBatches.lotCode,
+            batchMultiplier: productionBatches.batchMultiplier,
+            expectedOutputUnits: productionBatches.expectedOutputUnits,
+            actualOutputUnits: productionBatches.actualOutputUnits,
+            trimWasteUnits: productionBatches.trimWasteUnits,
+            yieldBp: productionBatches.yieldBp,
+            totalIngredientCostCents: productionBatches.totalIngredientCostCents,
+            effectiveUnitCostCents: productionBatches.effectiveUnitCostCents,
+            producedBy: productionBatches.producedBy,
+            notes: productionBatches.notes,
+            producedAt: productionBatches.producedAt,
+          })
+          .from(productionBatches)
+          .innerJoin(recipes, eq(productionBatches.recipeId, recipes.id))
+          .innerJoin(products, eq(productionBatches.outputProductId, products.id))
+          .orderBy(desc(productionBatches.producedAt))
+          .limit(30),
+      ]);
+
+      const ingByRecipe = new Map<string, (typeof ingRows)[number][]>();
+      for (const ing of ingRows) {
+        const list = ingByRecipe.get(ing.recipeId) ?? [];
+        list.push(ing);
+        ingByRecipe.set(ing.recipeId, list);
+      }
+
+      const enrichedRecipes = recipeRows.map((r) => {
+        const ingredients = (ingByRecipe.get(r.id) ?? []).map((i) => {
+          const isMeasured = i.unitMode === "weight_g" || i.unitMode === "volume_ml";
+          const lineCostCents = isMeasured
+            ? computeWeightedPriceCents(i.qtyBaseUnits, i.avgCostCents)
+            : i.qtyBaseUnits * i.avgCostCents;
+          return {
+            ...i,
+            onHandUnits: Number(i.onHandUnits ?? 0),
+            estimatedLineCostCents: lineCostCents,
+          };
+        });
+        const estimatedBatchCostCents = ingredients.reduce(
+          (s, i) => s + i.estimatedLineCostCents,
+          0
+        );
+        return {
+          ...r,
+          ingredients,
+          estimatedBatchCostCents,
+        };
+      });
+
+      return { recipes: enrichedRecipes, recentBatches: batchRows };
+    }
+  );
+
+  app.post(
+    "/api/operations/recipes",
+    { preHandler: [requireRole(["owner", "manager"])] },
+    async (req, reply) => {
+      const parsed = CreateRecipeSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+      const data = parsed.data;
+      const allProductIds = Array.from(
+        new Set([data.outputProductId, ...data.ingredients.map((i) => i.ingredientProductId)])
+      );
+      const found = await db
+        .select({ id: products.id })
+        .from(products)
+        .where(inArray(products.id, allProductIds));
+      if (found.length !== allProductIds.length) {
+        return reply.status(400).send({ error: "Output or ingredient productId does not exist." });
+      }
+
+      const created = await db.transaction(async (tx) => {
+        const [rec] = await tx
+          .insert(recipes)
+          .values({
+            code: data.code.toUpperCase(),
+            name: data.name,
+            outputProductId: data.outputProductId,
+            expectedYieldBaseUnits: data.expectedYieldBaseUnits,
+            shelfLifeDays: data.shelfLifeDays,
+            notes: data.notes ?? null,
+          })
+          .returning();
+
+        await tx.insert(recipeIngredients).values(
+          data.ingredients.map((i) => ({
+            recipeId: rec.id,
+            ingredientProductId: i.ingredientProductId,
+            qtyBaseUnits: i.qtyBaseUnits,
+          }))
+        );
+
+        await tx.insert(auditLogs).values({
+          actor: req.authUser!.fullName,
+          action: "recipe_create",
+          entityType: "recipe",
+          entityId: rec.id,
+          detailsJson: { code: rec.code, name: rec.name, ingredients: data.ingredients.length },
+        });
+        return rec;
+      });
+
+      return reply.status(201).send({ recipe: created });
+    }
+  );
+
+  app.post(
+    "/api/operations/production-batches",
+    { preHandler: [requireRole(["owner", "manager", "stock_clerk"])] },
+    async (req, reply) => {
+      const parsed = LogProductionBatchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+      const data = parsed.data;
+      const actorName = req.authUser!.fullName;
+
+      const result = await db.transaction(async (tx) => {
+        const [rec] = await tx
+          .select()
+          .from(recipes)
+          .where(eq(recipes.id, data.recipeId))
+          .limit(1);
+        if (!rec) {
+          return { errorStatus: 404 as const, error: "Recipe not found." };
+        }
+
+        const [outProd] = await tx
+          .select({
+            id: products.id,
+            sku: products.sku,
+            name: products.name,
+            unitMode: products.unitMode,
+            avgCostCents: products.avgCostCents,
+          })
+          .from(products)
+          .where(eq(products.id, rec.outputProductId))
+          .for("update");
+        if (!outProd) {
+          return { errorStatus: 404 as const, error: "Output product not found." };
+        }
+
+        const ings = await tx
+          .select({
+            ingredientProductId: recipeIngredients.ingredientProductId,
+            qtyBaseUnits: recipeIngredients.qtyBaseUnits,
+            sku: products.sku,
+            unitMode: products.unitMode,
+            avgCostCents: products.avgCostCents,
+          })
+          .from(recipeIngredients)
+          .innerJoin(products, eq(recipeIngredients.ingredientProductId, products.id))
+          .where(eq(recipeIngredients.recipeId, rec.id));
+
+        const batchId = generateUuidV7();
+        let totalIngredientCostCents = 0;
+
+        // 1. Deduct raw ingredients via locked FEFO batches + production_out stock movements
+        const orderedIngs = [...ings].sort((a, b) =>
+          a.ingredientProductId.localeCompare(b.ingredientProductId)
+        );
+        for (const ing of orderedIngs) {
+          const consumeUnits = ing.qtyBaseUnits * data.batchMultiplier;
+          const isMeasured = ing.unitMode === "weight_g" || ing.unitMode === "volume_ml";
+          const lineCost = isMeasured
+            ? computeWeightedPriceCents(consumeUnits, ing.avgCostCents)
+            : consumeUnits * ing.avgCostCents;
+          totalIngredientCostCents += lineCost;
+
+          let remaining = consumeUnits;
+          const fefoBatches = await tx
+            .select()
+            .from(inventoryBatches)
+            .where(
+              and(
+                eq(inventoryBatches.productId, ing.ingredientProductId),
+                gt(inventoryBatches.qtyRemaining, 0),
+                sql`${inventoryBatches.status} IN ('active', 'clearance')`
+              )
+            )
+            .orderBy(asc(inventoryBatches.bestBeforeDate), asc(inventoryBatches.id))
+            .for("update");
+
+          for (const b of fefoBatches) {
+            if (remaining <= 0) break;
+            const take = Math.min(remaining, b.qtyRemaining);
+            const nextQty = b.qtyRemaining - take;
+            await tx
+              .update(inventoryBatches)
+              .set({ qtyRemaining: nextQty, status: nextQty === 0 ? "depleted" : b.status })
+              .where(eq(inventoryBatches.id, b.id));
+            await tx.insert(stockMovements).values({
+              id: generateUuidV7(),
+              productId: ing.ingredientProductId,
+              batchId: b.id,
+              qtyDelta: -take,
+              unitCostCents: ing.avgCostCents,
+              reason: "production_out",
+              refId: batchId,
+              folded: false,
+            });
+            remaining -= take;
+          }
+
+          if (remaining > 0) {
+            await tx.insert(stockMovements).values({
+              id: generateUuidV7(),
+              productId: ing.ingredientProductId,
+              batchId: null,
+              qtyDelta: -remaining,
+              unitCostCents: ing.avgCostCents,
+              reason: "production_out",
+              refId: batchId,
+              folded: false,
+            });
+          }
+        }
+
+        // 2. Compute effective unit cost (per kg/L for weight_g/volume_ml, per unit for each) & yield bp
+        const expectedOutputUnits = rec.expectedYieldBaseUnits * data.batchMultiplier;
+        const yieldBp = Math.round((data.actualOutputUnits * 10000) / expectedOutputUnits);
+        const outIsMeasured = outProd.unitMode === "weight_g" || outProd.unitMode === "volume_ml";
+        const effectiveUnitCostCents = outIsMeasured
+          ? Math.round((totalIngredientCostCents * 1000) / data.actualOutputUnits)
+          : Math.round(totalIngredientCostCents / data.actualOutputUnits);
+
+        const lotCode =
+          data.lotCode ??
+          `PROD-${rec.code}-${new Date().toISOString().slice(2, 10).replace(/-/g, "")}`;
+        const bestBeforeDate = new Date(Date.now() + rec.shelfLifeDays * 86_400_000)
+          .toISOString()
+          .slice(0, 10);
+
+        // 3. Create finished FEFO inventory batch + production_in stock movement
+        const [newFefoBatch] = await tx
+          .insert(inventoryBatches)
+          .values({
+            productId: outProd.id,
+            lotCode,
+            bestBeforeDate,
+            unitCostCents: effectiveUnitCostCents,
+            qtyReceived: data.actualOutputUnits,
+            qtyRemaining: data.actualOutputUnits,
+            status: "active",
+          })
+          .returning();
+
+        await tx.insert(stockMovements).values({
+          id: generateUuidV7(),
+          productId: outProd.id,
+          batchId: newFefoBatch.id,
+          qtyDelta: data.actualOutputUnits,
+          unitCostCents: effectiveUnitCostCents,
+          reason: "production_in",
+          refId: batchId,
+          folded: false,
+        });
+
+        // 4. Record trim/spoilage waste movement if > 0 (net-zero on stock, audited cost signal)
+        if (data.trimWasteUnits > 0) {
+          await tx.insert(stockMovements).values({
+            id: generateUuidV7(),
+            productId: outProd.id,
+            batchId: newFefoBatch.id,
+            qtyDelta: 0,
+            unitCostCents: effectiveUnitCostCents,
+            reason: "trim_waste",
+            refId: batchId,
+            folded: false,
+          });
+        }
+
+        const [logged] = await tx
+          .insert(productionBatches)
+          .values({
+            id: batchId,
+            recipeId: rec.id,
+            outputProductId: outProd.id,
+            outputBatchId: newFefoBatch.id,
+            lotCode,
+            batchMultiplier: data.batchMultiplier,
+            expectedOutputUnits,
+            actualOutputUnits: data.actualOutputUnits,
+            trimWasteUnits: data.trimWasteUnits,
+            yieldBp,
+            totalIngredientCostCents,
+            effectiveUnitCostCents,
+            producedBy: actorName,
+            notes: data.notes ?? null,
+          })
+          .returning();
+
+        await tx.insert(auditLogs).values({
+          actor: actorName,
+          action: "production_batch_log",
+          entityType: "production_batch",
+          entityId: logged.id,
+          detailsJson: {
+            recipeCode: rec.code,
+            outputSku: outProd.sku,
+            lotCode,
+            actualOutputUnits: data.actualOutputUnits,
+            trimWasteUnits: data.trimWasteUnits,
+            yieldBp,
+            effectiveUnitCostCents,
+          },
+        });
+
+        return { errorStatus: null, batch: logged, fefoBatch: newFefoBatch };
+      });
+
+      if (result.errorStatus) {
+        return reply.status(result.errorStatus).send({ error: result.error });
+      }
+      return reply.status(201).send({ batch: result.batch, fefoBatch: result.fefoBatch });
     }
   );
 }

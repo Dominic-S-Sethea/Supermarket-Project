@@ -397,7 +397,7 @@ describe("PosScanBar & HourlyFootfallChart localized interaction state", () => {
     }
 
     render(<Harness />);
-    const input = screen.getByLabelText(/Scan EAN-13 or UPC-A barcode/i);
+    const input = screen.getByLabelText(/Scan EAN-13, UPC-A, GS1 scale barcode/i);
     expect(document.activeElement).toBe(input);
 
     fireEvent.change(input, { target: { value: "0000" } });
@@ -433,5 +433,158 @@ describe("PosScanBar & HourlyFootfallChart localized interaction state", () => {
     expect(screen.getByRole("status")).toHaveTextContent(/09:00 — 48 in → 36 paid \(75%\)/i);
   });
 });
+
+describe("Flagship Milestone 1: PosFreshPluModal & FreshProductionTab", () => {
+  it("computes net weight after tare, generates GS1 scale barcode, and blocks recalled SKUs", async () => {
+    const { PosFreshPluModal } = await import("../components/PosFreshPluModal");
+    const onAddWeighted = vi.fn();
+    const onAddEach = vi.fn();
+    const onSimulateScaleBarcode = vi.fn();
+    const onClose = vi.fn();
+
+    render(
+      <PosFreshPluModal
+        open
+        items={[
+          {
+            productId: "p-banana",
+            sku: "PROD-4011",
+            name: "Cavendish Bananas (Loose)",
+            brand: "TropiFresh",
+            pluCode: "4011",
+            unitMode: "weight_g",
+            defaultTareGrams: 12,
+            netContentAmount: 1000,
+            netContentUnit: "g",
+            allergens: [],
+            recalled: false,
+            recallReason: null,
+            barcode: "8990009100011",
+            packLabel: "Per kg",
+            sellPriceCents: 200,
+          },
+          {
+            productId: "p-salmon",
+            sku: "MEAT-20020",
+            name: "Atlantic Salmon Fillet",
+            brand: "NordicSea",
+            pluCode: "20020",
+            unitMode: "weight_g",
+            defaultTareGrams: 30,
+            netContentAmount: 1000,
+            netContentUnit: "g",
+            allergens: ["fish"],
+            recalled: true,
+            recallReason: "Cold chain temperature excursion",
+            barcode: "8990009100073",
+            packLabel: "Per kg",
+            sellPriceCents: 2450,
+          },
+        ]}
+        onAddWeighted={onAddWeighted}
+        onAddEach={onAddEach}
+        onSimulateScaleBarcode={onSimulateScaleBarcode}
+        onClose={onClose}
+      />
+    );
+
+    const dialog = screen.getByRole("dialog", { name: /Fresh Produce, Butcher, Deli & Bakery PLU Scale/i });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+
+    // Default gross = 512g, tare = 12g -> net = 500g (0.500 kg) @ $2.00/kg = $1.00
+    fireEvent.click(screen.getByRole("button", { name: /Add 0\.500 kg to Basket \(\$1\.00\)/i }));
+    expect(onAddWeighted).toHaveBeenCalledWith(
+      expect.objectContaining({ sku: "PROD-4011" }),
+      500,
+      12
+    );
+
+    // Select recalled salmon -> food-safety alert blocks checkout
+    fireEvent.click(screen.getByRole("button", { name: /Atlantic Salmon Fillet/i }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/FOOD-SAFETY RECALL BLOCK/i);
+    expect(screen.queryByRole("button", { name: /Add .* to Basket/i })).not.toBeInTheDocument();
+  });
+
+  it("loads BOM recipes and posts a production batch with yield feedback", async () => {
+    const { FreshProductionTab } = await import("../components/FreshProductionTab");
+    const onFeedback = vi.fn();
+    const onError = vi.fn();
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/operations/recipes")) {
+        return new Response(
+          JSON.stringify({
+            recipes: [
+              {
+                id: "rec-1",
+                code: "BAKE-SOURDOUGH-10",
+                name: "Country Sourdough 10-Loaf Batch",
+                outputProductId: "p-loaf",
+                outputSku: "BAKE-40010",
+                outputName: "Artisan Country Sourdough Loaf 750g",
+                outputUnitMode: "each",
+                outputBaseUnitLabel: "loaf",
+                expectedYieldBaseUnits: 10,
+                shelfLifeDays: 2,
+                notes: "Stone deck bake",
+                active: true,
+                estimatedBatchCostCents: 1200,
+                ingredients: [
+                  {
+                    id: "ing-1",
+                    recipeId: "rec-1",
+                    ingredientProductId: "p-flour",
+                    sku: "BAKE-RAW-FLOUR",
+                    name: "Artisan Bread Flour T65",
+                    unitMode: "weight_g",
+                    baseUnitLabel: "g",
+                    avgCostCents: 240,
+                    qtyBaseUnits: 5000,
+                    onHandUnits: 25000,
+                    estimatedLineCostCents: 1200,
+                  },
+                ],
+              },
+            ],
+            recentBatches: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.includes("/api/operations/production-batches") && init?.method === "POST") {
+        return new Response(
+          JSON.stringify({
+            batch: {
+              lotCode: "PROD-BAKE-SOURDOUGH-10-261126",
+              actualOutputUnits: 10,
+              yieldBp: 10000,
+              effectiveUnitCostCents: 120,
+            },
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response("{}", { status: 404 });
+    });
+
+    render(<FreshProductionTab onFeedback={onFeedback} onError={onError} />);
+
+    const logBtn = await screen.findByRole("button", {
+      name: /Log Production Batch & Deduct Raw Stock/i,
+    });
+    expect(screen.getByText(/Artisan Bread Flour T65/i)).toBeInTheDocument();
+
+    fireEvent.click(logBtn);
+    await waitFor(() => {
+      expect(onFeedback).toHaveBeenCalledWith(expect.stringContaining("PROD-BAKE-SOURDOUGH-10-261126"));
+    });
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "/api/operations/production-batches",
+      expect.objectContaining({ method: "POST" })
+    );
+  });
+});
+
 
 

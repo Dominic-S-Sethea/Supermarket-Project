@@ -193,6 +193,14 @@ test.describe("Manual-Equivalent Verification: Keyboard-Only, Chromium AX Tree &
     expect((await inspectActiveFocus(page)).hasVisibleFocus).toBe(true);
 
     await page.keyboard.press("ArrowRight");
+    await expect(page.locator("#ops-subtab-production")).toBeFocused();
+    await expect(page.locator("#ops-subtab-production")).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator('[role="tabpanel"]')).toHaveAttribute(
+      "aria-labelledby",
+      "ops-subtab-production"
+    );
+
+    await page.keyboard.press("ArrowRight");
     await expect(page.locator("#ops-subtab-orders")).toBeFocused();
     await expect(page.locator("#ops-subtab-orders")).toHaveAttribute("aria-selected", "true");
     await expect(page.locator('[role="tabpanel"]')).toHaveAttribute(
@@ -331,7 +339,7 @@ test.describe("Manual-Equivalent Verification: Keyboard-Only, Chromium AX Tree &
     const tablist = opsAx.find((n) => n.role?.value === "tablist");
     expect(tablist).toBeTruthy();
     const tabs = opsAx.filter((n) => n.role?.value === "tab");
-    expect(tabs.length).toBe(5);
+    expect(tabs.length).toBe(6);
     const selectedTabs = tabs.filter(
       (t) => t.properties?.find((p) => p.name === "selected")?.value.value === true
     );

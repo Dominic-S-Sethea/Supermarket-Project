@@ -62,7 +62,17 @@ export const products = pgTable(
     taxRateId: uuid("tax_rate_id")
       .notNull()
       .references(() => taxRates.id, { onDelete: "restrict" }),
-    baseUnitLabel: text("base_unit_label").notNull().default("unit"), // can, bottle, pack, bag
+    baseUnitLabel: text("base_unit_label").notNull().default("unit"), // can, bottle, pack, bag, g, ml
+    unitMode: text("unit_mode").notNull().default("each"), // each | weight_g | volume_ml
+    pluCode: text("plu_code").unique(), // 4-5 digit IFPS Produce / Deli PLU (e.g. 4011, 20010)
+    defaultTareGrams: integer("default_tare_grams").notNull().default(0),
+    netContentAmount: integer("net_content_amount"), // e.g. 330 (ml), 500 (g), 1000 (per kg)
+    netContentUnit: text("net_content_unit"), // g | ml | ea
+    allergensJson: jsonb("allergens_json").$type<string[]>().notNull().default([]), // EU Reg 1169/2011 14 allergens
+    ingredientsText: text("ingredients_text"),
+    recalled: boolean("recalled").notNull().default(false),
+    recallReason: text("recall_reason"),
+    recalledAt: timestamp("recalled_at", { withTimezone: true }),
     avgCostCents: bigint("avg_cost_cents", { mode: "number" }).notNull().default(0),
     minMarginBp: integer("min_margin_bp").notNull().default(1500),
     requiresAgeCheck: boolean("requires_age_check").notNull().default(false),
@@ -79,6 +89,8 @@ export const products = pgTable(
     index("idx_products_brand").on(t.brand),
     index("idx_products_name").on(t.name),
     index("idx_products_active").on(t.active),
+    index("idx_products_unit_mode").on(t.unitMode),
+    index("idx_products_recalled").on(t.recalled),
   ]
 );
 
@@ -449,6 +461,8 @@ export const saleLines = pgTable(
     packLabel: text("pack_label").notNull(),
     packQty: integer("pack_qty").notNull(),
     qtyPacks: integer("qty_packs").notNull(),
+    weightGrams: integer("weight_grams"),
+    tareGrams: integer("tare_grams"),
     baseUnitsSold: integer("base_units_sold").notNull(),
     unitPriceCents: bigint("unit_price_cents", { mode: "number" }).notNull(),
     unitCostCents: bigint("unit_cost_cents", { mode: "number" }).notNull(),
@@ -1002,5 +1016,77 @@ export const analyticsPipelineRuns = pgTable(
     dqChecksJson: jsonb("dq_checks_json").notNull(),
   },
   (t) => [index("idx_pipeline_runs_finished").on(t.finishedAt)]
+);
+
+// ============================================================================
+// 11. FRESH PRODUCTION BILL-OF-MATERIALS (BAKERY, BUTCHER & DELI YIELD)
+// ============================================================================
+
+export const recipes = pgTable(
+  "recipes",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    code: text("code").notNull().unique(),
+    name: text("name").notNull(),
+    outputProductId: uuid("output_product_id")
+      .notNull()
+      .references(() => products.id, { onDelete: "restrict" }),
+    expectedYieldBaseUnits: integer("expected_yield_base_units").notNull(),
+    shelfLifeDays: integer("shelf_life_days").notNull().default(3),
+    notes: text("notes"),
+    active: boolean("active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index("idx_recipes_output_product").on(t.outputProductId)]
+);
+
+export const recipeIngredients = pgTable(
+  "recipe_ingredients",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    recipeId: uuid("recipe_id")
+      .notNull()
+      .references(() => recipes.id, { onDelete: "cascade" }),
+    ingredientProductId: uuid("ingredient_product_id")
+      .notNull()
+      .references(() => products.id, { onDelete: "restrict" }),
+    qtyBaseUnits: integer("qty_base_units").notNull(),
+  },
+  (t) => [
+    uniqueIndex("uq_recipe_ingredient").on(t.recipeId, t.ingredientProductId),
+    index("idx_recipe_ingredients_recipe").on(t.recipeId),
+  ]
+);
+
+export const productionBatches = pgTable(
+  "production_batches",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    recipeId: uuid("recipe_id")
+      .notNull()
+      .references(() => recipes.id, { onDelete: "restrict" }),
+    outputProductId: uuid("output_product_id")
+      .notNull()
+      .references(() => products.id, { onDelete: "restrict" }),
+    outputBatchId: uuid("output_batch_id").references(() => inventoryBatches.id, {
+      onDelete: "set null",
+    }),
+    lotCode: text("lot_code").notNull(),
+    batchMultiplier: integer("batch_multiplier").notNull().default(1),
+    expectedOutputUnits: integer("expected_output_units").notNull(),
+    actualOutputUnits: integer("actual_output_units").notNull(),
+    trimWasteUnits: integer("trim_waste_units").notNull().default(0),
+    yieldBp: integer("yield_bp").notNull(), // 10000 = 100.00%
+    totalIngredientCostCents: bigint("total_ingredient_cost_cents", { mode: "number" }).notNull(),
+    effectiveUnitCostCents: bigint("effective_unit_cost_cents", { mode: "number" }).notNull(),
+    producedBy: text("produced_by").notNull(),
+    notes: text("notes"),
+    producedAt: timestamp("produced_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("idx_production_batches_recipe").on(t.recipeId),
+    index("idx_production_batches_produced").on(t.producedAt),
+  ]
 );
 

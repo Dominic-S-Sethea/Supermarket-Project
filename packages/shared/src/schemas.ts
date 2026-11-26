@@ -1,5 +1,12 @@
 import { z } from "zod";
-import type { StockMovementReason, UserRole } from "./dtos.js";
+import {
+  EU_ALLERGENS,
+  type EuAllergenCode,
+  type NetContentUnit,
+  type StockMovementReason,
+  type UnitMode,
+  type UserRole,
+} from "./dtos.js";
 
 export const UserRoleSchema: z.ZodType<UserRole> = z.enum([
   "owner",
@@ -8,6 +15,12 @@ export const UserRoleSchema: z.ZodType<UserRole> = z.enum([
   "cashier",
   "accountant",
 ]);
+
+export const UnitModeSchema: z.ZodType<UnitMode> = z.enum(["each", "weight_g", "volume_ml"]);
+export const NetContentUnitSchema: z.ZodType<NetContentUnit> = z.enum(["g", "ml", "ea"]);
+export const EuAllergenSchema: z.ZodType<EuAllergenCode> = z.enum(
+  EU_ALLERGENS.map((a) => a.code) as [EuAllergenCode, ...EuAllergenCode[]]
+);
 
 export const StockMovementReasonSchema: z.ZodType<StockMovementReason> = z.enum([
   "sale",
@@ -20,6 +33,9 @@ export const StockMovementReasonSchema: z.ZodType<StockMovementReason> = z.enum(
   "count_adj",
   "clearance",
   "opening_stock",
+  "production_in",
+  "production_out",
+  "trim_waste",
 ]);
 
 export const CreateProductSchema = z.object({
@@ -29,6 +45,18 @@ export const CreateProductSchema = z.object({
   categoryId: z.string().uuid(),
   taxRateId: z.string().uuid(),
   baseUnitLabel: z.string().min(1).max(32).default("unit"),
+  unitMode: UnitModeSchema.optional().default("each"),
+  pluCode: z
+    .string()
+    .trim()
+    .regex(/^\d{4,5}$/, "PLU code must be 4 or 5 digits")
+    .nullable()
+    .optional(),
+  defaultTareGrams: z.number().int().min(0).max(50_000).optional().default(0),
+  netContentAmount: z.number().int().min(1).max(1_000_000).nullable().optional(),
+  netContentUnit: NetContentUnitSchema.nullable().optional(),
+  allergens: z.array(EuAllergenSchema).max(14).optional().default([]),
+  ingredientsText: z.string().trim().max(1000).nullable().optional(),
   avgCostCents: z.number().int().min(0),
   minMarginBp: z.number().int().min(0).max(9500).default(1500),
   requiresAgeCheck: z.boolean().default(false),
@@ -70,6 +98,8 @@ export const PosSaleUploadSchema = z.object({
         packLabel: z.string().min(1),
         packQty: z.number().int().min(1),
         qtyPacks: z.number().int().min(1),
+        weightGrams: z.number().int().min(1).max(500_000).nullable().optional(),
+        tareGrams: z.number().int().min(0).max(50_000).nullable().optional(),
         unitPriceCents: z.number().int().min(0),
         unitCostCents: z.number().int().min(0).optional().default(0),
         discountCents: z.number().int().min(0),
@@ -375,3 +405,50 @@ export const ChangePinSchema = z
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["newPin"], message: err });
     }
   });
+
+export const RecallProductSchema = z
+  .object({
+    recalled: z.boolean(),
+    reason: z.string().trim().max(240).nullable().optional(),
+  })
+  .superRefine((d, ctx) => {
+    if (d.recalled && (!d.reason || d.reason.trim().length < 4)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["reason"],
+        message: "Recall reason (min 4 characters) is required when activating a food-safety recall.",
+      });
+    }
+  });
+
+export const CreateRecipeSchema = z.object({
+  code: z
+    .string()
+    .trim()
+    .min(2)
+    .max(40)
+    .regex(/^[A-Z0-9_-]+$/i, "Recipe code must be alphanumeric with - or _"),
+  name: z.string().trim().min(2).max(160),
+  outputProductId: z.string().uuid(),
+  expectedYieldBaseUnits: z.number().int().min(1).max(1_000_000),
+  shelfLifeDays: z.number().int().min(1).max(365).default(3),
+  notes: z.string().trim().max(500).optional(),
+  ingredients: z
+    .array(
+      z.object({
+        ingredientProductId: z.string().uuid(),
+        qtyBaseUnits: z.number().int().min(1).max(1_000_000),
+      })
+    )
+    .min(1)
+    .max(40),
+});
+
+export const LogProductionBatchSchema = z.object({
+  recipeId: z.string().uuid(),
+  batchMultiplier: z.number().int().min(1).max(100).default(1),
+  actualOutputUnits: z.number().int().min(1).max(10_000_000),
+  trimWasteUnits: z.number().int().min(0).max(10_000_000).default(0),
+  lotCode: z.string().trim().min(2).max(64).optional(),
+  notes: z.string().trim().max(500).optional(),
+});

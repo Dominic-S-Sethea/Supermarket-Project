@@ -153,3 +153,91 @@ export function generateUuidV7(): string {
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+
+/**
+ * Compute integer line price (or cost) in cents for weight_g / volume_ml products
+ * where unitPricePer1000Cents is quoted per 1,000 base units (per kg or per L).
+ */
+export function computeWeightedPriceCents(
+  netMeasureMilliUnits: number,
+  pricePer1000Cents: number
+): number {
+  const safeMeasure = Number.isFinite(netMeasureMilliUnits) ? Math.max(0, Math.round(netMeasureMilliUnits)) : 0;
+  const safePrice = Number.isFinite(pricePer1000Cents) ? Math.max(0, Math.round(pricePer1000Cents)) : 0;
+  if (safeMeasure <= 0 || safePrice <= 0) return 0;
+  return Math.round((safeMeasure * safePrice) / 1000);
+}
+
+/**
+ * Derive approximate net weight in grams from an embedded-price GS1 25-29 barcode.
+ */
+export function deriveWeightFromPriceGrams(
+  embeddedPriceCents: number,
+  pricePerKgCents: number
+): number {
+  const safePrice = Number.isFinite(embeddedPriceCents) ? Math.max(1, Math.round(embeddedPriceCents)) : 1;
+  const safeKg = Number.isFinite(pricePerKgCents) ? Math.max(1, Math.round(pricePerKgCents)) : 1;
+  return Math.max(1, Math.round((safePrice * 1000) / safeKg));
+}
+
+/**
+ * Format inventory or sold quantity cleanly for each, weight_g (kg), or volume_ml (L).
+ */
+export function formatMeasure(
+  units: number,
+  unitMode: "each" | "weight_g" | "volume_ml" = "each",
+  baseUnitLabel = "unit"
+): string {
+  const safe = Number.isFinite(units) ? Math.round(units) : 0;
+  if (unitMode === "weight_g") {
+    return `${(safe / 1000).toFixed(3)} kg`;
+  }
+  if (unitMode === "volume_ml") {
+    return `${(safe / 1000).toFixed(3)} L`;
+  }
+  return `${safe.toLocaleString("en-US")} ${baseUnitLabel}`;
+}
+
+/**
+ * Compute EU Price Indication Directive 98/6/EC normalized unit price string
+ * (e.g., "$1.99 / kg", "$2.40 / L", "$0.48 / 100g").
+ */
+export function computeLegalUnitPrice(
+  sellPriceCents: number,
+  netContentAmount: number | null | undefined,
+  netContentUnit: "g" | "ml" | "ea" | null | undefined,
+  unitMode: "each" | "weight_g" | "volume_ml" = "each",
+  currencySymbol = "$"
+): string | null {
+  if (!Number.isFinite(sellPriceCents) || sellPriceCents <= 0) return null;
+  if (unitMode === "weight_g") {
+    return `${formatMoney(sellPriceCents, currencySymbol)} / kg`;
+  }
+  if (unitMode === "volume_ml") {
+    return `${formatMoney(sellPriceCents, currencySymbol)} / L`;
+  }
+  if (!netContentAmount || !Number.isFinite(netContentAmount) || netContentAmount <= 0 || !netContentUnit) {
+    return null;
+  }
+  if (netContentUnit === "g") {
+    if (netContentAmount < 250) {
+      const per100g = Math.round((sellPriceCents * 100) / netContentAmount);
+      return `${formatMoney(per100g, currencySymbol)} / 100g`;
+    }
+    const perKg = Math.round((sellPriceCents * 1000) / netContentAmount);
+    return `${formatMoney(perKg, currencySymbol)} / kg`;
+  }
+  if (netContentUnit === "ml") {
+    if (netContentAmount < 250) {
+      const per100ml = Math.round((sellPriceCents * 100) / netContentAmount);
+      return `${formatMoney(per100ml, currencySymbol)} / 100ml`;
+    }
+    const perL = Math.round((sellPriceCents * 1000) / netContentAmount);
+    return `${formatMoney(perL, currencySymbol)} / L`;
+  }
+  if (netContentUnit === "ea" && netContentAmount > 1) {
+    const perEach = Math.round(sellPriceCents / netContentAmount);
+    return `${formatMoney(perEach, currencySymbol)} / ea`;
+  }
+  return null;
+}

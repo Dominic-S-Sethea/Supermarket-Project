@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { UserRole } from "@supermarket/shared/dtos";
-import { formatBp, formatMoney, generateUuidV7 } from "@supermarket/shared/money";
+import { normalizePluCode, parseScaleBarcode } from "@supermarket/shared/barcodes";
+import type { UnitMode, UserRole } from "@supermarket/shared/dtos";
+import {
+  computeWeightedPriceCents,
+  deriveWeightFromPriceGrams,
+  formatBp,
+  formatMeasure,
+  formatMoney,
+  generateUuidV7,
+} from "@supermarket/shared/money";
 import { evaluateCart, type CartInputLine, type PromotionRule } from "@supermarket/shared/pricing";
 import {
   CheckCircle2,
@@ -11,12 +19,14 @@ import {
   Play,
   Receipt,
   RefreshCw,
+  Scale,
   ShieldCheck,
   Sparkles,
   Trash2,
   Wifi,
 } from "lucide-react";
 import { ApiError, apiGet, apiPost } from "../api";
+import { PosFreshPluModal, type FreshPluItem } from "../components/PosFreshPluModal";
 import { PosLoyaltyCard, type AppliedCoupon, type PosCustomer } from "../components/PosLoyaltyCard";
 import {
   AgeVerificationModal,
@@ -64,6 +74,8 @@ export function PosTerminalView({
   const canVoidOrRefund = userRole === "owner" || userRole === "manager";
   const [productsMap, setProductsMap] = useState<Map<string, BootstrapProduct>>(new Map());
   const [barcodesMap, setBarcodesMap] = useState<Map<string, BootstrapBarcode>>(new Map());
+  const [pluMap, setPluMap] = useState<Map<string, BootstrapProduct>>(new Map());
+  const [freshPluItems, setFreshPluItems] = useState<FreshPluItem[]>([]);
   const [primaryByProductMap, setPrimaryByProductMap] = useState<Map<string, BootstrapBarcode>>(
     new Map()
   );
@@ -83,6 +95,8 @@ export function PosTerminalView({
   const [cart, setCart] = useState<CartInputLine[]>([]);
   const [ageVerified, setAgeVerified] = useState(false);
   const [pendingAgeItem, setPendingAgeItem] = useState<BootstrapBarcode | null>(null);
+  const [showFreshPluModal, setShowFreshPluModal] = useState(false);
+  const [freshPluInitialProductId, setFreshPluInitialProductId] = useState<string | null>(null);
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -146,7 +160,12 @@ export function PosTerminalView({
   }, [cart.length, ageVerified]);
 
   const anyModalOpen = Boolean(
-    pendingAgeItem || showShiftClose || showShiftOpen || showRecentReceipts || showDeadLetterModal
+    pendingAgeItem ||
+      showFreshPluModal ||
+      showShiftClose ||
+      showShiftOpen ||
+      showRecentReceipts ||
+      showDeadLetterModal
   );
 
   // Re-focus barcode scanner input when POS tab becomes active and no modal is open
@@ -230,9 +249,44 @@ export function PosTerminalView({
 
       const tMap = new Map(data.taxRates.map((t) => [t.id, t]));
       const parsedPromos = mapBootstrapPromotions(data.promotions);
+      const nextPluMap = new Map<string, BootstrapProduct>();
+      const nextFreshItems: FreshPluItem[] = [];
+
+      for (const p of data.products) {
+        if (p.pluCode) {
+          nextPluMap.set(normalizePluCode(p.pluCode), p);
+          nextPluMap.set(p.pluCode.trim(), p);
+        }
+        const unitMode: UnitMode = p.unitMode ?? "each";
+        if (p.pluCode || unitMode !== "each") {
+          const primBc = primMap.get(p.id);
+          if (primBc) {
+            nextFreshItems.push({
+              productId: p.id,
+              sku: p.sku,
+              name: p.name,
+              brand: p.brand,
+              pluCode: p.pluCode ?? null,
+              unitMode,
+              defaultTareGrams: p.defaultTareGrams ?? 0,
+              netContentAmount: p.netContentAmount ?? null,
+              netContentUnit: p.netContentUnit ?? null,
+              allergens: Array.isArray(p.allergens) ? p.allergens : [],
+              recalled: Boolean(p.recalled),
+              recallReason: p.recallReason ?? null,
+              barcode: primBc.barcode,
+              packLabel: primBc.packLabel,
+              sellPriceCents: primBc.sellPriceCents,
+            });
+          }
+        }
+      }
+      nextFreshItems.sort((a, b) => a.sku.localeCompare(b.sku));
 
       setProductsMap(pMap);
       setBarcodesMap(bMap);
+      setPluMap(nextPluMap);
+      setFreshPluItems(nextFreshItems);
       setPrimaryByProductMap(primMap);
       setTaxMap(tMap);
       setPromos(parsedPromos);
@@ -246,15 +300,17 @@ export function PosTerminalView({
   );
 
   const loadBootstrap = useCallback(
-    async (signal?: AbortSignal) => {
+    async (signal?: AbortSignal, options?: { preferLive?: boolean }) => {
       setBootstrapLoading(true);
       setBootstrapError(null);
-      let hasCached = false;
+      let hasCached = Boolean(options?.preferLive);
       try {
-        const cached = await loadPosCache();
-        if (cached && !signal?.aborted) {
-          hasCached = true;
-          hydrateFromSnapshot(cached, "indexeddb");
+        if (!options?.preferLive) {
+          const cached = await loadPosCache();
+          if (cached && !signal?.aborted) {
+            hasCached = true;
+            hydrateFromSnapshot(cached, "indexeddb");
+          }
         }
         try {
           const live = await apiGet<PosBootstrapSnapshot>("/api/pos/bootstrap", signal);
@@ -289,11 +345,11 @@ export function PosTerminalView({
     return () => controller.abort();
   }, [loadBootstrap, loadActiveShift]);
 
-  // Refresh POS catalog/promos in place whenever AI Copilot executes a price/promo mutation (H-17)
+  // Refresh POS catalog/promos in place whenever Catalog or AI Copilot executes a mutation (H-17)
   useEffect(() => {
     if (catalogRefreshTick <= 0) return;
     const controller = new AbortController();
-    void loadBootstrap(controller.signal);
+    void loadBootstrap(controller.signal, { preferLive: true });
     return () => controller.abort();
   }, [catalogRefreshTick, loadBootstrap]);
 
@@ -316,7 +372,20 @@ export function PosTerminalView({
     daypartPreview === "morning" ? 9 : daypartPreview === "evening" ? 18 : new Date().getHours();
 
   const rawBasketSubtotalCents = useMemo(
-    () => cart.reduce((s, l) => s + l.unitPriceCents * l.qtyPacks, 0),
+    () =>
+      cart.reduce((s, l) => {
+        if (typeof l.embeddedPriceCents === "number" && l.embeddedPriceCents > 0) {
+          return s + l.embeddedPriceCents;
+        }
+        if (
+          (l.unitMode === "weight_g" || l.unitMode === "volume_ml") &&
+          typeof l.weightGrams === "number" &&
+          l.weightGrams > 0
+        ) {
+          return s + computeWeightedPriceCents(l.weightGrams, l.unitPriceCents);
+        }
+        return s + l.unitPriceCents * l.qtyPacks;
+      }, 0),
     [cart]
   );
 
@@ -380,9 +449,61 @@ export function PosTerminalView({
     return results;
   }, [cart, basketRules, primaryByProductMap, evalHour]);
 
+  const checkRecallBlock = (prod: BootstrapProduct): boolean => {
+    if (!prod.recalled) return false;
+    setScanError(
+      `FOOD-SAFETY RECALL BLOCK: ${prod.sku} (${prod.name}) is locked from sale — ${
+        prod.recallReason ?? "Remove from shelf immediately."
+      }`
+    );
+    return true;
+  };
+
+  const addWeightedLineToCart = (
+    prod: BootstrapProduct,
+    primBc: BootstrapBarcode,
+    scannedBarcode: string,
+    netGrams: number,
+    tareGrams: number,
+    embeddedPriceCents: number | null = null
+  ): boolean => {
+    if (checkRecallBlock(prod)) return false;
+    const tax = taxMap.get(prod.taxRateId) ?? { rateBp: 0, isInclusive: true };
+    const unitMode: UnitMode = prod.unitMode ?? "weight_g";
+    const measureLabel = formatMeasure(netGrams, unitMode);
+    setCart((prev) => [
+      ...prev,
+      {
+        lineKey: generateUuidV7(),
+        productId: prod.id,
+        categoryId: prod.categoryId,
+        sku: prod.sku,
+        name: prod.name,
+        scannedBarcode,
+        packLabel: embeddedPriceCents
+          ? `Scale Pack · ${measureLabel}`
+          : `${measureLabel}${tareGrams > 0 ? ` (Tare -${tareGrams}g)` : ""}`,
+        packQty: 1,
+        qtyPacks: 1,
+        unitMode,
+        weightGrams: netGrams,
+        tareGrams,
+        embeddedPriceCents,
+        unitPriceCents: primBc.sellPriceCents,
+        unitCostCents: prod.avgCostCents ?? 0,
+        taxRateBp: tax.rateBp,
+        taxInclusive: tax.isInclusive,
+        requiresAgeCheck: prod.requiresAgeCheck,
+      },
+    ]);
+    setScanError(null);
+    return true;
+  };
+
   const addBarcodeToCart = (bc: BootstrapBarcode, bypassAge = false) => {
     const prod = productsMap.get(bc.productId);
     if (!prod) return;
+    if (checkRecallBlock(prod)) return;
     if (prod.requiresAgeCheck && !ageVerified && !bypassAge) {
       setPendingAgeItem(bc);
       return;
@@ -390,7 +511,9 @@ export function PosTerminalView({
     const tax = taxMap.get(prod.taxRateId) ?? { rateBp: 0, isInclusive: true };
 
     setCart((prev) => {
-      const existingIdx = prev.findIndex((l) => l.scannedBarcode === bc.barcode);
+      const existingIdx = prev.findIndex(
+        (l) => l.scannedBarcode === bc.barcode && !l.weightGrams
+      );
       if (existingIdx >= 0) {
         return prev.map((l, idx) =>
           idx === existingIdx ? { ...l, qtyPacks: l.qtyPacks + 1 } : l
@@ -408,6 +531,7 @@ export function PosTerminalView({
           packLabel: bc.packLabel,
           packQty: bc.packQty,
           qtyPacks: 1,
+          unitMode: prod.unitMode ?? "each",
           unitPriceCents: bc.sellPriceCents,
           unitCostCents: prod.avgCostCents ?? 0,
           taxRateBp: tax.rateBp,
@@ -422,16 +546,98 @@ export function PosTerminalView({
   const handleScanSubmit = (raw: string): boolean => {
     const clean = raw.trim();
     if (!clean) return false;
+
+    // 1. Exact barcode match in local IndexedDB/live map
     const bc = barcodesMap.get(clean);
-    if (!bc) {
-      setScanError(`Barcode "${clean}" not found in local POS catalog (${barcodesMap.size} cached).`);
+    if (bc) {
+      const prod = productsMap.get(bc.productId);
+      if (prod) {
+        if (checkRecallBlock(prod)) {
+          scanRef.current?.focus();
+          scanRef.current?.select();
+          return false;
+        }
+        if (prod.unitMode === "weight_g" || prod.unitMode === "volume_ml") {
+          setFreshPluInitialProductId(prod.id);
+          setShowFreshPluModal(true);
+          setScanError(null);
+          return true;
+        }
+      }
+      addBarcodeToCart(bc);
       scanRef.current?.focus();
-      scanRef.current?.select();
-      return false;
+      return true;
     }
-    addBarcodeToCart(bc);
+
+    // 2. GS1 Prefix 20-29 in-store variable-measure / scale barcode (weight or embedded price)
+    const scaleParsed = parseScaleBarcode(clean);
+    if (scaleParsed) {
+      const matchedProd = scaleParsed.pluCandidates
+        .map((c) => pluMap.get(c))
+        .find((p): p is BootstrapProduct => Boolean(p));
+      if (!matchedProd) {
+        setScanError(
+          `Scale barcode "${clean}" decoded PLU ${scaleParsed.rawPlu5}, but no matching fresh PLU exists in catalog.`
+        );
+        scanRef.current?.focus();
+        scanRef.current?.select();
+        return false;
+      }
+      const primBc = primaryByProductMap.get(matchedProd.id);
+      if (!primBc) {
+        setScanError(`Fresh product ${matchedProd.sku} has no primary price tier configured.`);
+        return false;
+      }
+      const netGrams =
+        scaleParsed.kind === "weight" && scaleParsed.weightGrams
+          ? scaleParsed.weightGrams
+          : scaleParsed.embeddedPriceCents
+            ? deriveWeightFromPriceGrams(scaleParsed.embeddedPriceCents, primBc.sellPriceCents)
+            : 0;
+      if (netGrams < 1) {
+        setScanError(`Scale barcode "${clean}" resolved invalid weight (${netGrams}g).`);
+        return false;
+      }
+      const ok = addWeightedLineToCart(
+        matchedProd,
+        primBc,
+        scaleParsed.barcode,
+        netGrams,
+        0,
+        scaleParsed.kind === "price" ? scaleParsed.embeddedPriceCents : null
+      );
+      scanRef.current?.focus();
+      return ok;
+    }
+
+    // 3. Direct 4- or 5-digit PLU entry (e.g. 4011 Cavendish Bananas, 40010 Sourdough Loaf)
+    if (/^\d{4,5}$/.test(clean)) {
+      const matchedProd = pluMap.get(normalizePluCode(clean)) ?? pluMap.get(clean);
+      if (matchedProd) {
+        if (checkRecallBlock(matchedProd)) {
+          scanRef.current?.focus();
+          scanRef.current?.select();
+          return false;
+        }
+        if (matchedProd.unitMode === "weight_g" || matchedProd.unitMode === "volume_ml") {
+          setFreshPluInitialProductId(matchedProd.id);
+          setShowFreshPluModal(true);
+          setScanError(null);
+          return true;
+        }
+        const primBc = primaryByProductMap.get(matchedProd.id);
+        if (primBc) {
+          addBarcodeToCart(primBc);
+          scanRef.current?.focus();
+          return true;
+        }
+      }
+    }
+
+    setScanError(`Barcode or PLU "${clean}" not found in local POS catalog (${barcodesMap.size} cached).`);
     scanRef.current?.focus();
-    return true;
+    scanRef.current?.select();
+    return false;
   };
 
   const flushOfflineQueue = async (queueToFlush = offlineQueueRef.current) => {
@@ -540,10 +746,17 @@ export function PosTerminalView({
         ? `Loyalty: ${attachedCustomer.fullName} (${attachedCustomer.phone})`
         : "",
       "----------------------------------------",
-      ...evaluated.lines.map(
-        (l) =>
-          `${l.qtyPacks}x ${l.name.slice(0, 22).padEnd(22)} ${formatMoney(l.lineTotalCents).padStart(8)}\n   [${l.packLabel} -> -${l.baseUnitsSold} base units]`
-      ),
+      ...evaluated.lines.map((l) => {
+        const isWeighted =
+          (l.unitMode === "weight_g" || l.unitMode === "volume_ml") &&
+          typeof l.weightGrams === "number" &&
+          l.weightGrams > 0;
+        const prefix = isWeighted ? formatMeasure(l.weightGrams!, l.unitMode) : `${l.qtyPacks}x`;
+        const stockLabel = isWeighted
+          ? `-${formatMeasure(l.baseUnitsSold, l.unitMode)} stock`
+          : `-${l.baseUnitsSold} base units`;
+        return `${prefix} ${l.name.slice(0, 22).padEnd(22)} ${formatMoney(l.lineTotalCents).padStart(8)}\n   [${l.packLabel} -> ${stockLabel}]`;
+      }),
       "----------------------------------------",
       `Subtotal:           ${formatMoney(evaluated.subtotalBeforeDiscountCents).padStart(20)}`,
       `Promo & Coupon:    -${formatMoney(evaluated.totalDiscountCents).padStart(19)}`,
@@ -640,6 +853,8 @@ export function PosTerminalView({
           packLabel: l.packLabel,
           packQty: l.packQty,
           qtyPacks: l.qtyPacks,
+          weightGrams: l.weightGrams ?? null,
+          tareGrams: l.tareGrams ?? null,
           unitPriceCents: l.unitPriceCents,
           unitCostCents: l.unitCostCents,
           discountCents: l.discountCents,
@@ -871,6 +1086,18 @@ export function PosTerminalView({
           </p>
         </div>
         <div className="header-actions">
+          <button
+            id="open-plu-grid-btn"
+            type="button"
+            className="btn btn-primary"
+            disabled={freshPluItems.length === 0}
+            onClick={() => {
+              setFreshPluInitialProductId(null);
+              setShowFreshPluModal(true);
+            }}
+          >
+            <Scale size={14} aria-hidden="true" /> Fresh PLU / Scale ({freshPluItems.length})
+          </button>
           <select
             id="pos-daypart-select"
             aria-label="POS promotion clock daypart preview"
@@ -1107,72 +1334,108 @@ export function PosTerminalView({
                 Scan a barcode or tap a quick-test SKU to start ringing up a basket.
               </div>
             ) : (
-              evaluated.lines.map((line) => (
-                <div key={line.lineKey} className="cart-line">
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontWeight: 600, fontSize: 13 }}>{line.name}</div>
-                    <div style={{ fontSize: 11.5, color: "var(--ink-secondary)" }} className="mono">
-                      {line.packLabel} ({line.packQty}× base) · -{line.baseUnitsSold} stock
-                    </div>
-                    {line.appliedPromotions.length > 0 && (
-                      <div style={{ marginTop: 3, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                        {line.appliedPromotions.map((pName, idx) => (
-                          <span key={`${pName}-${idx}`} className="tag tag-green" style={{ fontSize: 10.5 }}>
-                            {pName}
-                            {idx === 0 ? ` (-${formatMoney(line.discountCents)})` : ""}
-                          </span>
-                        ))}
+              evaluated.lines.map((line) => {
+                const isWeighted =
+                  (line.unitMode === "weight_g" || line.unitMode === "volume_ml") &&
+                  typeof line.weightGrams === "number" &&
+                  line.weightGrams > 0;
+                const prodMeta = productsMap.get(line.productId);
+                const allergens = prodMeta?.allergens ?? [];
+                return (
+                  <div key={line.lineKey} className="cart-line">
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>{line.name}</div>
+                      <div style={{ fontSize: 11.5, color: "var(--ink-secondary)" }} className="mono">
+                        {isWeighted
+                          ? `${line.packLabel} · ${formatMoney(line.unitPriceCents)}/${
+                              line.unitMode === "volume_ml" ? "L" : "kg"
+                            } · -${formatMeasure(line.baseUnitsSold, line.unitMode)} stock`
+                          : `${line.packLabel} (${line.packQty}× base) · -${line.baseUnitsSold} stock`}
                       </div>
-                    )}
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div className="mono" style={{ fontWeight: 600 }}>
-                      {formatMoney(line.lineTotalCents)}
+                      {allergens.length > 0 && (
+                        <div style={{ marginTop: 3, display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {allergens.map((a) => (
+                            <span key={a} className="tag tag-amber mono" style={{ fontSize: 10 }}>
+                              {a.toUpperCase()}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {line.appliedPromotions.length > 0 && (
+                        <div style={{ marginTop: 3, display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {line.appliedPromotions.map((pName, idx) => (
+                            <span key={`${pName}-${idx}`} className="tag tag-green" style={{ fontSize: 10.5 }}>
+                              {pName}
+                              {idx === 0 ? ` (-${formatMoney(line.discountCents)})` : ""}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <div className="qty-stepper" style={{ marginTop: 4 }}>
-                      <button
-                        type="button"
-                        className="qty-btn"
-                        aria-label={`Decrease quantity for ${line.name}`}
-                        disabled={submittingSale}
-                        onClick={() =>
-                          setCart((prev) =>
-                            prev
-                              .map((c) =>
-                                c.lineKey === line.lineKey
-                                  ? { ...c, qtyPacks: c.qtyPacks - 1 }
-                                  : c
+                    <div style={{ textAlign: "right" }}>
+                      <div className="mono" style={{ fontWeight: 600 }}>
+                        {formatMoney(line.lineTotalCents)}
+                      </div>
+                      {isWeighted ? (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          style={{ marginTop: 4 }}
+                          aria-label={`Remove weighted line ${line.name}`}
+                          disabled={submittingSale}
+                          onClick={() =>
+                            setCart((prev) => prev.filter((c) => c.lineKey !== line.lineKey))
+                          }
+                        >
+                          Remove
+                        </button>
+                      ) : (
+                        <div className="qty-stepper" style={{ marginTop: 4 }}>
+                          <button
+                            type="button"
+                            className="qty-btn"
+                            aria-label={`Decrease quantity for ${line.name}`}
+                            disabled={submittingSale}
+                            onClick={() =>
+                              setCart((prev) =>
+                                prev
+                                  .map((c) =>
+                                    c.lineKey === line.lineKey
+                                      ? { ...c, qtyPacks: c.qtyPacks - 1 }
+                                      : c
+                                  )
+                                  .filter((c) => c.qtyPacks > 0)
                               )
-                              .filter((c) => c.qtyPacks > 0)
-                          )
-                        }
-                      >
-                        -
-                      </button>
-                      <span className="mono" style={{ minWidth: 18, textAlign: "center" }}>
-                        {line.qtyPacks}
-                      </span>
-                      <button
-                        type="button"
-                        className="qty-btn"
-                        aria-label={`Increase quantity for ${line.name}`}
-                        disabled={submittingSale}
-                        onClick={() =>
-                          setCart((prev) =>
-                            prev.map((c) =>
-                              c.lineKey === line.lineKey
-                                ? { ...c, qtyPacks: c.qtyPacks + 1 }
-                                : c
-                            )
-                          )
-                        }
-                      >
-                        +
-                      </button>
+                            }
+                          >
+                            -
+                          </button>
+                          <span className="mono" style={{ minWidth: 18, textAlign: "center" }}>
+                            {line.qtyPacks}
+                          </span>
+                          <button
+                            type="button"
+                            className="qty-btn"
+                            aria-label={`Increase quantity for ${line.name}`}
+                            disabled={submittingSale}
+                            onClick={() =>
+                              setCart((prev) =>
+                                prev.map((c) =>
+                                  c.lineKey === line.lineKey
+                                    ? { ...c, qtyPacks: c.qtyPacks + 1 }
+                                    : c
+                                )
+                              )
+                            }
+                          >
+                            +
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
 
@@ -1352,6 +1615,31 @@ export function PosTerminalView({
         onRetry={(entry, stripCoupon) => void handleRetryDeadLetter(entry, stripCoupon)}
         onDismiss={handleDismissDeadLetter}
         onClose={() => setShowDeadLetterModal(false)}
+      />
+
+      <PosFreshPluModal
+        open={showFreshPluModal}
+        items={freshPluItems}
+        initialProductId={freshPluInitialProductId}
+        onAddWeighted={(item, netGrams, tareGrams) => {
+          const prod = productsMap.get(item.productId);
+          const primBc = primaryByProductMap.get(item.productId);
+          if (prod && primBc) {
+            addWeightedLineToCart(prod, primBc, primBc.barcode, netGrams, tareGrams, null);
+          }
+          scanRef.current?.focus();
+        }}
+        onAddEach={(item) => {
+          const primBc = primaryByProductMap.get(item.productId);
+          if (primBc) {
+            addBarcodeToCart(primBc);
+          }
+          scanRef.current?.focus();
+        }}
+        onSimulateScaleBarcode={(code) => {
+          handleScanSubmit(code);
+        }}
+        onClose={() => setShowFreshPluModal(false)}
       />
     </div>
   );

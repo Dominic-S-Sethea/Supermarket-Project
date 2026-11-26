@@ -1,4 +1,5 @@
-import { computeTaxCents } from "./money.js";
+import { computeTaxCents, computeWeightedPriceCents } from "./money.js";
+import type { UnitMode } from "./dtos.js";
 
 export type PromoType =
   | "mix_and_match"
@@ -40,9 +41,13 @@ export interface CartInputLine {
   scannedBarcode: string;
   packLabel: string;
   packQty: number; // base units per pack (1, 5, 6, 24)
-  qtyPacks: number; // number of packs scanned
-  unitPriceCents: number; // price per scanned pack
-  unitCostCents: number; // cost per BASE unit (snapshot)
+  qtyPacks: number; // number of packs scanned (1 for weighted lines)
+  unitMode?: UnitMode; // each | weight_g | volume_ml
+  weightGrams?: number | null; // net measure in grams/ml for weight_g / volume_ml lines
+  tareGrams?: number | null; // deducted container/bag tare in grams
+  embeddedPriceCents?: number | null; // verified GS1 25-29 embedded scale price
+  unitPriceCents: number; // price per scanned pack (or per 1,000g/ml for weighted items)
+  unitCostCents: number; // cost per BASE unit (or per 1,000g/ml for weighted items)
   taxRateBp: number;
   taxInclusive: boolean;
   requiresAgeCheck: boolean;
@@ -222,13 +227,28 @@ export function evaluateCart(
     const taxRateBp = Number.isFinite(line.taxRateBp)
       ? Math.max(0, Math.round(line.taxRateBp))
       : 0;
-    const baseUnitsSold = packQty * qtyPacks;
-    const grossBeforeDiscountCents = unitPriceCents * qtyPacks;
-    const lineCostCents = unitCostCents * baseUnitsSold;
+    const isMeasured =
+      (line.unitMode === "weight_g" || line.unitMode === "volume_ml") &&
+      typeof line.weightGrams === "number" &&
+      Number.isFinite(line.weightGrams) &&
+      line.weightGrams > 0;
+    const weightGrams = isMeasured ? Math.max(1, Math.round(line.weightGrams!)) : null;
+    const baseUnitsSold = isMeasured ? weightGrams! : packQty * qtyPacks;
+    const grossBeforeDiscountCents = isMeasured
+      ? typeof line.embeddedPriceCents === "number" &&
+        Number.isFinite(line.embeddedPriceCents) &&
+        line.embeddedPriceCents > 0
+        ? Math.round(line.embeddedPriceCents)
+        : computeWeightedPriceCents(weightGrams!, unitPriceCents)
+      : unitPriceCents * qtyPacks;
+    const lineCostCents = isMeasured
+      ? computeWeightedPriceCents(weightGrams!, unitCostCents)
+      : unitCostCents * baseUnitsSold;
     return {
       ...line,
       packQty,
       qtyPacks,
+      weightGrams,
       unitPriceCents,
       unitCostCents,
       taxRateBp,
@@ -561,6 +581,10 @@ export function evaluateCart(
       packLabel: line.packLabel,
       packQty: line.packQty,
       qtyPacks: line.qtyPacks,
+      unitMode: line.unitMode,
+      weightGrams: line.weightGrams,
+      tareGrams: line.tareGrams,
+      embeddedPriceCents: line.embeddedPriceCents,
       unitPriceCents: line.unitPriceCents,
       unitCostCents: line.unitCostCents,
       taxRateBp: line.taxRateBp,

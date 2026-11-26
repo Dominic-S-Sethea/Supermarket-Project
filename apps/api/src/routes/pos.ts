@@ -2,11 +2,16 @@ import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import {
   computeTaxCents,
+  computeWeightedPriceCents,
+  deriveWeightFromPriceGrams,
   evaluateCart,
   generateUuidV7,
+  normalizePluCode,
+  parseScaleBarcode,
   PosSaleUploadSchema,
   type CartInputLine,
   type PromotionRule,
+  type UnitMode,
 } from "@supermarket/shared";
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -34,7 +39,7 @@ import { getPgErrorCode } from "../app.js";
 import { requireRole } from "../plugins/auth.js";
 
 export async function posRoutes(app: FastifyInstance) {
-  // Lightweight offline-first bootstrap payload (includes basket upsell rules & ETag conditional caching)
+  // Lightweight offline-first bootstrap payload (includes fresh PLU/allergen/recall metadata, basket upsells & ETag)
   app.get(
     "/api/pos/bootstrap",
     { preHandler: [requireRole(["owner", "manager", "cashier"])] },
@@ -42,7 +47,7 @@ export async function posRoutes(app: FastifyInstance) {
       const canSeeCost = req.authUser?.role === "owner" || req.authUser?.role === "manager";
       const verRes = await db.execute(sql`
         SELECT
-          (SELECT count(*)::text || ':' || coalesce(max(updated_at)::text, '') FROM products WHERE active = true) AS p_ver,
+          (SELECT count(*)::text || ':' || coalesce(max(updated_at)::text, '') || ':' || count(*) FILTER (WHERE recalled = true)::text FROM products WHERE active = true) AS p_ver,
           (SELECT count(*)::text || ':' || coalesce(sum(sell_price_cents)::text, '0') FROM product_barcodes) AS b_ver,
           (SELECT count(*)::text || ':' || coalesce(max(starts_at)::text, '') || ':' || coalesce(max(ends_at)::text, '') FROM promotions WHERE active = true) AS pr_ver,
           (SELECT count(*)::text FROM tax_rates) AS t_ver,
@@ -60,7 +65,7 @@ export async function posRoutes(app: FastifyInstance) {
       const etag = `"pos-boot-${etagHash}"`;
 
       reply.header("ETag", etag);
-      reply.header("Cache-Control", "private, max-age=30, must-revalidate");
+      reply.header("Cache-Control", "private, no-cache");
       reply.header("Vary", "Cookie, Authorization");
       if (req.headers["if-none-match"] === etag) {
         return reply.status(304).send();
@@ -76,6 +81,14 @@ export async function posRoutes(app: FastifyInstance) {
             categoryId: products.categoryId,
             taxRateId: products.taxRateId,
             baseUnitLabel: products.baseUnitLabel,
+            unitMode: products.unitMode,
+            pluCode: products.pluCode,
+            defaultTareGrams: products.defaultTareGrams,
+            netContentAmount: products.netContentAmount,
+            netContentUnit: products.netContentUnit,
+            allergens: products.allergensJson,
+            recalled: products.recalled,
+            recallReason: products.recallReason,
             avgCostCents: products.avgCostCents,
             requiresAgeCheck: products.requiresAgeCheck,
             aisleLocation: products.aisleLocation,
@@ -153,7 +166,7 @@ export async function posRoutes(app: FastifyInstance) {
         });
       }
 
-      // Verify referenced products, barcodes, and authoritative cost/price/tax/age metadata
+      // Verify referenced products, barcodes, and authoritative cost/price/tax/age/recall/weight metadata
       const uniquePids = Array.from(new Set(payload.lines.map((l) => l.productId)));
       const [foundProds, foundBarcodes, activePromos] = await Promise.all([
         db
@@ -162,6 +175,10 @@ export async function posRoutes(app: FastifyInstance) {
             sku: products.sku,
             name: products.name,
             categoryId: products.categoryId,
+            unitMode: products.unitMode,
+            pluCode: products.pluCode,
+            recalled: products.recalled,
+            recallReason: products.recallReason,
             avgCostCents: products.avgCostCents,
             requiresAgeCheck: products.requiresAgeCheck,
             taxInclusive: taxRates.isInclusive,
@@ -177,6 +194,7 @@ export async function posRoutes(app: FastifyInstance) {
             packQty: productBarcodes.packQty,
             packLabel: productBarcodes.packLabel,
             sellPriceCents: productBarcodes.sellPriceCents,
+            isPrimary: productBarcodes.isPrimary,
           })
           .from(productBarcodes)
           .where(inArray(productBarcodes.productId, uniquePids)),
@@ -192,34 +210,117 @@ export async function posRoutes(app: FastifyInstance) {
       const barcodeMap = new Map(
         foundBarcodes.map((b) => [`${b.productId}::${b.barcode}`, b])
       );
+      const primaryBarcodeByProduct = new Map<string, (typeof foundBarcodes)[number]>();
+      for (const b of foundBarcodes) {
+        if (b.isPrimary || !primaryBarcodeByProduct.has(b.productId)) {
+          primaryBarcodeByProduct.set(b.productId, b);
+        }
+      }
 
       let cartRequiresAgeCheck = false;
-      const normalizedLines: (typeof payload.lines[number])[] = [];
+      type NormalizedSaleLine = (typeof payload.lines)[number] & {
+        baseUnitsSold: number;
+        lineGrossCents: number;
+        lineCostCents: number;
+        unitMode: UnitMode;
+        embeddedPriceCents: number | null;
+      };
+      const normalizedLines: NormalizedSaleLine[] = [];
 
       for (const l of payload.lines) {
         const meta = prodMetaMap.get(l.productId)!;
         if (meta.requiresAgeCheck) cartRequiresAgeCheck = true;
 
+        // Hard food-safety recall block across every checkout lane
+        if (payload.kind === "sale" && meta.recalled) {
+          return reply.status(409).send({
+            error: `FOOD-SAFETY RECALL BLOCK: ${meta.sku} (${meta.name}) is recalled (${meta.recallReason ?? "Do not sell"}).`,
+          });
+        }
+
+        const unitMode = (meta.unitMode as UnitMode) ?? "each";
+        const isMeasured = unitMode === "weight_g" || unitMode === "volume_ml";
+        const scaleParsed = parseScaleBarcode(l.scannedBarcode);
+        const normalizedMetaPlu = meta.pluCode ? normalizePluCode(meta.pluCode) : null;
+        const scaleMatchesProduct = Boolean(
+          scaleParsed &&
+            normalizedMetaPlu &&
+            scaleParsed.pluCandidates.includes(normalizedMetaPlu)
+        );
+
+        let effectiveWeightGrams: number | null =
+          typeof l.weightGrams === "number" && l.weightGrams > 0 ? l.weightGrams : null;
+        let embeddedPriceCents: number | null = null;
+        let lineGross = l.unitPriceCents * l.qtyPacks;
+        let baseUnitsSold = l.packQty * l.qtyPacks;
+        let lineCostCents = meta.avgCostCents * baseUnitsSold;
+
         if (payload.kind === "sale") {
-          const authBarcode = barcodeMap.get(`${l.productId}::${l.scannedBarcode}`);
+          const authBarcode =
+            barcodeMap.get(`${l.productId}::${l.scannedBarcode}`) ??
+            (scaleMatchesProduct ? primaryBarcodeByProduct.get(l.productId) : undefined);
+
           if (!authBarcode) {
             return reply.status(400).send({
               error: `Barcode "${l.scannedBarcode}" is not registered for product ${meta.sku}.`,
             });
           }
-          if (l.packQty !== authBarcode.packQty) {
-            return reply.status(400).send({
-              error: `Pack quantity mismatch for barcode "${l.scannedBarcode}" (expected ${authBarcode.packQty}, got ${l.packQty}).`,
-            });
+
+          if (isMeasured) {
+            if (scaleParsed?.kind === "weight" && scaleParsed.weightGrams) {
+              effectiveWeightGrams = scaleParsed.weightGrams;
+            } else if (
+              scaleParsed?.kind === "price" &&
+              scaleParsed.embeddedPriceCents &&
+              !effectiveWeightGrams
+            ) {
+              effectiveWeightGrams = deriveWeightFromPriceGrams(
+                scaleParsed.embeddedPriceCents,
+                authBarcode.sellPriceCents
+              );
+            }
+            if (!effectiveWeightGrams || effectiveWeightGrams < 1) {
+              return reply.status(400).send({
+                error: `Measured product ${meta.sku} requires weightGrams >= 1.`,
+              });
+            }
+            if (scaleParsed?.kind === "price" && scaleParsed.embeddedPriceCents) {
+              embeddedPriceCents = scaleParsed.embeddedPriceCents;
+              lineGross = embeddedPriceCents;
+            } else {
+              if (l.unitPriceCents !== authBarcode.sellPriceCents) {
+                return reply.status(400).send({
+                  error: `Per-kg/L unit price mismatch for ${meta.sku} (expected ${authBarcode.sellPriceCents}c, got ${l.unitPriceCents}c).`,
+                });
+              }
+              lineGross = computeWeightedPriceCents(effectiveWeightGrams, authBarcode.sellPriceCents);
+            }
+            baseUnitsSold = effectiveWeightGrams;
+            lineCostCents = computeWeightedPriceCents(effectiveWeightGrams, meta.avgCostCents);
+          } else {
+            if (l.packQty !== authBarcode.packQty) {
+              return reply.status(400).send({
+                error: `Pack quantity mismatch for barcode "${l.scannedBarcode}" (expected ${authBarcode.packQty}, got ${l.packQty}).`,
+              });
+            }
+            if (l.unitPriceCents !== authBarcode.sellPriceCents) {
+              return reply.status(400).send({
+                error: `Unit price mismatch for barcode "${l.scannedBarcode}" (expected ${authBarcode.sellPriceCents}c, got ${l.unitPriceCents}c).`,
+              });
+            }
+            lineGross = l.unitPriceCents * l.qtyPacks;
+            baseUnitsSold = l.packQty * l.qtyPacks;
+            lineCostCents = meta.avgCostCents * baseUnitsSold;
           }
-          if (l.unitPriceCents !== authBarcode.sellPriceCents) {
-            return reply.status(400).send({
-              error: `Unit price mismatch for barcode "${l.scannedBarcode}" (expected ${authBarcode.sellPriceCents}c, got ${l.unitPriceCents}c).`,
-            });
-          }
+        } else if (isMeasured && effectiveWeightGrams) {
+          lineGross =
+            scaleParsed?.kind === "price" && scaleParsed.embeddedPriceCents
+              ? scaleParsed.embeddedPriceCents
+              : computeWeightedPriceCents(effectiveWeightGrams, l.unitPriceCents);
+          baseUnitsSold = effectiveWeightGrams;
+          lineCostCents = computeWeightedPriceCents(effectiveWeightGrams, meta.avgCostCents);
         }
 
-        const lineGross = l.unitPriceCents * l.qtyPacks;
         if (l.discountCents > lineGross) {
           return reply.status(400).send({
             error: `Discount exceeds gross amount on product ${l.productId}`,
@@ -247,6 +348,13 @@ export async function posRoutes(app: FastifyInstance) {
 
         normalizedLines.push({
           ...l,
+          weightGrams: effectiveWeightGrams,
+          tareGrams: l.tareGrams ?? null,
+          baseUnitsSold,
+          lineGrossCents: lineGross,
+          lineCostCents,
+          unitMode,
+          embeddedPriceCents,
           unitCostCents: meta.avgCostCents,
           taxRateBp: meta.taxRateBp,
           taxCents: authoritativeTaxCents,
@@ -277,17 +385,11 @@ export async function posRoutes(app: FastifyInstance) {
         }
       }
 
-      const subtotalCents = normalizedLines.reduce(
-        (s, l) => s + l.unitPriceCents * l.qtyPacks,
-        0
-      );
+      const subtotalCents = normalizedLines.reduce((s, l) => s + l.lineGrossCents, 0);
       const discountCents = normalizedLines.reduce((s, l) => s + l.discountCents, 0);
       const taxCents = normalizedLines.reduce((s, l) => s + l.taxCents, 0);
       const totalCents = normalizedLines.reduce((s, l) => s + l.lineTotalCents, 0);
-      let totalCostCents = normalizedLines.reduce(
-        (s, l) => s + l.unitCostCents * l.packQty * l.qtyPacks,
-        0
-      );
+      let totalCostCents = normalizedLines.reduce((s, l) => s + l.lineCostCents, 0);
 
       const paidTotalCents = payload.payments.reduce((s, p) => s + p.amountCents, 0);
       if (payload.kind === "sale" && paidTotalCents < totalCents) {
@@ -567,6 +669,10 @@ export async function posRoutes(app: FastifyInstance) {
                 packLabel: l.packLabel,
                 packQty: l.packQty,
                 qtyPacks: l.qtyPacks,
+                unitMode: l.unitMode,
+                weightGrams: l.weightGrams ?? null,
+                tareGrams: l.tareGrams ?? null,
+                embeddedPriceCents: l.embeddedPriceCents,
                 unitPriceCents: l.unitPriceCents,
                 unitCostCents: meta.avgCostCents,
                 taxRateBp: meta.taxRateBp,
@@ -646,7 +752,9 @@ export async function posRoutes(app: FastifyInstance) {
               packLabel: l.packLabel,
               packQty: l.packQty,
               qtyPacks: l.qtyPacks,
-              baseUnitsSold: l.packQty * l.qtyPacks,
+              weightGrams: l.weightGrams ?? null,
+              tareGrams: l.tareGrams ?? null,
+              baseUnitsSold: l.baseUnitsSold,
               unitPriceCents: l.unitPriceCents,
               unitCostCents: l.unitCostCents,
               discountCents: l.discountCents,
@@ -757,7 +865,7 @@ export async function posRoutes(app: FastifyInstance) {
           }
 
           for (const l of orderedLines) {
-            const baseUnits = l.packQty * l.qtyPacks;
+            const baseUnits = l.baseUnitsSold;
             if (sign === -1) {
               let remainingToAllocate = baseUnits;
               const fefoBatches = await tx

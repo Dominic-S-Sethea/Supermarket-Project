@@ -1,4 +1,4 @@
-import { buildValidEan13, generateUuidV7 } from "@supermarket/shared";
+import { buildScaleBarcode, buildValidEan13, generateUuidV7 } from "@supermarket/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { executeCopilotTool } from "../ai/tools.js";
@@ -22,6 +22,7 @@ import {
   pool,
   posShifts,
   productBarcodes,
+  productionBatches,
   products,
   promotions,
   purchaseOrderLines,
@@ -2556,5 +2557,321 @@ describe("SupermarketOS API integration (against live PostgreSQL 3,120-SKU DB)",
     expect(body).toContain("supermarket_analytics_last_run_age_seconds");
     expect(body).toContain("supermarket_analytics_dq_passed");
   });
+
+  it("Flagship Milestone 1: supports Fresh PLU/GS1 scale sales, Food-Safety Recall POS-block, BOM production batches, Scale PLU CSV & EU ZPL labels", async () => {
+    // 1. Scan 4-digit PLU (4011 Cavendish Bananas) & GS1 prefix-25 embedded-price scale barcode (20010 Ribeye Steak)
+    const pluScanRes = await app.inject({
+      method: "GET",
+      url: "/api/products/scan/4011",
+      headers: authHeaders(cashierToken),
+    });
+    expect(pluScanRes.statusCode).toBe(200);
+    const banana = pluScanRes.json() as {
+      productId: string;
+      sku: string;
+      unitMode: string;
+      pluCode: string;
+      barcode: string;
+      sellPriceCents: number;
+    };
+    expect(banana.sku).toBe("PROD-4011");
+    expect(banana.unitMode).toBe("weight_g");
+    expect(banana.pluCode).toBe("4011");
+
+    const steakScaleBc = buildScaleBarcode("price", "20010", 1125);
+    const scaleScanRes = await app.inject({
+      method: "GET",
+      url: `/api/products/scan/${steakScaleBc}`,
+      headers: authHeaders(cashierToken),
+    });
+    expect(scaleScanRes.statusCode).toBe(200);
+    const steakScan = scaleScanRes.json() as {
+      productId: string;
+      sku: string;
+      unitMode: string;
+      sellPriceCents: number;
+      scaleParsed: { kind: string; embeddedPriceCents: number } | null;
+    };
+    expect(steakScan.sku).toBe("MEAT-20010");
+    expect(steakScan.scaleParsed?.kind).toBe("price");
+    expect(steakScan.scaleParsed?.embeddedPriceCents).toBe(1125);
+
+    // Snapshot original FEFO batch quantities for clean restoration
+    const [bananaBatchBefore] = await db
+      .select()
+      .from(inventoryBatches)
+      .where(eq(inventoryBatches.productId, banana.productId))
+      .limit(1);
+    const [steakBatchBefore] = await db
+      .select()
+      .from(inventoryBatches)
+      .where(eq(inventoryBatches.productId, steakScan.productId))
+      .limit(1);
+
+    // 2. Weighted POS checkout (500g Bananas @ sellPriceCents/kg + $11.25 embedded-price Ribeye Steak)
+    const saleId = generateUuidV7();
+    const bananaLineTotal = Math.round((500 * banana.sellPriceCents) / 1000);
+    const expectedSteakGrams = Math.max(1, Math.round((1125 * 1000) / steakScan.sellPriceCents));
+    const totalSaleCents = bananaLineTotal + 1125;
+
+    try {
+      const bananaTaxCents = Math.round(bananaLineTotal - (bananaLineTotal * 10000) / 10700);
+      const steakTaxCents = Math.round(1125 - (1125 * 10000) / 10700);
+      const saleRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: {
+          id: saleId,
+          receiptNo: `TEST-FRESH-${saleId.slice(-6)}`,
+          registerCode: "REG-01",
+          kind: "sale",
+          soldAt: new Date().toISOString(),
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: banana.productId,
+              scannedBarcode: banana.barcode,
+              packLabel: "Per kg",
+              packQty: 1,
+              qtyPacks: 1,
+              weightGrams: 500,
+              tareGrams: 10,
+              unitPriceCents: banana.sellPriceCents,
+              discountCents: 0,
+              taxRateBp: 700,
+              taxCents: bananaTaxCents,
+              lineTotalCents: bananaLineTotal,
+            },
+            {
+              id: generateUuidV7(),
+              productId: steakScan.productId,
+              scannedBarcode: steakScaleBc,
+              packLabel: "Scale Pack",
+              packQty: 1,
+              qtyPacks: 1,
+              unitPriceCents: steakScan.sellPriceCents,
+              discountCents: 0,
+              taxRateBp: 700,
+              taxCents: steakTaxCents,
+              lineTotalCents: 1125,
+            },
+          ],
+          payments: [{ id: generateUuidV7(), method: "cash", amountCents: totalSaleCents }],
+        },
+      });
+      expect(saleRes.statusCode).toBe(201);
+
+      const storedLines = await db.select().from(saleLines).where(eq(saleLines.saleId, saleId));
+      const storedBanana = storedLines.find((l) => l.productId === banana.productId);
+      const storedSteak = storedLines.find((l) => l.productId === steakScan.productId);
+      expect(storedBanana?.weightGrams).toBe(500);
+      expect(storedBanana?.tareGrams).toBe(10);
+      expect(storedBanana?.baseUnitsSold).toBe(500);
+      expect(storedSteak?.weightGrams).toBe(expectedSteakGrams);
+      expect(storedSteak?.baseUnitsSold).toBe(expectedSteakGrams);
+      expect(storedSteak?.lineTotalCents).toBe(1125);
+
+      const moves = await db.select().from(stockMovements).where(eq(stockMovements.refId, saleId));
+      expect(moves.find((m) => m.productId === banana.productId)?.qtyDelta).toBe(-500);
+      expect(moves.find((m) => m.productId === steakScan.productId)?.qtyDelta).toBe(
+        -expectedSteakGrams
+      );
+    } finally {
+      await cleanupSales([saleId]);
+      if (bananaBatchBefore) {
+        await db
+          .update(inventoryBatches)
+          .set({ qtyRemaining: bananaBatchBefore.qtyRemaining, status: bananaBatchBefore.status })
+          .where(eq(inventoryBatches.id, bananaBatchBefore.id));
+      }
+      if (steakBatchBefore) {
+        await db
+          .update(inventoryBatches)
+          .set({ qtyRemaining: steakBatchBefore.qtyRemaining, status: steakBatchBefore.status })
+          .where(eq(inventoryBatches.id, steakBatchBefore.id));
+      }
+    }
+
+    // 3. One-Click Food-Safety Recall POS-Block (RBAC + 409 block + clear)
+    const cashierRecallRes = await app.inject({
+      method: "PATCH",
+      url: `/api/products/${banana.productId}/recall`,
+      headers: authHeaders(cashierToken),
+      payload: { recalled: true, reason: "Unauthorized attempt" },
+    });
+    expect(cashierRecallRes.statusCode).toBe(403);
+
+    try {
+      const activateRecallRes = await app.inject({
+        method: "PATCH",
+        url: `/api/products/${banana.productId}/recall`,
+        headers: authHeaders(ownerToken),
+        payload: { recalled: true, reason: "Lot #992 pesticide residue recall" },
+      });
+      expect(activateRecallRes.statusCode).toBe(200);
+      expect(activateRecallRes.json().product.recalled).toBe(true);
+
+      const blockedSaleRes = await app.inject({
+        method: "POST",
+        url: "/api/pos/sales",
+        headers: authHeaders(cashierToken),
+        payload: {
+          id: generateUuidV7(),
+          receiptNo: `TEST-RECALL-${Date.now().toString().slice(-6)}`,
+          registerCode: "REG-01",
+          kind: "sale",
+          soldAt: new Date().toISOString(),
+          lines: [
+            {
+              id: generateUuidV7(),
+              productId: banana.productId,
+              scannedBarcode: banana.barcode,
+              packLabel: "Per kg",
+              packQty: 1,
+              qtyPacks: 1,
+              weightGrams: 500,
+              unitPriceCents: banana.sellPriceCents,
+              discountCents: 0,
+              taxRateBp: 700,
+              taxCents: Math.round(bananaLineTotal - (bananaLineTotal * 10000) / 10700),
+              lineTotalCents: bananaLineTotal,
+            },
+          ],
+          payments: [{ id: generateUuidV7(), method: "cash", amountCents: bananaLineTotal }],
+        },
+      });
+      expect(blockedSaleRes.statusCode).toBe(409);
+      expect(String(blockedSaleRes.json().error)).toContain("FOOD-SAFETY RECALL BLOCK");
+    } finally {
+      const clearRecallRes = await app.inject({
+        method: "PATCH",
+        url: `/api/products/${banana.productId}/recall`,
+        headers: authHeaders(ownerToken),
+        payload: { recalled: false },
+      });
+      expect(clearRecallRes.statusCode).toBe(200);
+      expect(clearRecallRes.json().product.recalled).toBe(false);
+    }
+
+    // 4. Bakery/Deli BOM Recipes & Production Batch Logging (FEFO deduction + finished batch + yield)
+    const recipesRes = await app.inject({
+      method: "GET",
+      url: "/api/operations/recipes",
+      headers: authHeaders(ownerToken),
+    });
+    expect(recipesRes.statusCode).toBe(200);
+    const sourdoughRecipe = (
+      recipesRes.json().recipes as {
+        id: string;
+        code: string;
+        outputProductId: string;
+        ingredients: { ingredientProductId: string; qtyBaseUnits: number }[];
+      }[]
+    ).find((r) => r.code === "BAKE-SOURDOUGH-10");
+    expect(sourdoughRecipe).toBeDefined();
+
+    const cashierBatchRes = await app.inject({
+      method: "POST",
+      url: "/api/operations/production-batches",
+      headers: authHeaders(cashierToken),
+      payload: { recipeId: sourdoughRecipe!.id, batchMultiplier: 1, actualOutputUnits: 10 },
+    });
+    expect(cashierBatchRes.statusCode).toBe(403);
+
+    const ingIds = sourdoughRecipe!.ingredients.map((i) => i.ingredientProductId);
+    const ingBatchesBefore = await db
+      .select()
+      .from(inventoryBatches)
+      .where(inArray(inventoryBatches.productId, ingIds));
+
+    let createdProdBatchId: string | null = null;
+    let createdFefoBatchId: string | null = null;
+    try {
+      const prodRes = await app.inject({
+        method: "POST",
+        url: "/api/operations/production-batches",
+        headers: authHeaders(ownerToken),
+        payload: {
+          recipeId: sourdoughRecipe!.id,
+          batchMultiplier: 1,
+          actualOutputUnits: 10,
+          trimWasteUnits: 120,
+          lotCode: `TEST-SD-${Date.now().toString().slice(-5)}`,
+          notes: "Integration test morning bake",
+        },
+      });
+      expect(prodRes.statusCode).toBe(201);
+      const prodBody = prodRes.json() as {
+        batch: {
+          id: string;
+          yieldBp: number;
+          effectiveUnitCostCents: number;
+          totalIngredientCostCents: number;
+        };
+        fefoBatch: { id: string; qtyRemaining: number };
+      };
+      createdProdBatchId = prodBody.batch.id;
+      createdFefoBatchId = prodBody.fefoBatch.id;
+      expect(prodBody.batch.yieldBp).toBe(10000);
+      expect(prodBody.batch.totalIngredientCostCents).toBeGreaterThan(0);
+      expect(prodBody.batch.effectiveUnitCostCents).toBeGreaterThan(0);
+      expect(prodBody.fefoBatch.qtyRemaining).toBe(10);
+
+      const prodMoves = await db
+        .select()
+        .from(stockMovements)
+        .where(eq(stockMovements.refId, createdProdBatchId));
+      expect(prodMoves.some((m) => m.reason === "production_out" && m.qtyDelta < 0)).toBe(true);
+      expect(prodMoves.some((m) => m.reason === "production_in" && m.qtyDelta === 10)).toBe(true);
+      expect(prodMoves.some((m) => m.reason === "trim_waste")).toBe(true);
+    } finally {
+      if (createdProdBatchId) {
+        await db.delete(stockMovements).where(eq(stockMovements.refId, createdProdBatchId));
+        await db.delete(productionBatches).where(eq(productionBatches.id, createdProdBatchId));
+        await db.delete(auditLogs).where(eq(auditLogs.entityId, createdProdBatchId));
+      }
+      if (createdFefoBatchId) {
+        await db.delete(inventoryBatches).where(eq(inventoryBatches.id, createdFefoBatchId));
+      }
+      for (const b of ingBatchesBefore) {
+        await db
+          .update(inventoryBatches)
+          .set({ qtyRemaining: b.qtyRemaining, status: b.status })
+          .where(eq(inventoryBatches.id, b.id));
+      }
+    }
+
+    // 5. Scale PLU CSV export (RBAC + columns) & EU Legal Unit Price + Allergens in ZPL label
+    const cashierCsv = await app.inject({
+      method: "GET",
+      url: "/api/exports/scale-plu.csv",
+      headers: authHeaders(cashierToken),
+    });
+    expect(cashierCsv.statusCode).toBe(403);
+
+    const scaleCsv = await app.inject({
+      method: "GET",
+      url: "/api/exports/scale-plu.csv",
+      headers: authHeaders(ownerToken),
+    });
+    expect(scaleCsv.statusCode).toBe(200);
+    expect(scaleCsv.body).toContain(
+      "PLU,SKU,ProductName,Department,UnitMode,PricePerKgOrEach,TareGrams,ShelfLifeDays,EUAllergens"
+    );
+    expect(scaleCsv.body).toContain("4011,PROD-4011");
+
+    const zplRes = await app.inject({
+      method: "POST",
+      url: "/api/labels/zpl",
+      headers: authHeaders(ownerToken),
+      payload: { productIds: [sourdoughRecipe!.outputProductId] },
+    });
+    expect(zplRes.statusCode).toBe(200);
+    expect(zplRes.json().zpl).toContain("PLU 40010");
+    expect(zplRes.json().zpl).toContain("/ kg");
+    expect(zplRes.json().zpl).toContain("ALLERGENS: GLUTEN");
+  });
 });
+
 

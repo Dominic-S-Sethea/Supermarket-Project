@@ -18,6 +18,14 @@ export interface PosBootstrapSnapshot {
     categoryId: string;
     taxRateId: string;
     baseUnitLabel: string;
+    unitMode?: "each" | "weight_g" | "volume_ml";
+    pluCode?: string | null;
+    defaultTareGrams?: number;
+    netContentAmount?: number | null;
+    netContentUnit?: "g" | "ml" | "ea" | null;
+    allergens?: string[];
+    recalled?: boolean;
+    recallReason?: string | null;
     avgCostCents?: number;
     requiresAgeCheck: boolean;
   }[];
@@ -76,6 +84,8 @@ export interface QueuedPosSale {
     packLabel: string;
     packQty: number;
     qtyPacks: number;
+    weightGrams?: number | null;
+    tareGrams?: number | null;
     unitPriceCents: number;
     unitCostCents: number;
     discountCents: number;

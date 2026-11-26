@@ -96,10 +96,21 @@ test.describe("SupermarketOS Automated WCAG 2.0/2.1/2.2 A/AA Gate (axe-core)", (
     await page.keyboard.press("Escape");
     await expect(page.locator('[role="dialog"]')).toHaveCount(0);
 
+    // POS Fresh PLU / Scale modal (portaled dialog + background inert)
+    await page.click("#nav-pos");
+    await settleView(page);
+    await expect(page.locator("#open-plu-grid-btn")).toBeEnabled();
+    await page.click("#open-plu-grid-btn");
+    await expect(page.locator('[role="dialog"][aria-modal="true"]')).toBeVisible();
+    await scanAxe(page, "POS Fresh PLU Scale Modal (navy)", findings);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+
     // Operations lazy subtabs + WAI-ARIA tablist
     await page.click("#nav-operations");
     await settleView(page);
     for (const subId of [
+      "ops-subtab-production",
       "ops-subtab-orders",
       "ops-subtab-shelf",
       "ops-subtab-tasks",

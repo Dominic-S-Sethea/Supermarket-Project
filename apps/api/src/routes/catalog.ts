@@ -1,10 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import {
+  computeLegalUnitPrice,
   computeNetMarginBp,
   CreateProductSchema,
   CreatePromotionSchema,
   formatMoney,
   generateUuidV7,
+  normalizePluCode,
+  parseScaleBarcode,
+  RecallProductSchema,
   validateBarcode,
 } from "@supermarket/shared";
 import { and, asc, eq, ilike, inArray, or, sql } from "drizzle-orm";
@@ -258,6 +262,15 @@ export async function catalogRoutes(app: FastifyInstance) {
           taxRateBp: taxRates.rateBp,
           taxInclusive: taxRates.isInclusive,
           baseUnitLabel: products.baseUnitLabel,
+          unitMode: products.unitMode,
+          pluCode: products.pluCode,
+          defaultTareGrams: products.defaultTareGrams,
+          netContentAmount: products.netContentAmount,
+          netContentUnit: products.netContentUnit,
+          allergens: products.allergensJson,
+          ingredientsText: products.ingredientsText,
+          recalled: products.recalled,
+          recallReason: products.recallReason,
           avgCostCents: products.avgCostCents,
           minMarginBp: products.minMarginBp,
           requiresAgeCheck: products.requiresAgeCheck,
@@ -364,7 +377,7 @@ export async function catalogRoutes(app: FastifyInstance) {
     return { items, total, page, pageSize };
   });
 
-  // Sub-5ms POS barcode resolution (single consistent query for live stock)
+  // Sub-5ms POS barcode, GS1 20-29 scale barcode, and 4-5 digit PLU resolution
   app.get("/api/products/scan/:barcode", { preHandler: [requireAuth] }, async (req, reply) => {
     const { barcode } = req.params as { barcode: string };
     const clean = barcode.trim();
@@ -373,32 +386,47 @@ export async function catalogRoutes(app: FastifyInstance) {
       req.authUser?.role === "manager" ||
       req.authUser?.role === "accountant";
 
-    const [found] = await db
-      .select({
-        barcodeId: productBarcodes.id,
-        barcode: productBarcodes.barcode,
-        packQty: productBarcodes.packQty,
-        packLabel: productBarcodes.packLabel,
-        sellPriceCents: productBarcodes.sellPriceCents,
-        productId: products.id,
-        sku: products.sku,
-        name: products.name,
-        brand: products.brand,
-        categoryId: products.categoryId,
-        baseUnitLabel: products.baseUnitLabel,
-        avgCostCents: products.avgCostCents,
-        requiresAgeCheck: products.requiresAgeCheck,
-        taxRateBp: taxRates.rateBp,
-        taxInclusive: taxRates.isInclusive,
-        onHandUnits: sql<number>`(
-          coalesce(${stockBaselines.quantity}, 0) +
-          coalesce((
-            SELECT sum(sm.qty_delta)::int
-            FROM stock_movements sm
-            WHERE sm.folded = false AND sm.product_id = ${products.id}
-          ), 0)
-        )::int`,
-      })
+    const scaleParsed = parseScaleBarcode(clean);
+    const pluLookupCandidates = scaleParsed
+      ? scaleParsed.pluCandidates
+      : /^\d{4,5}$/.test(clean)
+        ? Array.from(new Set([clean, normalizePluCode(clean)]))
+        : [];
+
+    const selectShape = {
+      barcodeId: productBarcodes.id,
+      barcode: productBarcodes.barcode,
+      packQty: productBarcodes.packQty,
+      packLabel: productBarcodes.packLabel,
+      sellPriceCents: productBarcodes.sellPriceCents,
+      productId: products.id,
+      sku: products.sku,
+      name: products.name,
+      brand: products.brand,
+      categoryId: products.categoryId,
+      baseUnitLabel: products.baseUnitLabel,
+      unitMode: products.unitMode,
+      pluCode: products.pluCode,
+      defaultTareGrams: products.defaultTareGrams,
+      allergens: products.allergensJson,
+      recalled: products.recalled,
+      recallReason: products.recallReason,
+      avgCostCents: products.avgCostCents,
+      requiresAgeCheck: products.requiresAgeCheck,
+      taxRateBp: taxRates.rateBp,
+      taxInclusive: taxRates.isInclusive,
+      onHandUnits: sql<number>`(
+        coalesce(${stockBaselines.quantity}, 0) +
+        coalesce((
+          SELECT sum(sm.qty_delta)::int
+          FROM stock_movements sm
+          WHERE sm.folded = false AND sm.product_id = ${products.id}
+        ), 0)
+      )::int`,
+    };
+
+    let [found] = await db
+      .select(selectShape)
       .from(productBarcodes)
       .innerJoin(products, eq(productBarcodes.productId, products.id))
       .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
@@ -406,18 +434,37 @@ export async function catalogRoutes(app: FastifyInstance) {
       .where(eq(productBarcodes.barcode, clean))
       .limit(1);
 
-    if (!found) {
-      return reply.status(404).send({ error: "Barcode not found", barcode: clean });
+    if (!found && pluLookupCandidates.length > 0) {
+      [found] = await db
+        .select(selectShape)
+        .from(products)
+        .innerJoin(
+          productBarcodes,
+          and(eq(productBarcodes.productId, products.id), eq(productBarcodes.isPrimary, true))
+        )
+        .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
+        .leftJoin(stockBaselines, eq(products.id, stockBaselines.productId))
+        .where(inArray(products.pluCode, pluLookupCandidates))
+        .limit(1);
     }
+
+    if (!found) {
+      return reply.status(404).send({ error: "Barcode or PLU not found", barcode: clean });
+    }
+
+    const payload = {
+      ...found,
+      scaleParsed,
+    };
 
     if (!canSeeFinancials) {
-      const { avgCostCents: _c, ...pub } = found;
+      const { avgCostCents: _c, ...pub } = payload;
       return pub;
     }
-    return found;
+    return payload;
   });
 
-  // Create new product with Multi-UOM barcodes
+  // Create new product with Multi-UOM barcodes & fresh/EU allergen metadata
   app.post(
     "/api/products",
     { preHandler: [requireRole(["owner", "manager"])] },
@@ -452,6 +499,13 @@ export async function catalogRoutes(app: FastifyInstance) {
           categoryId: data.categoryId,
           taxRateId: data.taxRateId,
           baseUnitLabel: data.baseUnitLabel,
+          unitMode: data.unitMode ?? "each",
+          pluCode: data.pluCode ?? null,
+          defaultTareGrams: data.defaultTareGrams ?? 0,
+          netContentAmount: data.netContentAmount ?? null,
+          netContentUnit: data.netContentUnit ?? null,
+          allergensJson: data.allergens ?? [],
+          ingredientsText: data.ingredientsText ?? null,
           avgCostCents: data.avgCostCents,
           minMarginBp: data.minMarginBp,
           requiresAgeCheck: data.requiresAgeCheck,
@@ -1038,6 +1092,11 @@ export async function catalogRoutes(app: FastifyInstance) {
           sku: products.sku,
           name: products.name,
           aisle: products.aisleLocation,
+          unitMode: products.unitMode,
+          pluCode: products.pluCode,
+          netContentAmount: products.netContentAmount,
+          netContentUnit: products.netContentUnit,
+          allergens: products.allergensJson,
           barcode: productBarcodes.barcode,
           packLabel: productBarcodes.packLabel,
           sellPriceCents: productBarcodes.sellPriceCents,
@@ -1048,25 +1107,98 @@ export async function catalogRoutes(app: FastifyInstance) {
           and(inArray(products.id, parsed.data.productIds), eq(productBarcodes.isPrimary, true))
         );
 
-      const zplBlocks = rows.map(
-        (r) => `^XA
+      const zplBlocks = rows.map((r) => {
+        const unitPrice = computeLegalUnitPrice(
+          r.sellPriceCents,
+          r.netContentAmount,
+          (r.netContentUnit as "g" | "ml" | "ea" | null) ?? null,
+          (r.unitMode as "each" | "weight_g" | "volume_ml") ?? "each"
+        );
+        const allergenLine =
+          Array.isArray(r.allergens) && r.allergens.length > 0
+            ? `ALLERGENS: ${r.allergens.map((a) => a.toUpperCase()).join(", ")}`
+            : "";
+        const pluPart = r.pluCode ? `  |  PLU ${sanitizeZpl(r.pluCode)}` : "";
+        return `^XA
 ^PW460
-^LL240
-^CF0,28
-^FO20,18^FD${sanitizeZpl(r.name).slice(0, 34)}^FS
-^CF0,20
-^FO20,54^FD${sanitizeZpl(r.sku)}  |  ${sanitizeZpl(r.packLabel)}  |  Aisle ${sanitizeZpl(r.aisle)}^FS
-^CF0,56
-^FO20,86^FD${formatMoney(r.sellPriceCents)}^FS
-^BY2,2,52
+^LL280
+^CF0,26
+^FO20,14^FD${sanitizeZpl(r.name).slice(0, 34)}^FS
+^CF0,18
+^FO20,46^FD${sanitizeZpl(r.sku)}  |  ${sanitizeZpl(r.packLabel)}${pluPart}  |  ${sanitizeZpl(r.aisle)}^FS
+^CF0,50
+^FO20,74^FD${formatMoney(r.sellPriceCents)}^FS${
+          unitPrice ? `\n^CF0,18\n^FO250,94^FD(${sanitizeZpl(unitPrice)})^FS` : ""
+        }${
+          allergenLine
+            ? `\n^CF0,16\n^FO20,130^FD${sanitizeZpl(allergenLine).slice(0, 48)}^FS`
+            : ""
+        }
+^BY2,2,48
 ${buildZplBarcodeCommand(r.barcode)}
-^XZ`
-      );
+^XZ`;
+      });
 
       return {
         labelCount: zplBlocks.length,
         zpl: zplBlocks.join("\n"),
       };
+    }
+  );
+
+  // One-Click Food-Safety Product Recall POS-Block (owner/manager only)
+  app.patch(
+    "/api/products/:id/recall",
+    { preHandler: [requireRole(["owner", "manager"])] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid product ID format." });
+      }
+      const parsed = RecallProductSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+
+      const [existing] = await db
+        .select({ id: products.id, sku: products.sku, name: products.name })
+        .from(products)
+        .where(eq(products.id, id))
+        .limit(1);
+      if (!existing) {
+        return reply.status(404).send({ error: "Product not found." });
+      }
+
+      const nextRecalled = parsed.data.recalled;
+      const nextReason = nextRecalled ? (parsed.data.reason?.trim() ?? "Food-safety recall") : null;
+
+      const [updated] = await db
+        .update(products)
+        .set({
+          recalled: nextRecalled,
+          recallReason: nextReason,
+          recalledAt: nextRecalled ? new Date() : null,
+          updatedAt: new Date(),
+        })
+        .where(eq(products.id, id))
+        .returning({
+          id: products.id,
+          sku: products.sku,
+          name: products.name,
+          recalled: products.recalled,
+          recallReason: products.recallReason,
+          recalledAt: products.recalledAt,
+        });
+
+      await db.insert(auditLogs).values({
+        actor: req.authUser!.fullName,
+        action: nextRecalled ? "product_recall_activate" : "product_recall_clear",
+        entityType: "product",
+        entityId: updated.id,
+        detailsJson: { sku: updated.sku, name: updated.name, reason: nextReason },
+      });
+
+      return { product: updated };
     }
   );
 }

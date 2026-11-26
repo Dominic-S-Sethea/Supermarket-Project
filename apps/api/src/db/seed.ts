@@ -7,6 +7,7 @@ import {
 import { eq, isNotNull, sql } from "drizzle-orm";
 import { hashPin } from "../plugins/auth.js";
 import { applyDatabaseConstraintsAndViews } from "./applyConstraints.js";
+import { seedFreshDepartmentsAndBom } from "./seedFresh.js";
 import {
   auditLogs,
   categories,
@@ -399,6 +400,7 @@ async function seed() {
     const rng = createRng(20261126);
     await seedShiftTelemetryAndDaypart(rng);
     await seedRetailExpansionData(rng);
+    await seedFreshDepartmentsAndBom();
     await applyDatabaseConstraintsAndViews();
     await pool.end();
     return;
@@ -1120,6 +1122,7 @@ async function seed() {
 
   await seedShiftTelemetryAndDaypart(rng);
   await seedRetailExpansionData(rng);
+  await seedFreshDepartmentsAndBom();
   await applyDatabaseConstraintsAndViews();
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
