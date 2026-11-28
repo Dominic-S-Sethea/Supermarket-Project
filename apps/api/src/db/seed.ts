@@ -375,7 +375,19 @@ const SUPPLIER_SEEDS = [
   { code: "SUP-HSH", name: "Allied Pantry & Home Wholesale", email: "wholesale@alliedpantry.local", lead: 5 },
 ];
 
+/**
+ * Prevents running the destructive demo seeder against production databases.
+ */
+export function assertSafeToSeed(nodeEnv = process.env.NODE_ENV): void {
+  if (nodeEnv === "production") {
+    throw new Error(
+      "FATAL: Refusing to run destructive demo seeder when NODE_ENV=production. Use pnpm db:bootstrap-prod instead."
+    );
+  }
+}
+
 async function seed() {
+  assertSafeToSeed();
   console.log("Checking existing catalog...");
   const [{ count }] = await db
     .select({ count: sql<number>`count(*)::int` })
@@ -1627,7 +1639,7 @@ async function seedRetailExpansionData(rng: () => number) {
             caseQty: item.caseQty,
             orderedCases,
             receivedCases,
-            unitCostCents: item.caseCostCents,
+            unitCostCents: Math.max(1, Math.round(item.caseCostCents / Math.max(1, item.caseQty))),
             lineTotalCents: orderedCases * item.caseCostCents,
           });
 
@@ -1744,7 +1756,10 @@ async function seedRetailExpansionData(rng: () => number) {
   }
 }
 
-seed().catch((err) => {
-  console.error("Seed failed:", err);
-  process.exit(1);
-});
+const isMain = process.argv[1]?.replace(/\\/g, "/").endsWith("/seed.ts");
+if (isMain) {
+  seed().catch((err) => {
+    console.error("Seed failed:", err);
+    process.exit(1);
+  });
+}

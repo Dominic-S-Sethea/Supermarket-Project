@@ -155,7 +155,7 @@ export const stockMovements = pgTable(
       .notNull()
       .references(() => products.id, { onDelete: "restrict" }),
     batchId: uuid("batch_id").references(() => inventoryBatches.id, {
-      onDelete: "set null",
+      onDelete: "restrict",
     }),
     qtyDelta: integer("qty_delta").notNull(),
     unitCostCents: bigint("unit_cost_cents", { mode: "number" }).notNull().default(0),
@@ -253,6 +253,7 @@ export const purchaseOrderLines = pgTable(
   (t) => [
     index("idx_po_lines_po").on(t.poId),
     index("idx_po_lines_product").on(t.productId),
+    uniqueIndex("uq_po_lines_po_product").on(t.poId, t.productId),
   ]
 );
 
@@ -399,6 +400,9 @@ export const posShifts = pgTable(
     id: uuid("id").primaryKey(),
     registerCode: text("register_code").notNull(),
     cashierName: text("cashier_name").notNull(),
+    cashierUserId: uuid("cashier_user_id").references(() => users.id, { onDelete: "restrict" }),
+    closedBy: text("closed_by"),
+    closedByUserId: uuid("closed_by_user_id").references(() => users.id, { onDelete: "restrict" }),
     openedAt: timestamp("opened_at", { withTimezone: true }).notNull().defaultNow(),
     closedAt: timestamp("closed_at", { withTimezone: true }),
     openingFloatCents: bigint("opening_float_cents", { mode: "number" }).notNull().default(0),
@@ -410,8 +414,28 @@ export const posShifts = pgTable(
   },
   (t) => [
     index("idx_pos_shifts_cashier_opened").on(t.cashierName, t.openedAt),
+    index("idx_pos_shifts_cashier_user").on(t.cashierUserId),
     index("idx_pos_shifts_register_closed").on(t.registerCode, t.closedAt),
   ]
+);
+
+export const posCashDrops = pgTable(
+  "pos_cash_drops",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    shiftId: uuid("shift_id")
+      .notNull()
+      .references(() => posShifts.id, { onDelete: "restrict" }),
+    registerCode: text("register_code").notNull(),
+    amountCents: bigint("amount_cents", { mode: "number" }).notNull(),
+    recordedBy: text("recorded_by").notNull(),
+    recordedByUserId: uuid("recorded_by_user_id").references(() => users.id, {
+      onDelete: "restrict",
+    }),
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index("idx_pos_cash_drops_shift").on(t.shiftId)]
 );
 
 export const sales = pgTable(
@@ -427,6 +451,7 @@ export const sales = pgTable(
       onDelete: "restrict",
     }),
     cashierName: text("cashier_name").notNull(),
+    cashierUserId: uuid("cashier_user_id").references(() => users.id, { onDelete: "restrict" }),
     subtotalCents: bigint("subtotal_cents", { mode: "number" }).notNull(),
     discountCents: bigint("discount_cents", { mode: "number" }).notNull().default(0),
     taxCents: bigint("tax_cents", { mode: "number" }).notNull().default(0),
@@ -439,6 +464,7 @@ export const sales = pgTable(
   (t) => [
     index("idx_sales_sold_at").on(t.soldAt),
     index("idx_sales_cashier").on(t.cashierName),
+    index("idx_sales_cashier_user").on(t.cashierUserId),
     index("idx_sales_kind").on(t.kind),
     index("idx_sales_sold_at_kind").on(t.soldAt, t.kind),
     index("idx_sales_register_sold").on(t.registerCode, t.soldAt),
@@ -489,13 +515,16 @@ export const salePayments = pgTable(
     tenderedCents: bigint("tendered_cents", { mode: "number" }),
     changeCents: bigint("change_cents", { mode: "number" }),
     externalRef: text("external_ref"),
-    paymentIntentId: uuid("payment_intent_id"),
+    paymentIntentId: uuid("payment_intent_id").references(() => paymentIntents.id, {
+      onDelete: "restrict",
+    }),
     currencyCode: text("currency_code").notNull().default("USD"),
     foreignAmount: bigint("foreign_amount", { mode: "number" }),
     fxRateUsed: doublePrecision("fx_rate_used"),
   },
   (t) => [
     index("idx_sale_payments_sale").on(t.saleId),
+    index("idx_sale_payments_sale_method").on(t.saleId, t.method),
     index("idx_sale_payments_intent").on(t.paymentIntentId),
   ]
 );
@@ -505,6 +534,7 @@ export const auditLogs = pgTable(
   {
     id: uuid("id").defaultRandom().primaryKey(),
     actor: text("actor").notNull(),
+    actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "restrict" }),
     action: text("action").notNull(), // void_line | price_override | no_sale_drawer | grn_post | csv_import | expiry_markdown
     entityType: text("entity_type").notNull(),
     entityId: text("entity_id"),
@@ -513,6 +543,9 @@ export const auditLogs = pgTable(
   },
   (t) => [
     index("idx_audit_logs_actor_action").on(t.actor, t.action),
+    index("idx_audit_logs_actor_user").on(t.actorUserId),
+    index("idx_audit_logs_action").on(t.action),
+    index("idx_audit_logs_entity_type").on(t.entityType),
     index("idx_audit_logs_created").on(t.createdAt),
   ]
 );
@@ -677,7 +710,10 @@ export const analyticsLpAnomalies = pgTable(
     riskLevel: text("risk_level").notNull(), // normal | elevated | high
     computedAt: timestamp("computed_at", { withTimezone: true }).defaultNow().notNull(),
   },
-  (t) => [index("idx_lp_anomalies_risk").on(t.riskLevel)]
+  (t) => [
+    index("idx_lp_anomalies_risk").on(t.riskLevel),
+    uniqueIndex("uq_lp_anomalies_cashier").on(t.cashierName),
+  ]
 );
 
 // ============================================================================
@@ -690,7 +726,7 @@ export const aiConversations = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     userId: uuid("user_id")
       .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
+      .references(() => users.id, { onDelete: "restrict" }),
     title: text("title").notNull(),
     lastInteractionId: text("last_interaction_id"),
     model: text("model").notNull().default("gemini-4-hydrogen"),
@@ -721,8 +757,8 @@ export const aiProposedActions = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     conversationId: uuid("conversation_id")
       .notNull()
-      .references(() => aiConversations.id, { onDelete: "cascade" }),
-    messageId: uuid("message_id"),
+      .references(() => aiConversations.id, { onDelete: "restrict" }),
+    messageId: uuid("message_id").references(() => aiMessages.id, { onDelete: "set null" }),
     actionType: text("action_type").notNull(), // create_po | update_price | create_promo
     title: text("title").notNull(),
     summary: text("summary").notNull(),
@@ -1125,6 +1161,8 @@ export const storeSettings = pgTable("store_settings", {
   promptpayProxy: text("promptpay_proxy").notNull().default("0812345678"),
   paynowUen: text("paynow_uen").notNull().default("202612345K"),
   fiscalProvider: text("fiscal_provider").notNull().default("local_hash_chain"),
+  storeTimezone: text("store_timezone").notNull().default("Asia/Phnom_Penh"),
+  railFxRatesJson: jsonb("rail_fx_rates_json"),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -1150,7 +1188,36 @@ export const paymentIntents = pgTable(
   },
   (t) => [
     index("idx_payment_intents_status_created").on(t.status, t.createdAt),
+    index("idx_payment_intents_status_expires").on(t.status, t.expiresAt),
     index("idx_payment_intents_sale").on(t.saleId),
+  ]
+);
+
+export const supervisorOverrides = pgTable(
+  "supervisor_overrides",
+  {
+    id: uuid("id").primaryKey(),
+    actionType: text("action_type").notNull(),
+    reason: text("reason").notNull(),
+    registerCode: text("register_code").notNull().default("REG-01"),
+    cashierUserId: uuid("cashier_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    supervisorUserId: uuid("supervisor_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    supervisorName: text("supervisor_name").notNull(),
+    supervisorRole: text("supervisor_role").notNull(),
+    consumedBySaleId: uuid("consumed_by_sale_id").references(() => sales.id, {
+      onDelete: "set null",
+    }),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("idx_supervisor_overrides_expires").on(t.expiresAt),
+    index("idx_supervisor_overrides_consumed_sale").on(t.consumedBySaleId),
   ]
 );
 
@@ -1158,9 +1225,10 @@ export const parkedBaskets = pgTable(
   "parked_baskets",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    holdCode: text("hold_code").notNull().unique(),
+    holdCode: text("hold_code").notNull(),
     registerCode: text("register_code").notNull().default("REG-01"),
     cashierName: text("cashier_name").notNull(),
+    cashierUserId: uuid("cashier_user_id").references(() => users.id, { onDelete: "restrict" }),
     customerLabel: text("customer_label"),
     customerId: uuid("customer_id").references(() => customers.id, { onDelete: "set null" }),
     couponCode: text("coupon_code"),
@@ -1172,6 +1240,9 @@ export const parkedBaskets = pgTable(
     parkedAt: timestamp("parked_at", { withTimezone: true }).defaultNow().notNull(),
     recalledAt: timestamp("recalled_at", { withTimezone: true }),
     recalledBy: text("recalled_by"),
+    recalledByUserId: uuid("recalled_by_user_id").references(() => users.id, {
+      onDelete: "restrict",
+    }),
   },
   (t) => [
     index("idx_parked_baskets_status_parked").on(t.status, t.parkedAt),

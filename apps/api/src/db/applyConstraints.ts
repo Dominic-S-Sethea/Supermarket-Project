@@ -271,6 +271,16 @@ export async function applyDatabaseConstraintsAndViews() {
   `);
 
   await db.execute(sql`
+    CREATE OR REPLACE FUNCTION unit_cost_divisor(mode text)
+    RETURNS numeric
+    LANGUAGE sql
+    IMMUTABLE
+    AS $$
+      SELECT CASE WHEN mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END;
+    $$;
+  `);
+
+  await db.execute(sql`
     CREATE OR REPLACE VIEW v_product_live_stock AS
     SELECT
       p.id AS product_id,
