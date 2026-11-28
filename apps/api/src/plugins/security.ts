@@ -35,7 +35,7 @@ export function registerSecurityHeaders(app: FastifyInstance) {
     if (!reply.hasHeader("Content-Security-Policy")) {
       reply.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
     }
-    if (env.cookieSecure || env.isProduction || req.protocol === "https") {
+    if (req.protocol === "https" || (env.isProduction && env.cookieSecure)) {
       reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     }
     if (
@@ -137,7 +137,7 @@ export function createRateLimiter(opts: { keyPrefix: string; windowMs: number; m
 }
 
 // =========================================================================
-// PER-USERNAME SLIDING-WINDOW BRUTE-FORCE PIN LOCKOUT (IP-INDEPENDENT)
+// DUAL-TIER BRUTE-FORCE PIN LOCKOUT (PER-(USERNAME, IP) + GLOBAL USERNAME)
 // =========================================================================
 interface LockoutRecord {
   failures: number[];
@@ -146,51 +146,74 @@ interface LockoutRecord {
 
 const LOCKOUT_WINDOW_MS = 15 * 60_000;
 const LOCKOUT_DURATION_MS = 15 * 60_000;
-const MAX_FAILED_PIN_ATTEMPTS = 5;
+const MAX_FAILED_PIN_PER_IP = 5;
+const MAX_FAILED_PIN_GLOBAL = 15;
 
-const loginLockouts = new Map<string, LockoutRecord>();
+const ipLockouts = new Map<string, LockoutRecord>();
+const globalLockouts = new Map<string, LockoutRecord>();
 let authLockoutsTotal = 0;
 
 export function resetLoginLockouts() {
-  loginLockouts.clear();
+  ipLockouts.clear();
+  globalLockouts.clear();
 }
 
 export function getAuthLockoutTotal(): number {
   return authLockoutsTotal;
 }
 
-export function checkLoginLockout(username: string): { locked: boolean; retryAfterSec: number } {
-  const key = username.trim().toLowerCase();
+function normalizeUserKey(username: string): string {
+  return username.trim().toLowerCase();
+}
+
+function normalizeIpKey(username: string, ip?: string): string {
+  return `${normalizeUserKey(username)}|${(ip ?? "local").trim() || "local"}`;
+}
+
+function sweepBucketMap(map: Map<string, LockoutRecord>, now: number) {
+  if (map.size <= 5000) return;
+  for (const [k, v] of map) {
+    if (v.lockedUntil <= now && v.failures.every((ts) => now - ts > LOCKOUT_WINDOW_MS)) {
+      map.delete(k);
+    }
+  }
+}
+
+export function checkLoginLockout(
+  username: string,
+  ip?: string
+): { locked: boolean; retryAfterSec: number; scope?: "ip" | "global" } {
+  const userKey = normalizeUserKey(username);
+  const ipKey = normalizeIpKey(username, ip);
   const now = Date.now();
-  const rec = loginLockouts.get(key);
-  if (!rec) return { locked: false, retryAfterSec: 0 };
-  if (rec.lockedUntil > now) {
+
+  const globalRec = globalLockouts.get(userKey);
+  if (globalRec && globalRec.lockedUntil > now) {
     return {
       locked: true,
-      retryAfterSec: Math.max(1, Math.ceil((rec.lockedUntil - now) / 1000)),
+      retryAfterSec: Math.max(1, Math.ceil((globalRec.lockedUntil - now) / 1000)),
+      scope: "global",
+    };
+  }
+  const ipRec = ipLockouts.get(ipKey);
+  if (ipRec && ipRec.lockedUntil > now) {
+    return {
+      locked: true,
+      retryAfterSec: Math.max(1, Math.ceil((ipRec.lockedUntil - now) / 1000)),
+      scope: "ip",
     };
   }
   return { locked: false, retryAfterSec: 0 };
 }
 
-export function recordFailedLogin(username: string): {
-  locked: boolean;
-  newlyLocked: boolean;
-  retryAfterSec: number;
-  failures: number;
-} {
-  const key = username.trim().toLowerCase();
-  const now = Date.now();
-
-  if (loginLockouts.size > 5000) {
-    for (const [k, v] of loginLockouts) {
-      if (v.lockedUntil <= now && v.failures.every((ts) => now - ts > LOCKOUT_WINDOW_MS)) {
-        loginLockouts.delete(k);
-      }
-    }
-  }
-
-  const rec = loginLockouts.get(key) ?? { failures: [], lockedUntil: 0 };
+function advanceLockoutRecord(
+  map: Map<string, LockoutRecord>,
+  key: string,
+  maxAttempts: number,
+  now: number
+): { locked: boolean; newlyLocked: boolean; retryAfterSec: number; failures: number } {
+  sweepBucketMap(map, now);
+  const rec = map.get(key) ?? { failures: [], lockedUntil: 0 };
   if (rec.lockedUntil > now) {
     return {
       locked: true,
@@ -204,10 +227,9 @@ export function recordFailedLogin(username: string): {
   recent.push(now);
   rec.failures = recent;
 
-  if (recent.length >= MAX_FAILED_PIN_ATTEMPTS) {
+  if (recent.length >= maxAttempts) {
     rec.lockedUntil = now + LOCKOUT_DURATION_MS;
-    loginLockouts.set(key, rec);
-    authLockoutsTotal += 1;
+    map.set(key, rec);
     return {
       locked: true,
       newlyLocked: true,
@@ -216,7 +238,7 @@ export function recordFailedLogin(username: string): {
     };
   }
 
-  loginLockouts.set(key, rec);
+  map.set(key, rec);
   return {
     locked: false,
     newlyLocked: false,
@@ -225,6 +247,70 @@ export function recordFailedLogin(username: string): {
   };
 }
 
-export function clearLoginFailures(username: string): void {
-  loginLockouts.delete(username.trim().toLowerCase());
+export function recordFailedLogin(
+  username: string,
+  ip?: string
+): {
+  locked: boolean;
+  newlyLocked: boolean;
+  retryAfterSec: number;
+  failures: number;
+  scope?: "ip" | "global";
+} {
+  const now = Date.now();
+  const userKey = normalizeUserKey(username);
+  const ipKey = normalizeIpKey(username, ip);
+
+  const ipRes = advanceLockoutRecord(ipLockouts, ipKey, MAX_FAILED_PIN_PER_IP, now);
+  const globalRes = advanceLockoutRecord(globalLockouts, userKey, MAX_FAILED_PIN_GLOBAL, now);
+
+  const newlyLocked = ipRes.newlyLocked || globalRes.newlyLocked;
+  if (newlyLocked) {
+    authLockoutsTotal += 1;
+  }
+
+  if (globalRes.locked) {
+    return {
+      locked: true,
+      newlyLocked,
+      retryAfterSec: Math.max(globalRes.retryAfterSec, ipRes.retryAfterSec),
+      failures: globalRes.failures,
+      scope: "global",
+    };
+  }
+  if (ipRes.locked) {
+    return {
+      locked: true,
+      newlyLocked,
+      retryAfterSec: ipRes.retryAfterSec,
+      failures: ipRes.failures,
+      scope: "ip",
+    };
+  }
+  return {
+    locked: false,
+    newlyLocked: false,
+    retryAfterSec: 0,
+    failures: ipRes.failures,
+  };
+}
+
+export function clearLoginFailures(username: string, ip?: string): void {
+  const userKey = normalizeUserKey(username);
+  ipLockouts.delete(normalizeIpKey(username, ip));
+  const globalRec = globalLockouts.get(userKey);
+  if (globalRec && globalRec.lockedUntil <= Date.now()) {
+    globalLockouts.delete(userKey);
+  }
+}
+
+export function unlockUserLogin(username: string): void {
+  const userKey = normalizeUserKey(username);
+  globalLockouts.delete(userKey);
+  const prefix = `${userKey}|`;
+  for (const key of ipLockouts.keys()) {
+    if (key.startsWith(prefix)) {
+      ipLockouts.delete(key);
+    }
+  }
 }

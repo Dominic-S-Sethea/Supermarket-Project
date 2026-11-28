@@ -9,7 +9,7 @@ import {
 import { and, eq, isNull, ne } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { env } from "../config/env.js";
-import { auditLogs, db, userSessions, users } from "../db/index.js";
+import { auditLogs, db, supervisorOverrides, userSessions, users } from "../db/index.js";
 import {
   hashPin,
   requireAuth,
@@ -45,7 +45,7 @@ export async function authRoutes(app: FastifyInstance) {
     }
 
     const username = parsed.data.username.trim().toLowerCase();
-    const lockState = checkLoginLockout(username);
+    const lockState = checkLoginLockout(username, req.ip);
     if (lockState.locked) {
       reply.header("Retry-After", String(lockState.retryAfterSec));
       return reply.status(429).send({
@@ -67,7 +67,7 @@ export async function authRoutes(app: FastifyInstance) {
     }
 
     if (!found || !pinValid) {
-      const failState = recordFailedLogin(username);
+      const failState = recordFailedLogin(username, req.ip);
       if (failState.newlyLocked) {
         await db.insert(auditLogs).values({
           actor: found?.fullName ?? username,
@@ -77,6 +77,7 @@ export async function authRoutes(app: FastifyInstance) {
           detailsJson: {
             username,
             ip: req.ip,
+            scope: failState.scope ?? "ip",
             failures: failState.failures,
             lockoutSeconds: failState.retryAfterSec,
           },
@@ -91,7 +92,7 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.status(401).send({ error: "Invalid username or PIN." });
     }
 
-    clearLoginFailures(username);
+    clearLoginFailures(username, req.ip);
 
     const user = {
       id: found.id,
@@ -157,7 +158,7 @@ export async function authRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: strengthError });
       }
 
-      const lockState = checkLoginLockout(actor.username);
+      const lockState = checkLoginLockout(actor.username, req.ip);
       if (lockState.locked) {
         reply.header("Retry-After", String(lockState.retryAfterSec));
         return reply.status(429).send({
@@ -167,7 +168,7 @@ export async function authRoutes(app: FastifyInstance) {
 
       const [dbUser] = await db.select().from(users).where(eq(users.id, actor.id)).limit(1);
       if (!dbUser || !(await verifyPin(parsed.data.currentPin, dbUser.pinHash))) {
-        const failState = recordFailedLogin(actor.username);
+        const failState = recordFailedLogin(actor.username, req.ip);
         if (failState.newlyLocked) {
           await db.transaction(async (tx) => {
             if (req.sessionJti) {
@@ -185,6 +186,7 @@ export async function authRoutes(app: FastifyInstance) {
                 source: "change_pin",
                 username: actor.username,
                 ip: req.ip,
+                scope: failState.scope ?? "ip",
                 failures: failState.failures,
                 lockoutSeconds: failState.retryAfterSec,
               },
@@ -194,13 +196,13 @@ export async function authRoutes(app: FastifyInstance) {
         if (failState.locked) {
           reply.header("Retry-After", String(failState.retryAfterSec));
           return reply.status(429).send({
-            error: `Account temporarily locked due to repeated failed PIN attempts. Retry in ${failState.retryAfterSec}s.`,
+            error: `Account temporarily locked due to repeated failed PIN attempts. Retry in ${lockState.retryAfterSec}s.`,
           });
         }
         return reply.status(401).send({ error: "Current PIN is incorrect." });
       }
 
-      clearLoginFailures(actor.username);
+      clearLoginFailures(actor.username, req.ip);
       const nextHash = await hashPin(parsed.data.newPin);
       const revokedCount = await db.transaction(async (tx) => {
         await tx.update(users).set({ pinHash: nextHash }).where(eq(users.id, actor.id));
@@ -263,7 +265,7 @@ export async function authRoutes(app: FastifyInstance) {
       }
 
       const supUsername = data.username.trim().toLowerCase();
-      const lockState = checkLoginLockout(supUsername);
+      const lockState = checkLoginLockout(supUsername, req.ip);
       if (lockState.locked) {
         reply.header("Retry-After", String(lockState.retryAfterSec));
         return reply.status(429).send({
@@ -277,52 +279,85 @@ export async function authRoutes(app: FastifyInstance) {
         .where(and(eq(users.username, supUsername), eq(users.active, true)))
         .limit(1);
 
+      // Eliminate 401 vs 403 PIN oracle: ineligible roles run constant-time dummy scrypt without checking PIN
+      const isEligibleSupervisor = Boolean(
+        found && (found.role === "owner" || found.role === "manager")
+      );
       let pinValid = false;
-      if (!found) {
+      if (!isEligibleSupervisor || !found) {
         await runDummyPinWork(data.pin);
       } else {
         pinValid = await verifyPin(data.pin, found.pinHash);
       }
 
-      if (!found || !pinValid) {
-        const failState = recordFailedLogin(supUsername);
+      if (!isEligibleSupervisor || !found || !pinValid) {
+        const failState = recordFailedLogin(supUsername, req.ip);
+        if (failState.newlyLocked) {
+          await db.insert(auditLogs).values({
+            actor: found?.fullName ?? supUsername,
+            action: "auth_lockout",
+            entityType: "user",
+            entityId: found?.id ?? null,
+            detailsJson: {
+              source: "verify_override",
+              username: supUsername,
+              requestedBy: cashier.username,
+              ip: req.ip,
+              scope: failState.scope ?? "ip",
+              failures: failState.failures,
+              lockoutSeconds: failState.retryAfterSec,
+            },
+          });
+        }
         if (failState.locked) {
           reply.header("Retry-After", String(failState.retryAfterSec));
           return reply.status(429).send({
             error: `Supervisor account temporarily locked. Retry in ${failState.retryAfterSec}s.`,
           });
         }
-        return reply.status(401).send({ error: "Invalid supervisor username or PIN." });
+        return reply
+          .status(401)
+          .send({ error: "Invalid supervisor credentials or insufficient privileges." });
       }
 
-      if (found.role !== "owner" && found.role !== "manager") {
-        return reply.status(403).send({
-          error: "Supervisor override requires an active Store Manager or Owner account.",
-        });
-      }
-
-      clearLoginFailures(supUsername);
+      clearLoginFailures(supUsername, req.ip);
       const overrideId = generateUuidV7();
-      const approvedAt = new Date().toISOString();
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + 5 * 60_000);
 
-      await db.insert(auditLogs).values({
-        actor: found.fullName,
-        action: data.actionType === "no_sale_drawer" ? "no_sale_drawer" : "supervisor_override",
-        entityType: "pos_override",
-        entityId: overrideId,
-        detailsJson: {
-          overrideId,
+      await db.transaction(async (tx) => {
+        await tx.insert(supervisorOverrides).values({
+          id: overrideId,
           actionType: data.actionType,
           reason: data.reason,
           registerCode: data.registerCode,
-          cashierId: cashier.id,
-          cashierName: cashier.fullName,
-          cashierRole: cashier.role,
-          supervisorId: found.id,
+          cashierUserId: cashier.id,
+          supervisorUserId: found.id,
           supervisorName: found.fullName,
           supervisorRole: found.role,
-          metadata: data.metadata ?? null,
-        },
+          expiresAt,
+        });
+
+        await tx.insert(auditLogs).values({
+          actor: found.fullName,
+          action: data.actionType === "no_sale_drawer" ? "no_sale_drawer" : "supervisor_override",
+          entityType: "pos_override",
+          entityId: overrideId,
+          detailsJson: {
+            overrideId,
+            actionType: data.actionType,
+            reason: data.reason,
+            registerCode: data.registerCode,
+            cashierId: cashier.id,
+            cashierName: cashier.fullName,
+            cashierRole: cashier.role,
+            supervisorId: found.id,
+            supervisorName: found.fullName,
+            supervisorRole: found.role,
+            expiresAt: expiresAt.toISOString(),
+            metadata: data.metadata ?? null,
+          },
+        });
       });
 
       return {
@@ -332,7 +367,8 @@ export async function authRoutes(app: FastifyInstance) {
         supervisorName: found.fullName,
         supervisorRole: found.role as UserRole,
         actionType: data.actionType,
-        approvedAt,
+        approvedAt: now.toISOString(),
+        expiresAt: expiresAt.toISOString(),
       };
     }
   );

@@ -1,9 +1,9 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../app.js";
 import { aiConversations, auditLogs, db, pool, userSessions, users } from "../db/index.js";
 import { buildCsvDocument, escapeCsvCell } from "../lib/helpers.js";
-import { SESSION_COOKIE_NAME } from "../plugins/auth.js";
+import { SESSION_COOKIE_NAME, verifySessionToken } from "../plugins/auth.js";
 import { resetLoginLockouts, resetRateLimits } from "../plugins/security.js";
 
 let app: Awaited<ReturnType<typeof buildApp>>;
@@ -13,6 +13,7 @@ let accountantToken = "";
 let cashierToken = "";
 let clerkToken = "";
 let ownerCookie = "";
+const createdSessionJtis: string[] = [];
 
 function authHeaders(token = ownerToken) {
   return { authorization: `Bearer ${token}` };
@@ -39,6 +40,10 @@ beforeAll(async () => {
   accountantToken = (logins[2].json() as { token: string }).token;
   cashierToken = (logins[3].json() as { token: string }).token;
   clerkToken = (logins[4].json() as { token: string }).token;
+  for (const tok of [ownerToken, managerToken, accountantToken, cashierToken, clerkToken]) {
+    const jti = verifySessionToken(tok)?.jti;
+    if (jti) createdSessionJtis.push(jti);
+  }
 
   // Versioned v1.<kid>.<payload>.<sig> session token format (L-06)
   expect(ownerToken.startsWith("v1.")).toBe(true);
@@ -52,12 +57,15 @@ beforeAll(async () => {
 
 afterAll(async () => {
   resetLoginLockouts();
+  if (createdSessionJtis.length > 0) {
+    await db.delete(userSessions).where(inArray(userSessions.jti, createdSessionJtis));
+  }
   await app.close();
   await pool.end();
 });
 
 describe("SupermarketOS OWASP Security Hardening Suite", () => {
-  it("enforces IP-independent per-username PIN brute-force lockout (5 failures -> 429 + audit log)", async () => {
+  it("enforces dual-tier per-(username,ip) + global PIN lockout (without cross-IP DoS) and supports owner unlock", async () => {
     const tempUser = `sec_lock_${Date.now().toString().slice(-6)}`;
     const createRes = await app.inject({
       method: "POST",
@@ -74,42 +82,78 @@ describe("SupermarketOS OWASP Security Hardening Suite", () => {
     const createdId = (createRes.json() as { user: { id: string } }).user.id;
 
     try {
-      // 4 bad PINs from rotating simulated remote addresses -> 401
+      // 4 bad PINs from IP 10.10.0.1 -> 401
       for (let i = 1; i <= 4; i++) {
+        const res = await app.inject({
+          method: "POST",
+          url: "/api/auth/login",
+          remoteAddress: "10.10.0.1",
+          payload: { username: tempUser, pin: "0000" },
+        });
+        expect(res.statusCode).toBe(401);
+      }
+
+      // 5th bad PIN from IP 10.10.0.1 locks (tempUser, 10.10.0.1) -> 429
+      const fifth = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        remoteAddress: "10.10.0.1",
+        payload: { username: tempUser, pin: "0000" },
+      });
+      expect(fifth.statusCode).toBe(429);
+      expect(Number(fifth.headers["retry-after"])).toBeGreaterThan(60);
+
+      // Legitimate POS lane on a different IP (10.10.0.99) is NOT DoS-blocked
+      const legitimateLane = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        remoteAddress: "10.10.0.99",
+        payload: { username: tempUser, pin: "8421" },
+      });
+      expect(legitimateLane.statusCode).toBe(200);
+
+      // Distributed rotating-IP attack (reaching 15 total failures) triggers global lock
+      for (let i = 2; i <= 11; i++) {
         const res = await app.inject({
           method: "POST",
           url: "/api/auth/login",
           remoteAddress: `10.10.0.${i}`,
           payload: { username: tempUser, pin: "0000" },
         });
-        expect(res.statusCode).toBe(401);
+        expect([401, 429]).toContain(res.statusCode);
       }
-
-      // 5th bad PIN from a 5th IP triggers lockout -> 429 + Retry-After + immutable auth_lockout audit event
-      const fifth = await app.inject({
+      const blockedGlobally = await app.inject({
         method: "POST",
         url: "/api/auth/login",
-        remoteAddress: "10.10.0.5",
-        payload: { username: tempUser, pin: "0000" },
-      });
-      expect(fifth.statusCode).toBe(429);
-      expect(Number(fifth.headers["retry-after"])).toBeGreaterThan(60);
-
-      // Even the CORRECT PIN is rejected while locked out (429)
-      const correctWhileLocked = await app.inject({
-        method: "POST",
-        url: "/api/auth/login",
-        remoteAddress: "10.10.0.6",
+        remoteAddress: "10.10.0.88",
         payload: { username: tempUser, pin: "8421" },
       });
-      expect(correctWhileLocked.statusCode).toBe(429);
+      expect(blockedGlobally.statusCode).toBe(429);
 
-      // Verify immutable auth_lockout audit event was written
+      // Owner unlocks account via POST /api/admin/users/:id/unlock -> succeeds immediately
+      const unlockRes = await app.inject({
+        method: "POST",
+        url: `/api/admin/users/${createdId}/unlock`,
+        headers: authHeaders(),
+        payload: {},
+      });
+      expect(unlockRes.statusCode).toBe(200);
+
+      const afterUnlock = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        remoteAddress: "10.10.0.1",
+        payload: { username: tempUser, pin: "8421" },
+      });
+      expect(afterUnlock.statusCode).toBe(200);
+
+      // Verify immutable auth_lockout & auth_unlock audit events were written
       const lockoutAudits = await db
         .select()
         .from(auditLogs)
         .where(eq(auditLogs.entityId, createdId));
       expect(lockoutAudits.some((a) => a.action === "auth_lockout")).toBe(true);
+      expect(lockoutAudits.some((a) => a.action === "auth_unlock")).toBe(true);
     } finally {
       resetLoginLockouts();
       await db.delete(userSessions).where(eq(userSessions.userId, createdId));
@@ -389,6 +433,65 @@ describe("SupermarketOS OWASP Security Hardening Suite", () => {
     if (clerkSemantic.json().items.length > 0) {
       expect(clerkSemantic.json().items[0].avgCostCents).toBeUndefined();
     }
+
+    // 3b. Uniform cost redaction from stock_clerk, cashier coupon/PII lock & manager settlement restriction (AUD-014)
+    const [
+      ownerBoot,
+      clerkExpiry,
+      clerkPhantom,
+      clerkMarkdowns,
+      clerkRecipes,
+      cashierCoupons,
+      cashierCustEmpty,
+      cashierCustWildcard,
+      mgrSettlementPatch,
+    ] = await Promise.all([
+      app.inject({ method: "GET", url: "/api/pos/bootstrap", headers: authHeaders(ownerToken) }),
+      app.inject({ method: "GET", url: "/api/inventory/expiry-alerts", headers: authHeaders(clerkToken) }),
+      app.inject({ method: "GET", url: "/api/inventory/phantom-stock", headers: authHeaders(clerkToken) }),
+      app.inject({ method: "GET", url: "/api/inventory/dynamic-markdowns", headers: authHeaders(clerkToken) }),
+      app.inject({ method: "GET", url: "/api/operations/recipes", headers: authHeaders(clerkToken) }),
+      app.inject({ method: "GET", url: "/api/loyalty/coupons", headers: authHeaders(cashierToken) }),
+      app.inject({ method: "GET", url: "/api/loyalty/customers", headers: authHeaders(cashierToken) }),
+      app.inject({ method: "GET", url: "/api/loyalty/customers?search=%25%25%25", headers: authHeaders(cashierToken) }),
+      app.inject({
+        method: "PATCH",
+        url: "/api/store-settings",
+        headers: authHeaders(managerToken),
+        payload: { khqrAccountId: "hijack@evilbank" },
+      }),
+    ]);
+    expect(ownerBoot.statusCode).toBe(200);
+    expect(ownerBoot.json().products[0].avgCostCents).toBeUndefined();
+    expect(clerkExpiry.statusCode).toBe(200);
+    for (const item of clerkExpiry.json().items as { unitCostCents?: number; atRiskCostCents?: number }[]) {
+      expect(item.unitCostCents).toBeUndefined();
+      expect(item.atRiskCostCents).toBeUndefined();
+    }
+    expect(clerkPhantom.statusCode).toBe(200);
+    expect(clerkPhantom.json().summary.openAtRiskCents).toBeUndefined();
+    for (const item of clerkPhantom.json().items as { avgCostCents?: number; estimatedValueAtRiskCents?: number }[]) {
+      expect(item.avgCostCents).toBeUndefined();
+      expect(item.estimatedValueAtRiskCents).toBeUndefined();
+    }
+    expect(clerkMarkdowns.statusCode).toBe(200);
+    for (const item of clerkMarkdowns.json().items as { unitCostCents?: number }[]) {
+      expect(item.unitCostCents).toBeUndefined();
+    }
+    expect(clerkRecipes.statusCode).toBe(200);
+    for (const rec of clerkRecipes.json().recipes as { estimatedBatchCostCents?: number; ingredients: { avgCostCents?: number; estimatedLineCostCents?: number }[] }[]) {
+      expect(rec.estimatedBatchCostCents).toBeUndefined();
+      for (const ing of rec.ingredients) {
+        expect(ing.avgCostCents).toBeUndefined();
+        expect(ing.estimatedLineCostCents).toBeUndefined();
+      }
+    }
+    expect(cashierCoupons.statusCode).toBe(403);
+    expect(cashierCustEmpty.statusCode).toBe(200);
+    expect(cashierCustEmpty.json().customers).toEqual([]);
+    expect(cashierCustWildcard.statusCode).toBe(200);
+    expect(cashierCustWildcard.json().customers).toEqual([]);
+    expect(mgrSettlementPatch.statusCode).toBe(403);
 
     // 4. Weak PIN denylist & privileged 8+ char credential policy (H-13)
     const weakPinRes = await app.inject({

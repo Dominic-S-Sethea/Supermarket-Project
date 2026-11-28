@@ -5,6 +5,10 @@ export default defineConfig({
     include: ["src/__tests__/**/*.test.ts"],
     exclude: ["dist/**", "node_modules/**"],
     testTimeout: 30_000,
+    env: {
+      GEMINI_API_KEY: "",
+      PAYMENT_WEBHOOK_SECRET: "vitest-payment-webhook-secret-32chars",
+    },
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],

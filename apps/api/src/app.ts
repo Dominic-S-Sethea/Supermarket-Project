@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import Fastify from "fastify";
 import { env } from "./config/env.js";
 import { db } from "./db/index.js";
+import { foldStockLedger } from "./lib/stockLedger.js";
 import { registerAuthHook } from "./plugins/auth.js";
 import { registerMetrics } from "./plugins/metrics.js";
 import {
@@ -179,25 +180,7 @@ export async function buildApp(logger = true) {
   if (!process.env.VITEST) {
     const foldTimer = setInterval(async () => {
       try {
-        await db.execute(sql`
-          WITH batch AS (
-            UPDATE stock_movements
-            SET folded = true
-            WHERE folded = false
-            RETURNING product_id, qty_delta
-          ),
-          agg AS (
-            SELECT product_id, SUM(qty_delta)::int AS total_delta
-            FROM batch
-            GROUP BY product_id
-          )
-          INSERT INTO stock_baselines (product_id, quantity, updated_at)
-          SELECT product_id, total_delta, now() FROM agg
-          ON CONFLICT (product_id)
-          DO UPDATE SET
-            quantity = stock_baselines.quantity + EXCLUDED.quantity,
-            updated_at = now();
-        `);
+        await foldStockLedger(db);
       } catch (err) {
         app.log.warn({ err }, "Background ledger fold skipped");
       }
