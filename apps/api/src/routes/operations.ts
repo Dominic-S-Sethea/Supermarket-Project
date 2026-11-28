@@ -2,6 +2,8 @@ import type { FastifyInstance } from "fastify";
 import {
   ApplyDynamicMarkdownSchema,
   CompleteFloorTaskSchema,
+  computeInventoryValueCents,
+  computeMovingWeightedAvgCostCents,
   computeSuggestedSellPriceCents,
   computeWeightedPriceCents,
   CreateRecipeSchema,
@@ -10,9 +12,10 @@ import {
   generateUuidV7,
   LogProductionBatchSchema,
   PrintShelfTagBatchSchema,
+  type UnitMode,
   UpdateStaffingPlanSchema,
 } from "@supermarket/shared";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   analyticsDynamicMarkdowns,
@@ -39,6 +42,7 @@ import {
   users,
 } from "../db/index.js";
 import { buildZplBarcodeCommand, sanitizeZpl } from "../lib/helpers.js";
+import { depleteFefoBatchesTx, getLiveStockForProductsTx } from "../lib/stockLedger.js";
 import { requireRole } from "../plugins/auth.js";
 
 const UuidSchema = z.string().uuid();
@@ -70,7 +74,7 @@ export async function operationsRoutes(app: FastifyInstance) {
         conditions.push(eq(analyticsPhantomStock.status, q.status));
       }
 
-      const items = await db
+      const rawItems = await db
         .select({
           productId: analyticsPhantomStock.productId,
           sku: products.sku,
@@ -95,6 +99,15 @@ export async function operationsRoutes(app: FastifyInstance) {
         .where(conditions.length > 0 ? and(...conditions) : undefined)
         .orderBy(desc(analyticsPhantomStock.phantomProb))
         .limit(80);
+
+      const canSeeFinancials =
+        req.authUser?.role === "owner" ||
+        req.authUser?.role === "manager" ||
+        req.authUser?.role === "accountant";
+
+      const items = canSeeFinancials
+        ? rawItems
+        : rawItems.map(({ avgCostCents: _ac, estimatedValueAtRiskCents: _ev, ...pub }) => pub);
 
       const aggRows = await db
         .select({
@@ -125,7 +138,7 @@ export async function operationsRoutes(app: FastifyInstance) {
           totalFlagged,
           openCount,
           verifiedCount: totalFlagged - openCount,
-          openAtRiskCents,
+          ...(canSeeFinancials ? { openAtRiskCents } : {}),
           avgPhantomProb: totalFlagged > 0 ? Number((weightedProbSum / totalFlagged).toFixed(3)) : 0,
         },
         items,
@@ -150,6 +163,7 @@ export async function operationsRoutes(app: FastifyInstance) {
           .select({
             id: products.id,
             sku: products.sku,
+            unitMode: products.unitMode,
             avgCostCents: products.avgCostCents,
           })
           .from(products)
@@ -164,19 +178,8 @@ export async function operationsRoutes(app: FastifyInstance) {
           .for("update");
         if (!phantom) return { notFound: "phantom" as const };
 
-        const [baseline] = await tx
-          .select({ quantity: stockBaselines.quantity })
-          .from(stockBaselines)
-          .where(eq(stockBaselines.productId, productId))
-          .limit(1);
-        const [unfolded] = await tx
-          .select({
-            delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
-          })
-          .from(stockMovements)
-          .where(and(eq(stockMovements.productId, productId), eq(stockMovements.folded, false)));
-
-        const expectedUnits = Number(baseline?.quantity ?? 0) + Number(unfolded?.delta ?? 0);
+        const liveMap = await getLiveStockForProductsTx(tx, [productId]);
+        const expectedUnits = liveMap.get(productId) ?? 0;
         const countedUnits =
           parsed.data.markVerifiedOk && parsed.data.countedBaseUnits === undefined
             ? expectedUnits
@@ -185,7 +188,7 @@ export async function operationsRoutes(app: FastifyInstance) {
         const nextStatus =
           parsed.data.markVerifiedOk || varianceUnits === 0 ? "verified_ok" : "recounted";
 
-        if (varianceUnits !== 0) {
+        if (varianceUnits > 0) {
           await tx.insert(stockMovements).values({
             id: generateUuidV7(),
             productId,
@@ -194,6 +197,31 @@ export async function operationsRoutes(app: FastifyInstance) {
             reason: "count_adj",
             folded: false,
           });
+        } else if (varianceUnits < 0) {
+          const fefoRes = await depleteFefoBatchesTx(tx, productId, Math.abs(varianceUnits));
+          const adjMovements: (typeof stockMovements.$inferInsert)[] = fefoRes.allocations.map((a) => ({
+            id: generateUuidV7(),
+            productId,
+            batchId: a.batchId,
+            qtyDelta: -a.qty,
+            unitCostCents: lockedProd.avgCostCents,
+            reason: "count_adj",
+            folded: false,
+          }));
+          if (fefoRes.unbatchedRemainder > 0) {
+            adjMovements.push({
+              id: generateUuidV7(),
+              productId,
+              batchId: null,
+              qtyDelta: -fefoRes.unbatchedRemainder,
+              unitCostCents: lockedProd.avgCostCents,
+              reason: "count_adj",
+              folded: false,
+            });
+          }
+          if (adjMovements.length > 0) {
+            await tx.insert(stockMovements).values(adjMovements);
+          }
         }
 
         await tx
@@ -227,7 +255,11 @@ export async function operationsRoutes(app: FastifyInstance) {
           expectedUnits,
           countedUnits,
           varianceUnits,
-          varianceCostCents: varianceUnits * lockedProd.avgCostCents,
+          varianceCostCents: computeInventoryValueCents(
+            varianceUnits,
+            lockedProd.avgCostCents,
+            lockedProd.unitMode as UnitMode
+          ),
         };
       });
 
@@ -289,10 +321,24 @@ export async function operationsRoutes(app: FastifyInstance) {
         .orderBy(asc(analyticsDynamicMarkdowns.daysLeft), desc(analyticsDynamicMarkdowns.expectedRecoveryCents))
         .limit(80);
 
-      const items = rows.map((r) => ({
-        ...r,
-        incrementalRecoveryCents: r.expectedRecoveryCents - r.baselineNoPromoRecoveryCents,
-      }));
+      const canSeeFinancials =
+        req.authUser?.role === "owner" ||
+        req.authUser?.role === "manager" ||
+        req.authUser?.role === "accountant";
+
+      const items = rows.map((r) => {
+        if (!canSeeFinancials) {
+          const { unitCostCents: _uc, ...pub } = r;
+          return {
+            ...pub,
+            incrementalRecoveryCents: r.expectedRecoveryCents - r.baselineNoPromoRecoveryCents,
+          };
+        }
+        return {
+          ...r,
+          incrementalRecoveryCents: r.expectedRecoveryCents - r.baselineNoPromoRecoveryCents,
+        };
+      });
 
       const aggRows = await db
         .select({
@@ -452,6 +498,7 @@ export async function operationsRoutes(app: FastifyInstance) {
             rulesJson: {
               productIds: [lockedBatch.productId],
               discountBp: effectiveDiscountBp,
+              batchId: lockedBatch.id,
             },
           })
           .returning();
@@ -845,21 +892,27 @@ ${buildZplBarcodeCommand(r.barcode)}
         return reply.status(400).send({ error: "Provide at least one field to update." });
       }
 
-      const [updated] = await db
-        .update(shiftRosters)
-        .set(patch)
-        .where(eq(shiftRosters.id, id))
-        .returning();
+      const actor = req.authUser!;
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(shiftRosters)
+          .set(patch)
+          .where(eq(shiftRosters.id, id))
+          .returning();
+        if (!row) return null;
+
+        await tx.insert(auditLogs).values({
+          actor: actor.fullName,
+          actorUserId: actor.id,
+          action: "staffing_slot_update",
+          entityType: "shift_roster",
+          entityId: row.id,
+          detailsJson: patch,
+        });
+        return row;
+      });
 
       if (!updated) return reply.status(404).send({ error: "Staffing slot not found." });
-
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: "staffing_slot_update",
-        entityType: "shift_roster",
-        entityId: updated.id,
-        detailsJson: patch,
-      });
 
       return { slot: updated };
     }
@@ -968,23 +1021,11 @@ ${buildZplBarcodeCommand(r.barcode)}
             .where(eq(products.id, task.productId))
             .for("update");
           if (lockedProd) {
-            const [baseline] = await tx
-              .select({ quantity: stockBaselines.quantity })
-              .from(stockBaselines)
-              .where(eq(stockBaselines.productId, lockedProd.id))
-              .limit(1);
-            const [unfolded] = await tx
-              .select({
-                delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
-              })
-              .from(stockMovements)
-              .where(
-                and(eq(stockMovements.productId, lockedProd.id), eq(stockMovements.folded, false))
-              );
-            const expected = Number(baseline?.quantity ?? 0) + Number(unfolded?.delta ?? 0);
+            const liveMap = await getLiveStockForProductsTx(tx, [lockedProd.id]);
+            const expected = liveMap.get(lockedProd.id) ?? 0;
             const variance = parsed.data.actualQty - expected;
             stockVarianceUnits = variance;
-            if (variance !== 0) {
+            if (variance > 0) {
               await tx.insert(stockMovements).values({
                 id: generateUuidV7(),
                 productId: lockedProd.id,
@@ -993,6 +1034,33 @@ ${buildZplBarcodeCommand(r.barcode)}
                 reason: "count_adj",
                 folded: false,
               });
+            } else if (variance < 0) {
+              const fefoRes = await depleteFefoBatchesTx(tx, lockedProd.id, Math.abs(variance));
+              const adjMovements: (typeof stockMovements.$inferInsert)[] = fefoRes.allocations.map(
+                (a) => ({
+                  id: generateUuidV7(),
+                  productId: lockedProd.id,
+                  batchId: a.batchId,
+                  qtyDelta: -a.qty,
+                  unitCostCents: lockedProd.avgCostCents,
+                  reason: "count_adj",
+                  folded: false,
+                })
+              );
+              if (fefoRes.unbatchedRemainder > 0) {
+                adjMovements.push({
+                  id: generateUuidV7(),
+                  productId: lockedProd.id,
+                  batchId: null,
+                  qtyDelta: -fefoRes.unbatchedRemainder,
+                  unitCostCents: lockedProd.avgCostCents,
+                  reason: "count_adj",
+                  folded: false,
+                });
+              }
+              if (adjMovements.length > 0) {
+                await tx.insert(stockMovements).values(adjMovements);
+              }
             }
             await tx
               .update(analyticsPhantomStock)
@@ -1046,7 +1114,11 @@ ${buildZplBarcodeCommand(r.barcode)}
   app.get(
     "/api/operations/recipes",
     { preHandler: [requireRole(["owner", "manager", "stock_clerk"])] },
-    async () => {
+    async (req) => {
+      const canSeeFinancials =
+        req.authUser?.role === "owner" ||
+        req.authUser?.role === "manager" ||
+        req.authUser?.role === "accountant";
       const [recipeRows, ingRows, batchRows] = await Promise.all([
         db
           .select({
@@ -1129,14 +1201,27 @@ ${buildZplBarcodeCommand(r.barcode)}
           const lineCostCents = isMeasured
             ? computeWeightedPriceCents(i.qtyBaseUnits, i.avgCostCents)
             : i.qtyBaseUnits * i.avgCostCents;
+          if (!canSeeFinancials) {
+            const { avgCostCents: _ac, ...pub } = i;
+            return {
+              ...pub,
+              onHandUnits: Number(i.onHandUnits ?? 0),
+            };
+          }
           return {
             ...i,
             onHandUnits: Number(i.onHandUnits ?? 0),
             estimatedLineCostCents: lineCostCents,
           };
         });
+        if (!canSeeFinancials) {
+          return {
+            ...r,
+            ingredients,
+          };
+        }
         const estimatedBatchCostCents = ingredients.reduce(
-          (s, i) => s + i.estimatedLineCostCents,
+          (s, i) => s + ((i as { estimatedLineCostCents?: number }).estimatedLineCostCents ?? 0),
           0
         );
         return {
@@ -1146,7 +1231,13 @@ ${buildZplBarcodeCommand(r.barcode)}
         };
       });
 
-      return { recipes: enrichedRecipes, recentBatches: batchRows };
+      const visibleBatches = canSeeFinancials
+        ? batchRows
+        : batchRows.map(
+            ({ totalIngredientCostCents: _tc, effectiveUnitCostCents: _ec, ...pub }) => pub
+          );
+
+      return { recipes: enrichedRecipes, recentBatches: visibleBatches };
     }
   );
 
@@ -1159,6 +1250,17 @@ ${buildZplBarcodeCommand(r.barcode)}
         return reply.status(400).send({ error: parsed.error.flatten() });
       }
       const data = parsed.data;
+      if (data.ingredients.some((i) => i.ingredientProductId === data.outputProductId)) {
+        return reply.status(400).send({
+          error: "A recipe cannot list its own outputProductId as an ingredient.",
+        });
+      }
+      const uniqueIngs = new Set(data.ingredients.map((i) => i.ingredientProductId));
+      if (uniqueIngs.size !== data.ingredients.length) {
+        return reply.status(400).send({
+          error: "Duplicate ingredientProductId entries are not allowed in a recipe.",
+        });
+      }
       const allProductIds = Array.from(
         new Set([data.outputProductId, ...data.ingredients.map((i) => i.ingredientProductId)])
       );
@@ -1225,6 +1327,12 @@ ${buildZplBarcodeCommand(r.barcode)}
         if (!rec) {
           return { errorStatus: 404 as const, error: "Recipe not found." };
         }
+        if (!rec.active) {
+          return {
+            errorStatus: 409 as const,
+            error: "Cannot log production against an inactive recipe.",
+          };
+        }
 
         const [outProd] = await tx
           .select({
@@ -1240,6 +1348,8 @@ ${buildZplBarcodeCommand(r.barcode)}
         if (!outProd) {
           return { errorStatus: 404 as const, error: "Output product not found." };
         }
+        const outStockMap = await getLiveStockForProductsTx(tx, [outProd.id]);
+        const currentOutStock = outStockMap.get(outProd.id) ?? 0;
 
         const ings = await tx
           .select({
@@ -1268,52 +1378,33 @@ ${buildZplBarcodeCommand(r.barcode)}
             : consumeUnits * ing.avgCostCents;
           totalIngredientCostCents += lineCost;
 
-          let remaining = consumeUnits;
-          const fefoBatches = await tx
-            .select()
-            .from(inventoryBatches)
-            .where(
-              and(
-                eq(inventoryBatches.productId, ing.ingredientProductId),
-                gt(inventoryBatches.qtyRemaining, 0),
-                sql`${inventoryBatches.status} IN ('active', 'clearance')`
-              )
-            )
-            .orderBy(asc(inventoryBatches.bestBeforeDate), asc(inventoryBatches.id))
-            .for("update");
-
-          for (const b of fefoBatches) {
-            if (remaining <= 0) break;
-            const take = Math.min(remaining, b.qtyRemaining);
-            const nextQty = b.qtyRemaining - take;
-            await tx
-              .update(inventoryBatches)
-              .set({ qtyRemaining: nextQty, status: nextQty === 0 ? "depleted" : b.status })
-              .where(eq(inventoryBatches.id, b.id));
-            await tx.insert(stockMovements).values({
+          const fefoRes = await depleteFefoBatchesTx(tx, ing.ingredientProductId, consumeUnits);
+          const ingMovements: (typeof stockMovements.$inferInsert)[] = fefoRes.allocations.map(
+            (a) => ({
               id: generateUuidV7(),
               productId: ing.ingredientProductId,
-              batchId: b.id,
-              qtyDelta: -take,
+              batchId: a.batchId,
+              qtyDelta: -a.qty,
               unitCostCents: ing.avgCostCents,
               reason: "production_out",
               refId: batchId,
               folded: false,
-            });
-            remaining -= take;
-          }
-
-          if (remaining > 0) {
-            await tx.insert(stockMovements).values({
+            })
+          );
+          if (fefoRes.unbatchedRemainder > 0) {
+            ingMovements.push({
               id: generateUuidV7(),
               productId: ing.ingredientProductId,
               batchId: null,
-              qtyDelta: -remaining,
+              qtyDelta: -fefoRes.unbatchedRemainder,
               unitCostCents: ing.avgCostCents,
               reason: "production_out",
               refId: batchId,
               folded: false,
             });
+          }
+          if (ingMovements.length > 0) {
+            await tx.insert(stockMovements).values(ingMovements);
           }
         }
 
@@ -1357,19 +1448,17 @@ ${buildZplBarcodeCommand(r.barcode)}
           folded: false,
         });
 
-        // 4. Record trim/spoilage waste movement if > 0 (net-zero on stock, audited cost signal)
-        if (data.trimWasteUnits > 0) {
-          await tx.insert(stockMovements).values({
-            id: generateUuidV7(),
-            productId: outProd.id,
-            batchId: newFefoBatch.id,
-            qtyDelta: 0,
-            unitCostCents: effectiveUnitCostCents,
-            reason: "trim_waste",
-            refId: batchId,
-            folded: false,
-          });
-        }
+        // Update finished product MWAC using pre-production live stock + newly produced batch cost
+        const updatedAvgCostCents = computeMovingWeightedAvgCostCents(
+          currentOutStock,
+          outProd.avgCostCents,
+          data.actualOutputUnits,
+          effectiveUnitCostCents
+        );
+        await tx
+          .update(products)
+          .set({ avgCostCents: updatedAvgCostCents, updatedAt: new Date() })
+          .where(eq(products.id, outProd.id));
 
         const [logged] = await tx
           .insert(productionBatches)

@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, gte, lte, sql, type SQL } from "drizzle-orm";
 import {
   auditLogs,
   db,
@@ -14,6 +14,30 @@ import { env } from "../config/env.js";
 import { buildCsvDocument } from "../lib/helpers.js";
 import { requireRole } from "../plugins/auth.js";
 import { createRateLimiter } from "../plugins/security.js";
+
+function parseDateRangeBounds(q: { from?: string; to?: string }): {
+  fromDate?: Date;
+  toDate?: Date;
+  error?: string;
+} {
+  let fromDate: Date | undefined;
+  let toDate: Date | undefined;
+  if (q.from) {
+    const t = Date.parse(q.from);
+    if (!Number.isFinite(t)) return { error: "Invalid 'from' date parameter." };
+    fromDate = new Date(t);
+  }
+  if (q.to) {
+    const raw = q.to.trim();
+    const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T23:59:59.999Z` : raw);
+    if (!Number.isFinite(t)) return { error: "Invalid 'to' date parameter." };
+    toDate = new Date(t);
+  }
+  if (fromDate && toDate && fromDate.getTime() > toDate.getTime()) {
+    return { error: "'from' date must be before or equal to 'to' date." };
+  }
+  return { fromDate, toDate };
+}
 
 export async function exportRoutes(app: FastifyInstance) {
   const exportLimiter = createRateLimiter({
@@ -106,31 +130,47 @@ export async function exportRoutes(app: FastifyInstance) {
   app.get(
     "/api/exports/supplier-variances.csv",
     { preHandler: financeRoles },
-    async (_req, reply) => {
-      const rows = await db
-        .select({
-          createdAt: grnVariances.createdAt,
-          supplierName: suppliers.name,
-          poNumber: purchaseOrders.poNumber,
-          invoiceNumber: goodsReceipts.invoiceNumber,
-          sku: products.sku,
-          productName: products.name,
-          varianceType: grnVariances.varianceType,
-          orderedQtyUnits: grnVariances.orderedQtyUnits,
-          receivedQtyUnits: grnVariances.receivedQtyUnits,
-          poUnitCostCents: grnVariances.poUnitCostCents,
-          invoiceUnitCostCents: grnVariances.invoiceUnitCostCents,
-          financialImpactCents: grnVariances.financialImpactCents,
-          status: grnVariances.status,
-          resolutionNote: grnVariances.resolutionNote,
-        })
-        .from(grnVariances)
-        .innerJoin(suppliers, eq(grnVariances.supplierId, suppliers.id))
-        .innerJoin(products, eq(grnVariances.productId, products.id))
-        .innerJoin(goodsReceipts, eq(grnVariances.grnId, goodsReceipts.id))
-        .leftJoin(purchaseOrders, eq(grnVariances.poId, purchaseOrders.id))
-        .orderBy(desc(grnVariances.createdAt))
-        .limit(500);
+    async (req, reply) => {
+      const range = parseDateRangeBounds(req.query as { from?: string; to?: string });
+      if (range.error) return reply.status(400).send({ error: range.error });
+      const conds: SQL[] = [];
+      if (range.fromDate) conds.push(gte(grnVariances.createdAt, range.fromDate));
+      if (range.toDate) conds.push(lte(grnVariances.createdAt, range.toDate));
+      const whereClause = conds.length > 0 ? and(...conds) : undefined;
+      const limitRows = 2000;
+
+      const [rows, countRes] = await Promise.all([
+        db
+          .select({
+            createdAt: grnVariances.createdAt,
+            supplierName: suppliers.name,
+            poNumber: purchaseOrders.poNumber,
+            invoiceNumber: goodsReceipts.invoiceNumber,
+            sku: products.sku,
+            productName: products.name,
+            varianceType: grnVariances.varianceType,
+            orderedQtyUnits: grnVariances.orderedQtyUnits,
+            receivedQtyUnits: grnVariances.receivedQtyUnits,
+            poUnitCostCents: grnVariances.poUnitCostCents,
+            invoiceUnitCostCents: grnVariances.invoiceUnitCostCents,
+            financialImpactCents: grnVariances.financialImpactCents,
+            status: grnVariances.status,
+            resolutionNote: grnVariances.resolutionNote,
+          })
+          .from(grnVariances)
+          .innerJoin(suppliers, eq(grnVariances.supplierId, suppliers.id))
+          .innerJoin(products, eq(grnVariances.productId, products.id))
+          .innerJoin(goodsReceipts, eq(grnVariances.grnId, goodsReceipts.id))
+          .leftJoin(purchaseOrders, eq(grnVariances.poId, purchaseOrders.id))
+          .where(whereClause)
+          .orderBy(desc(grnVariances.createdAt))
+          .limit(limitRows),
+        db
+          .select({ total: sql<number>`count(*)::int` })
+          .from(grnVariances)
+          .where(whereClause),
+      ]);
+      const totalCount = Number(countRes[0]?.total ?? rows.length);
 
       const toUsd = (c: number) => (c / 100).toFixed(2);
       const csv = buildCsvDocument(
@@ -169,6 +209,9 @@ export async function exportRoutes(app: FastifyInstance) {
       );
 
       reply.header("Content-Type", "text/csv; charset=utf-8");
+      reply.header("X-Row-Count", String(rows.length));
+      reply.header("X-Total-Count", String(totalCount));
+      reply.header("X-Truncated", String(totalCount > rows.length));
       reply.header(
         "Content-Disposition",
         `attachment; filename="supermarket-os-supplier-variances-${new Date().toISOString().slice(0, 10)}.csv"`
@@ -178,12 +221,28 @@ export async function exportRoutes(app: FastifyInstance) {
   );
 
   // 3. Z-Report Blind Shift Closeout Register CSV
-  app.get("/api/exports/shifts.csv", { preHandler: financeRoles }, async (_req, reply) => {
-    const rows = await db
-      .select()
-      .from(posShifts)
-      .orderBy(desc(posShifts.openedAt))
-      .limit(500);
+  app.get("/api/exports/shifts.csv", { preHandler: financeRoles }, async (req, reply) => {
+    const range = parseDateRangeBounds(req.query as { from?: string; to?: string });
+    if (range.error) return reply.status(400).send({ error: range.error });
+    const conds: SQL[] = [];
+    if (range.fromDate) conds.push(gte(posShifts.openedAt, range.fromDate));
+    if (range.toDate) conds.push(lte(posShifts.openedAt, range.toDate));
+    const whereClause = conds.length > 0 ? and(...conds) : undefined;
+    const limitRows = 2000;
+
+    const [rows, countRes] = await Promise.all([
+      db
+        .select()
+        .from(posShifts)
+        .where(whereClause)
+        .orderBy(desc(posShifts.openedAt))
+        .limit(limitRows),
+      db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(posShifts)
+        .where(whereClause),
+    ]);
+    const totalCount = Number(countRes[0]?.total ?? rows.length);
 
     const toUsd = (c: number | null) => (c === null ? "" : (c / 100).toFixed(2));
     const csv = buildCsvDocument(
@@ -214,6 +273,9 @@ export async function exportRoutes(app: FastifyInstance) {
     );
 
     reply.header("Content-Type", "text/csv; charset=utf-8");
+    reply.header("X-Row-Count", String(rows.length));
+    reply.header("X-Total-Count", String(totalCount));
+    reply.header("X-Truncated", String(totalCount > rows.length));
     reply.header(
       "Content-Disposition",
       `attachment; filename="supermarket-os-z-reports-${new Date().toISOString().slice(0, 10)}.csv"`
@@ -222,12 +284,28 @@ export async function exportRoutes(app: FastifyInstance) {
   });
 
   // 4. Immutable Compliance Audit Trail CSV
-  app.get("/api/exports/audit-logs.csv", { preHandler: financeRoles }, async (_req, reply) => {
-    const rows = await db
-      .select()
-      .from(auditLogs)
-      .orderBy(desc(auditLogs.createdAt))
-      .limit(1000);
+  app.get("/api/exports/audit-logs.csv", { preHandler: financeRoles }, async (req, reply) => {
+    const range = parseDateRangeBounds(req.query as { from?: string; to?: string });
+    if (range.error) return reply.status(400).send({ error: range.error });
+    const conds: SQL[] = [];
+    if (range.fromDate) conds.push(gte(auditLogs.createdAt, range.fromDate));
+    if (range.toDate) conds.push(lte(auditLogs.createdAt, range.toDate));
+    const whereClause = conds.length > 0 ? and(...conds) : undefined;
+    const limitRows = 5000;
+
+    const [rows, countRes] = await Promise.all([
+      db
+        .select()
+        .from(auditLogs)
+        .where(whereClause)
+        .orderBy(desc(auditLogs.createdAt))
+        .limit(limitRows),
+      db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(auditLogs)
+        .where(whereClause),
+    ]);
+    const totalCount = Number(countRes[0]?.total ?? rows.length);
 
     const csv = buildCsvDocument(
       ["Timestamp", "Actor", "Action", "EntityType", "EntityId", "DetailsJSON"],
@@ -242,6 +320,9 @@ export async function exportRoutes(app: FastifyInstance) {
     );
 
     reply.header("Content-Type", "text/csv; charset=utf-8");
+    reply.header("X-Row-Count", String(rows.length));
+    reply.header("X-Total-Count", String(totalCount));
+    reply.header("X-Truncated", String(totalCount > rows.length));
     reply.header(
       "Content-Disposition",
       `attachment; filename="supermarket-os-audit-logs-${new Date().toISOString().slice(0, 10)}.csv"`
@@ -342,6 +423,7 @@ export async function exportRoutes(app: FastifyInstance) {
         "/auth/logout": { post: { summary: "Revoke active session", tags: ["Auth"] } },
         "/auth/me": { get: { summary: "Current authenticated staff profile", tags: ["Auth"] } },
         "/auth/change-pin": { post: { summary: "Self-service PIN rotation", tags: ["Auth"] } },
+        "/auth/verify-override": { post: { summary: "Issue single-use supervisor override token", tags: ["Auth", "POS"] } },
         "/meta": { get: { summary: "Role-scoped catalog metadata (departments, categories, tax rates, active promos)", tags: ["Catalog"] } },
         "/products": {
           get: { summary: "Paginated 3,120+ SKU catalog with live stock & net margin", tags: ["Catalog"] },
@@ -369,8 +451,18 @@ export async function exportRoutes(app: FastifyInstance) {
         "/pos/shifts": { get: { summary: "List recent register shifts", tags: ["POS"] } },
         "/pos/shifts/active": { get: { summary: "Get active open shift for register", tags: ["POS"] } },
         "/pos/shifts/open": { post: { summary: "Open register shift", tags: ["POS"] } },
+        "/pos/shifts/{id}/cash-drop": { post: { summary: "Record audited cash drawer skim/drop", tags: ["POS"] } },
         "/pos/shifts/close": { post: { summary: "Blind cash closeout (Z-Report)", tags: ["POS"] } },
         "/pos/shifts/summary": { get: { summary: "Cashier Z-Report variance scorecard", tags: ["POS"] } },
+        "/pos/payment-intents": { post: { summary: "Create dynamic EMVCo QR or terminal payment intent", tags: ["POS", "Payments"] } },
+        "/pos/parked-baskets": {
+          get: { summary: "List active parked baskets", tags: ["POS"] },
+          post: { summary: "Park active customer basket", tags: ["POS"] },
+        },
+        "/store-settings": {
+          get: { summary: "Read flagship store, FX and SE Asia QR settings", tags: ["Admin", "POS"] },
+          patch: { summary: "Update store identity, FX rates and payment rails", tags: ["Admin"] },
+        },
         "/purchasing/orders": {
           get: { summary: "List persistent purchase orders", tags: ["Purchasing"] },
           post: { summary: "Create purchase order", tags: ["Purchasing"] },
@@ -407,6 +499,13 @@ export async function exportRoutes(app: FastifyInstance) {
         "/operations/staffing-plan/{id}": { patch: { summary: "Assign staff or update lane slot status", tags: ["Operations"] } },
         "/operations/tasks": { get: { summary: "Daily floor task checklist", tags: ["Operations"] } },
         "/operations/tasks/{id}/complete": { post: { summary: "Complete floor task + optional blind count", tags: ["Operations"] } },
+        "/operations/recipes": {
+          get: { summary: "List Fresh BOM recipes & recent production runs", tags: ["Operations"] },
+          post: { summary: "Create Fresh BOM recipe", tags: ["Operations"] },
+        },
+        "/operations/production-batches": {
+          post: { summary: "Log bakery/butcher/deli production batch & update MWAC", tags: ["Operations"] },
+        },
         "/analytics/overview": { get: { summary: "Executive KPIs, daily trend, hourly traffic & payment mix", tags: ["Analytics"] } },
         "/analytics/departments": { get: { summary: "Department profitability, GMROII & inventory turns", tags: ["Analytics"] } },
         "/analytics/abc-xyz": { get: { summary: "ABC-XYZ 3x3 segmentation matrix & SKU rankings", tags: ["Analytics"] } },
@@ -432,10 +531,10 @@ export async function exportRoutes(app: FastifyInstance) {
         "/ai/chat/stream": { post: { summary: "SSE streaming AI Copilot turn", tags: ["AI"] } },
         "/ai/actions/{id}/execute": { post: { summary: "Human-in-the-loop approval & execution of AI proposal", tags: ["AI"] } },
         "/ai/actions/{id}/reject": { post: { summary: "Reject pending AI Copilot proposal", tags: ["AI"] } },
-        "/ai/briefing/today": { get: { summary: "Daily executive AI morning briefing", tags: ["AI"] } },
+        "/ai/briefing": { get: { summary: "Daily executive AI morning briefing", tags: ["AI"] } },
         "/ai/search/semantic": { get: { summary: "Semantic vector catalog search", tags: ["AI", "Catalog"] } },
         "/ai/embeddings/sync": { post: { summary: "Rebuild product semantic embeddings index", tags: ["AI"] } },
-        "/ai/invoice/parse": { post: { summary: "OCR / structured supplier invoice parser for GRN", tags: ["AI", "Purchasing"] } },
+        "/ai/grn/parse-invoice": { post: { summary: "OCR / structured supplier invoice parser for GRN", tags: ["AI", "Purchasing"] } },
         "/ai/triage": { post: { summary: "Calibrated AI anomaly/discrepancy triage", tags: ["AI"] } },
         "/admin/users": {
           get: { summary: "List staff accounts & active session counts", tags: ["Admin"] },
@@ -443,6 +542,9 @@ export async function exportRoutes(app: FastifyInstance) {
         },
         "/admin/users/{id}": { patch: { summary: "Update staff role/status or reset PIN", tags: ["Admin"] } },
         "/admin/users/{id}/revoke-sessions": { post: { summary: "Revoke all active sessions for user", tags: ["Admin"] } },
+        "/admin/users/{id}/unlock": { post: { summary: "Unlock a rate-locked staff user account", tags: ["Admin"] } },
+        "/admin/customers/{id}/anonymize": { post: { summary: "Pseudonymize loyalty customer PII while preserving financial ledgers", tags: ["Admin", "Privacy"] } },
+        "/admin/retention/purge": { post: { summary: "Purge expired user sessions and aged unreferenced AI chat messages", tags: ["Admin", "Privacy"] } },
         "/admin/audit-logs": { get: { summary: "Paginated immutable audit trail", tags: ["Admin"] } },
         "/admin/pipeline-runs": { get: { summary: "ML analytics pipeline run telemetry & 12-check data-quality contracts", tags: ["Admin", "Analytics"] } },
         "/exports/accounting.csv": { get: { summary: "Accounting journal CSV", tags: ["Exports"] } },

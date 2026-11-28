@@ -1,24 +1,20 @@
 import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import {
+  computeInventoryValueCents,
   computeTaxCents,
   computeWeightedPriceCents,
-  CreatePaymentIntentSchema,
   deriveWeightFromPriceGrams,
   evaluateCart,
-  generateQrMatrix,
   generateUuidV7,
   normalizePluCode,
-  ParkBasketSchema,
   parseScaleBarcode,
-  PaymentWebhookSchema,
   PosSaleUploadSchema,
   type CartInputLine,
   type PromotionRule,
   type UnitMode,
 } from "@supermarket/shared";
-import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
-import { z } from "zod";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { recordPosSaleMetric } from "../plugins/metrics.js";
 import {
   analyticsBasketRules,
@@ -28,7 +24,6 @@ import {
   db,
   inventoryBatches,
   loyaltyLedger,
-  parkedBaskets,
   paymentIntents,
   posShifts,
   productBarcodes,
@@ -38,32 +33,35 @@ import {
   salePayments,
   sales,
   stockMovements,
+  supervisorOverrides,
   targetedCoupons,
   taxRates,
 } from "../db/index.js";
 import { getPgErrorCode } from "../app.js";
+import { env } from "../config/env.js";
+import { getHourInTimezone, validateSoldAtBounds } from "../lib/helpers.js";
+import { depleteFefoBatchesTx } from "../lib/stockLedger.js";
 import { requireRole } from "../plugins/auth.js";
-import {
-  generateExternalSettlementRef,
-  getOrCreateStoreSettings,
-  resolvePaymentAdapter,
-  verifyWebhookSignature,
-} from "../services/payments.js";
-
-const UuidSchema = z.string().uuid();
+import { getOrCreateStoreSettings } from "../services/payments.js";
+import { posParkedRoutes } from "./posParked.js";
+import { posPaymentRoutes } from "./posPayments.js";
+import { posShiftRoutes } from "./posShifts.js";
 
 export async function posRoutes(app: FastifyInstance) {
+  await posShiftRoutes(app);
+  await posPaymentRoutes(app);
+  await posParkedRoutes(app);
+
   // Lightweight offline-first bootstrap payload (includes fresh PLU/allergen/recall metadata, store settings, basket upsells & ETag)
   app.get(
     "/api/pos/bootstrap",
     { preHandler: [requireRole(["owner", "manager", "cashier"])] },
     async (req, reply) => {
-      const canSeeCost = req.authUser?.role === "owner" || req.authUser?.role === "manager";
       const settings = await getOrCreateStoreSettings();
       const verRes = await db.execute(sql`
         SELECT
           (SELECT count(*)::text || ':' || coalesce(max(updated_at)::text, '') || ':' || count(*) FILTER (WHERE recalled = true)::text FROM products WHERE active = true) AS p_ver,
-          (SELECT count(*)::text || ':' || coalesce(sum(sell_price_cents)::text, '0') FROM product_barcodes) AS b_ver,
+          (SELECT count(*)::text || ':' || coalesce(sum(pb.sell_price_cents)::text, '0') || ':' || coalesce(sum(pb.pack_qty)::text, '0') FROM product_barcodes pb JOIN products p ON p.id = pb.product_id WHERE p.active = true) AS b_ver,
           (SELECT count(*)::text || ':' || coalesce(max(starts_at)::text, '') || ':' || coalesce(max(ends_at)::text, '') FROM promotions WHERE active = true) AS pr_ver,
           (SELECT count(*)::text FROM tax_rates) AS t_ver,
           (SELECT count(*)::text FROM categories) AS c_ver,
@@ -74,7 +72,7 @@ export async function posRoutes(app: FastifyInstance) {
       const etagHash = crypto
         .createHash("sha256")
         .update(
-          `${canSeeCost ? "mgr" : "cash"}|${vRow.p_ver}|${vRow.b_ver}|${vRow.pr_ver}|${vRow.t_ver}|${vRow.c_ver}|${vRow.r_ver}|${vRow.s_ver}`
+          `pos|${vRow.p_ver}|${vRow.b_ver}|${vRow.pr_ver}|${vRow.t_ver}|${vRow.c_ver}|${vRow.r_ver}|${vRow.s_ver}`
         )
         .digest("hex")
         .slice(0, 24);
@@ -105,7 +103,6 @@ export async function posRoutes(app: FastifyInstance) {
             allergens: products.allergensJson,
             recalled: products.recalled,
             recallReason: products.recallReason,
-            avgCostCents: products.avgCostCents,
             requiresAgeCheck: products.requiresAgeCheck,
             aisleLocation: products.aisleLocation,
           })
@@ -121,7 +118,9 @@ export async function posRoutes(app: FastifyInstance) {
             sellPriceCents: productBarcodes.sellPriceCents,
             isPrimary: productBarcodes.isPrimary,
           })
-          .from(productBarcodes),
+          .from(productBarcodes)
+          .innerJoin(products, eq(productBarcodes.productId, products.id))
+          .where(eq(products.active, true)),
         db.select().from(promotions).where(eq(promotions.active, true)),
         db.select().from(taxRates),
         db.select().from(categories),
@@ -144,9 +143,7 @@ export async function posRoutes(app: FastifyInstance) {
         productCount: prods.length,
         barcodeCount: bcs.length,
         storeSettings: settings,
-        products: canSeeCost
-          ? prods
-          : prods.map(({ avgCostCents: _cost, ...pub }) => pub),
+        products: prods,
         barcodes: bcs,
         promotions: promos,
         taxRates: taxes,
@@ -183,9 +180,48 @@ export async function posRoutes(app: FastifyInstance) {
         });
       }
 
+      // Early idempotency check before live price/recall/coupon validations so offline retries stay immune to catalog edits
+      const [alreadySaved] = await db
+        .select({
+          id: sales.id,
+          receiptNo: sales.receiptNo,
+          totalCents: sales.totalCents,
+        })
+        .from(sales)
+        .where(eq(sales.id, payload.id))
+        .limit(1);
+      if (alreadySaved) {
+        return reply.status(200).send({
+          id: alreadySaved.id,
+          receiptNo: alreadySaved.receiptNo,
+          duplicate: true,
+          totalCents: alreadySaved.totalCents,
+          pointsEarned: 0,
+        });
+      }
+
+      if (payload.supervisorOverrideBy && !payload.supervisorOverrideId) {
+        return reply.status(400).send({
+          error:
+            "Supervisor overrides require a server-issued supervisorOverrideId from /api/auth/verify-override.",
+        });
+      }
+
+      if (payload.kind === "sale") {
+        const bounds = validateSoldAtBounds(
+          payload.soldAt,
+          Date.now(),
+          env.posMaxBackdateHours,
+          env.posMaxFutureSkewSec
+        );
+        if (!bounds.ok) {
+          return reply.status(400).send({ error: bounds.error });
+        }
+      }
+
       // Verify referenced products, barcodes, and authoritative cost/price/tax/age/recall/weight metadata
       const uniquePids = Array.from(new Set(payload.lines.map((l) => l.productId)));
-      const [foundProds, foundBarcodes, activePromos] = await Promise.all([
+      const [foundProds, foundBarcodes, activePromos, storeSettingsRow] = await Promise.all([
         db
           .select({
             id: products.id,
@@ -218,6 +254,7 @@ export async function posRoutes(app: FastifyInstance) {
         payload.kind === "sale"
           ? db.select().from(promotions).where(eq(promotions.active, true))
           : Promise.resolve([]),
+        getOrCreateStoreSettings(),
       ]);
 
       if (foundProds.length !== uniquePids.length) {
@@ -302,6 +339,17 @@ export async function posRoutes(app: FastifyInstance) {
               });
             }
             if (scaleParsed?.kind === "price" && scaleParsed.embeddedPriceCents) {
+              if (typeof l.weightGrams === "number" && l.weightGrams > 0) {
+                const expectedEmbeddedCents = computeWeightedPriceCents(
+                  l.weightGrams,
+                  authBarcode.sellPriceCents
+                );
+                if (Math.abs(scaleParsed.embeddedPriceCents - expectedEmbeddedCents) > 1) {
+                  return reply.status(400).send({
+                    error: `Scale barcode embedded price (${scaleParsed.embeddedPriceCents}c) conflicts with weight ${l.weightGrams}g at unit price ${authBarcode.sellPriceCents}c.`,
+                  });
+                }
+              }
               embeddedPriceCents = scaleParsed.embeddedPriceCents;
               lineGross = embeddedPriceCents;
             } else {
@@ -329,13 +377,50 @@ export async function posRoutes(app: FastifyInstance) {
             baseUnitsSold = l.packQty * l.qtyPacks;
             lineCostCents = meta.avgCostCents * baseUnitsSold;
           }
-        } else if (isMeasured && effectiveWeightGrams) {
+        } else if (isMeasured) {
+          if (!effectiveWeightGrams && scaleParsed?.kind === "weight" && scaleParsed.weightGrams) {
+            effectiveWeightGrams = scaleParsed.weightGrams;
+          } else if (
+            !effectiveWeightGrams &&
+            scaleParsed?.kind === "price" &&
+            scaleParsed.embeddedPriceCents
+          ) {
+            effectiveWeightGrams = deriveWeightFromPriceGrams(
+              scaleParsed.embeddedPriceCents,
+              l.unitPriceCents
+            );
+          }
+          if (!effectiveWeightGrams || effectiveWeightGrams < 1) {
+            return reply.status(400).send({
+              error: `Measured product ${meta.sku} reversal requires weightGrams >= 1.`,
+            });
+          }
+          if (
+            scaleParsed?.kind === "price" &&
+            scaleParsed.embeddedPriceCents &&
+            typeof l.weightGrams === "number" &&
+            l.weightGrams > 0
+          ) {
+            const expectedEmbeddedCents = computeWeightedPriceCents(
+              l.weightGrams,
+              l.unitPriceCents
+            );
+            if (Math.abs(scaleParsed.embeddedPriceCents - expectedEmbeddedCents) > 1) {
+              return reply.status(400).send({
+                error: `Scale barcode embedded price (${scaleParsed.embeddedPriceCents}c) conflicts with weight ${l.weightGrams}g at unit price ${l.unitPriceCents}c.`,
+              });
+            }
+          }
           lineGross =
             scaleParsed?.kind === "price" && scaleParsed.embeddedPriceCents
               ? scaleParsed.embeddedPriceCents
               : computeWeightedPriceCents(effectiveWeightGrams, l.unitPriceCents);
           baseUnitsSold = effectiveWeightGrams;
-          lineCostCents = computeWeightedPriceCents(effectiveWeightGrams, meta.avgCostCents);
+          lineCostCents = computeInventoryValueCents(
+            effectiveWeightGrams,
+            meta.avgCostCents,
+            unitMode
+          );
         }
 
         if (l.discountCents > lineGross) {
@@ -414,6 +499,11 @@ export async function posRoutes(app: FastifyInstance) {
           error: `Payment total (${paidTotalCents}c) is less than sale total (${totalCents}c).`,
         });
       }
+      if (payload.kind !== "sale" && paidTotalCents !== totalCents) {
+        return reply.status(400).send({
+          error: `Reversal payment total (${paidTotalCents}c) must exactly equal reversal total (${totalCents}c).`,
+        });
+      }
 
       let customerSegment: string | null = null;
       if (payload.customerId) {
@@ -444,20 +534,61 @@ export async function posRoutes(app: FastifyInstance) {
 
       const sign = payload.kind === "refund" || payload.kind === "void" ? 1 : -1;
       let duplicate = false;
-      let txRejection: { status: 400 | 404 | 409; message: string } | null = null;
+      let persistedReceiptNo = payload.receiptNo;
+      let persistedTotalCents = totalCents;
+      let txRejection: { status: 400 | 403 | 404 | 409; message: string } | null = null;
       let pointsEarned = 0;
 
       try {
         await db.transaction(async (tx) => {
+          let effectiveCustomerId: string | null =
+            payload.kind === "sale" ? (payload.customerId ?? null) : null;
+          let pointsToRestore = 0;
           // Idempotent insert by client UUIDv7 primary key
           const [existingById] = await tx
-            .select({ id: sales.id })
+            .select({
+              id: sales.id,
+              receiptNo: sales.receiptNo,
+              totalCents: sales.totalCents,
+            })
             .from(sales)
             .where(eq(sales.id, payload.id))
             .limit(1);
           if (existingById) {
             duplicate = true;
+            persistedReceiptNo = existingById.receiptNo;
+            persistedTotalCents = existingById.totalCents;
             return;
+          }
+
+          if (payload.shiftId) {
+            const [refShift] = await tx
+              .select({
+                id: posShifts.id,
+                registerCode: posShifts.registerCode,
+                closedAt: posShifts.closedAt,
+              })
+              .from(posShifts)
+              .where(eq(posShifts.id, payload.shiftId))
+              .limit(1);
+            if (!refShift) {
+              txRejection = { status: 404, message: "Referenced shiftId was not found." };
+              return;
+            }
+            if (refShift.closedAt !== null) {
+              txRejection = {
+                status: 409,
+                message: "Cannot attach a sale or reversal to an already closed shift.",
+              };
+              return;
+            }
+            if (refShift.registerCode !== payload.registerCode) {
+              txRejection = {
+                status: 409,
+                message: `Referenced shift belongs to register "${refShift.registerCode}", not "${payload.registerCode}".`,
+              };
+              return;
+            }
           }
 
           // Row-lock original sale for voids/refunds to eliminate concurrent double-void and over-refund races
@@ -478,6 +609,7 @@ export async function posRoutes(app: FastifyInstance) {
               };
               return;
             }
+            effectiveCustomerId = orig.customerId ?? null;
 
             const priorReversals = await tx
               .select({ id: sales.id, kind: sales.kind, totalCents: sales.totalCents })
@@ -513,11 +645,12 @@ export async function posRoutes(app: FastifyInstance) {
                     .where(inArray(saleLines.saleId, priorRefundIds))
                 : [];
 
-            // Aggregate original and already-refunded quantities per (productId, scannedBarcode)
+            // Aggregate original and already-refunded quantities (including weighed baseUnitsSold) per (productId, scannedBarcode)
             const origAgg = new Map<
               string,
               {
                 qtyPacks: number;
+                baseUnitsSold: number;
                 packQty: number;
                 unitPriceCents: number;
                 unitCostCents: number;
@@ -529,10 +662,12 @@ export async function posRoutes(app: FastifyInstance) {
               const cur = origAgg.get(key);
               if (cur) {
                 cur.qtyPacks += ol.qtyPacks;
+                cur.baseUnitsSold += ol.baseUnitsSold;
                 cur.lineTotalCents += ol.lineTotalCents;
               } else {
                 origAgg.set(key, {
                   qtyPacks: ol.qtyPacks,
+                  baseUnitsSold: ol.baseUnitsSold,
                   packQty: ol.packQty,
                   unitPriceCents: ol.unitPriceCents,
                   unitCostCents: ol.unitCostCents,
@@ -541,16 +676,27 @@ export async function posRoutes(app: FastifyInstance) {
               }
             }
 
-            const refundedAgg = new Map<string, { qtyPacks: number; lineTotalCents: number }>();
+            const refundedAgg = new Map<
+              string,
+              { qtyPacks: number; baseUnitsSold: number; lineTotalCents: number }
+            >();
             for (const rl of priorRefundLines) {
               const key = `${rl.productId}::${rl.scannedBarcode}`;
-              const cur = refundedAgg.get(key) ?? { qtyPacks: 0, lineTotalCents: 0 };
+              const cur = refundedAgg.get(key) ?? {
+                qtyPacks: 0,
+                baseUnitsSold: 0,
+                lineTotalCents: 0,
+              };
               cur.qtyPacks += rl.qtyPacks;
+              cur.baseUnitsSold += rl.baseUnitsSold;
               cur.lineTotalCents += rl.lineTotalCents;
               refundedAgg.set(key, cur);
             }
 
-            const reqAgg = new Map<string, { qtyPacks: number; lineTotalCents: number }>();
+            const reqAgg = new Map<
+              string,
+              { qtyPacks: number; baseUnitsSold: number; lineTotalCents: number }
+            >();
             for (const l of normalizedLines) {
               const key = `${l.productId}::${l.scannedBarcode}`;
               const origItem = origAgg.get(key);
@@ -568,22 +714,47 @@ export async function posRoutes(app: FastifyInstance) {
                 };
                 return;
               }
-              // Use original sale cost-at-sale on restock movements
+              if (l.unitPriceCents !== origItem.unitPriceCents) {
+                txRejection = {
+                  status: 400,
+                  message: `Unit price mismatch for reversal item "${l.scannedBarcode}" (expected ${origItem.unitPriceCents}c, got ${l.unitPriceCents}c).`,
+                };
+                return;
+              }
+              // Use original sale cost-at-sale on restock movements & scale weighted units properly
               l.unitCostCents = origItem.unitCostCents;
-              const cur = reqAgg.get(key) ?? { qtyPacks: 0, lineTotalCents: 0 };
+              l.lineCostCents = computeInventoryValueCents(
+                l.baseUnitsSold,
+                l.unitCostCents,
+                l.unitMode
+              );
+              const cur = reqAgg.get(key) ?? { qtyPacks: 0, baseUnitsSold: 0, lineTotalCents: 0 };
               cur.qtyPacks += l.qtyPacks;
+              cur.baseUnitsSold += l.baseUnitsSold;
               cur.lineTotalCents += l.lineTotalCents;
               reqAgg.set(key, cur);
             }
 
             for (const [key, reqItem] of reqAgg.entries()) {
               const origItem = origAgg.get(key)!;
-              const prevRef = refundedAgg.get(key) ?? { qtyPacks: 0, lineTotalCents: 0 };
+              const prevRef = refundedAgg.get(key) ?? {
+                qtyPacks: 0,
+                baseUnitsSold: 0,
+                lineTotalCents: 0,
+              };
               const remainingQty = origItem.qtyPacks - prevRef.qtyPacks;
               if (reqItem.qtyPacks > remainingQty) {
                 txRejection = {
                   status: 409,
                   message: `Reversal quantity (${reqItem.qtyPacks}) exceeds remaining refundable quantity (${remainingQty}) on receipt ${orig.receiptNo}.`,
+                };
+                return;
+              }
+              const remainingBaseUnits = origItem.baseUnitsSold - prevRef.baseUnitsSold;
+              if (reqItem.baseUnitsSold > remainingBaseUnits) {
+                txRejection = {
+                  status: 409,
+                  message: `Reversal base units (${reqItem.baseUnitsSold}) exceeds remaining refundable units (${remainingBaseUnits}) on receipt ${orig.receiptNo}.`,
                 };
                 return;
               }
@@ -606,10 +777,53 @@ export async function posRoutes(app: FastifyInstance) {
               return;
             }
 
-            totalCostCents = normalizedLines.reduce(
-              (s, l) => s + l.unitCostCents * l.packQty * l.qtyPacks,
-              0
-            );
+            if (effectiveCustomerId) {
+              const origLoyaltyRows = await tx
+                .select({ amountCents: salePayments.amountCents })
+                .from(salePayments)
+                .where(
+                  and(
+                    eq(salePayments.saleId, orig.id),
+                    eq(salePayments.method, "loyalty_points")
+                  )
+                );
+              const origLoyaltyRedeemed = origLoyaltyRows.reduce(
+                (s, r) => s + Number(r.amountCents ?? 0),
+                0
+              );
+              if (origLoyaltyRedeemed > 0) {
+                let alreadyRestored = 0;
+                if (priorRefundIds.length > 0) {
+                  const priorRestoreRows = await tx
+                    .select({ pointsDelta: loyaltyLedger.pointsDelta })
+                    .from(loyaltyLedger)
+                    .where(
+                      and(
+                        inArray(loyaltyLedger.saleId, priorRefundIds),
+                        eq(loyaltyLedger.reason, "refund_restore")
+                      )
+                    );
+                  alreadyRestored = priorRestoreRows.reduce(
+                    (s, r) => s + Math.max(0, Number(r.pointsDelta ?? 0)),
+                    0
+                  );
+                }
+                const remainingRestorable = Math.max(0, origLoyaltyRedeemed - alreadyRestored);
+                if (
+                  payload.kind === "void" ||
+                  priorRefundedTotalCents + totalCents >= orig.totalCents
+                ) {
+                  pointsToRestore = remainingRestorable;
+                } else if (orig.totalCents > 0) {
+                  pointsToRestore = Math.min(
+                    remainingRestorable,
+                    Math.round((origLoyaltyRedeemed * totalCents) / orig.totalCents)
+                  );
+                }
+              }
+            }
+
+            totalCostCents = normalizedLines.reduce((s, l) => s + l.lineCostCents, 0);
           }
 
           // Atomic single-use loyalty coupon validation & row lock (prevents concurrent double-redemption)
@@ -698,9 +912,10 @@ export async function posRoutes(app: FastifyInstance) {
               };
             });
             const soldDate = new Date(payload.soldAt);
+            const storeTz = storeSettingsRow.storeTimezone || env.storeTimezone;
             const serverEval = evaluateCart(cartInputs, mappedActivePromos, {
               evalNow: soldDate,
-              evalHour: soldDate.getHours(),
+              evalHour: getHourInTimezone(soldDate, storeTz),
               couponDiscountCents: lockedCouponDiscountCents,
             });
             if (discountCents > serverEval.totalDiscountCents) {
@@ -710,16 +925,46 @@ export async function posRoutes(app: FastifyInstance) {
               };
               return;
             }
+            const evalLineByKey = new Map(serverEval.lines.map((el) => [el.lineKey, el]));
+            for (const line of normalizedLines) {
+              const allowedLineDiscount = evalLineByKey.get(line.id)?.discountCents ?? 0;
+              if (line.discountCents > allowedLineDiscount) {
+                txRejection = {
+                  status: 400,
+                  message: `Line discount (${line.discountCents}c) for ${line.scannedBarcode} exceeds authorized discount (${allowedLineDiscount}c).`,
+                };
+                return;
+              }
+            }
           }
 
-          // Verify any referenced EMVCo QR / terminal payment intents are settled & unlinked
-          const referencedIntentIds = Array.from(
-            new Set(
-              payload.payments
-                .map((p) => p.paymentIntentId)
-                .filter((id): id is string => Boolean(id))
-            )
-          ).sort();
+          // Verify all EMVCo QR / terminal payment intents are present, settled, unlinked, and match leg amount & rail
+          const rawIntentIds = payload.payments
+            .map((p) => p.paymentIntentId)
+            .filter((id): id is string => Boolean(id));
+          const referencedIntentIds = Array.from(new Set(rawIntentIds)).sort();
+          if (payload.kind === "sale") {
+            const missingIntentLeg = payload.payments.find(
+              (p) =>
+                (p.method === "khqr" || p.method === "promptpay" || p.method === "paynow") &&
+                !p.paymentIntentId
+            );
+            if (missingIntentLeg) {
+              txRejection = {
+                status: 400,
+                message: `Payment method "${missingIntentLeg.method}" requires a settled paymentIntentId.`,
+              };
+              return;
+            }
+            if (referencedIntentIds.length !== rawIntentIds.length) {
+              txRejection = {
+                status: 400,
+                message:
+                  "Duplicate paymentIntentId across multiple tender legs in the same sale is not allowed.",
+              };
+              return;
+            }
+          }
           if (payload.kind === "sale" && referencedIntentIds.length > 0) {
             const lockedIntents = await tx
               .select()
@@ -731,7 +976,10 @@ export async function posRoutes(app: FastifyInstance) {
               txRejection = { status: 400, message: "Referenced paymentIntentId was not found." };
               return;
             }
-            for (const intent of lockedIntents) {
+            const intentById = new Map(lockedIntents.map((intent) => [intent.id, intent]));
+            for (const leg of payload.payments) {
+              if (!leg.paymentIntentId) continue;
+              const intent = intentById.get(leg.paymentIntentId)!;
               if (intent.status !== "paid") {
                 txRejection = {
                   status: 409,
@@ -743,6 +991,21 @@ export async function posRoutes(app: FastifyInstance) {
                 txRejection = {
                   status: 409,
                   message: `Payment intent ${intent.billReference} has already been linked to another receipt.`,
+                };
+                return;
+              }
+              if (leg.amountCents !== intent.amountCents) {
+                txRejection = {
+                  status: 400,
+                  message: `Tender leg amount (${leg.amountCents}c) does not match settled payment intent ${intent.billReference} (${intent.amountCents}c).`,
+                };
+                return;
+              }
+              const expectedMethod = intent.rail === "card_terminal" ? "card" : intent.rail;
+              if (leg.method !== expectedMethod) {
+                txRejection = {
+                  status: 400,
+                  message: `Tender method "${leg.method}" does not match payment intent rail "${intent.rail}".`,
                 };
                 return;
               }
@@ -778,17 +1041,57 @@ export async function posRoutes(app: FastifyInstance) {
             }
           }
 
+          // Verify & atomically consume single-use server-issued supervisorOverrideId (blocks client audit forgery)
+          let verifiedOverride: typeof supervisorOverrides.$inferSelect | null = null;
+          if (payload.supervisorOverrideId) {
+            const [ov] = await tx
+              .select()
+              .from(supervisorOverrides)
+              .where(eq(supervisorOverrides.id, payload.supervisorOverrideId))
+              .for("update");
+            if (!ov) {
+              txRejection = {
+                status: 400,
+                message: "Referenced supervisorOverrideId was not found.",
+              };
+              return;
+            }
+            if (ov.cashierUserId !== actor.id) {
+              txRejection = {
+                status: 403,
+                message: "Supervisor override token belongs to a different cashier session.",
+              };
+              return;
+            }
+            if (ov.consumedBySaleId) {
+              txRejection = {
+                status: 409,
+                message: "Supervisor override token has already been consumed.",
+              };
+              return;
+            }
+            if (new Date(ov.expiresAt).getTime() <= Date.now()) {
+              txRejection = {
+                status: 409,
+                message: "Supervisor override token has expired.",
+              };
+              return;
+            }
+            verifiedOverride = ov;
+          }
+
           const inserted = await tx
             .insert(sales)
             .values({
               id: payload.id,
               registerCode: payload.registerCode,
               shiftId: payload.shiftId ?? null,
-              customerId: payload.customerId ?? null,
+              customerId: effectiveCustomerId,
               receiptNo: payload.receiptNo,
               kind: payload.kind,
               originalSaleId: payload.originalSaleId ?? null,
               cashierName: actor.fullName,
+              cashierUserId: actor.id,
               subtotalCents,
               discountCents,
               taxCents,
@@ -801,7 +1104,16 @@ export async function posRoutes(app: FastifyInstance) {
             .returning({ id: sales.id });
 
           if (inserted.length === 0) {
+            const [raceExisting] = await tx
+              .select({ receiptNo: sales.receiptNo, totalCents: sales.totalCents })
+              .from(sales)
+              .where(eq(sales.id, payload.id))
+              .limit(1);
             duplicate = true;
+            if (raceExisting) {
+              persistedReceiptNo = raceExisting.receiptNo;
+              persistedTotalCents = raceExisting.totalCents;
+            }
             return;
           }
 
@@ -856,7 +1168,7 @@ export async function posRoutes(app: FastifyInstance) {
               tenderedCents: p.tenderedCents ?? p.amountCents,
               changeCents: p.changeCents ?? 0,
               externalRef: p.externalRef ?? null,
-              paymentIntentId: p.paymentIntentId ?? null,
+              paymentIntentId: payload.kind === "sale" ? (p.paymentIntentId ?? null) : null,
               currencyCode: p.currencyCode ?? "USD",
               foreignAmount: p.foreignAmount ?? null,
               fxRateUsed: p.fxRateUsed ?? null,
@@ -870,17 +1182,28 @@ export async function posRoutes(app: FastifyInstance) {
               .where(inArray(paymentIntents.id, referencedIntentIds));
           }
 
-          if (payload.supervisorOverrideBy) {
+          if (verifiedOverride) {
+            await tx
+              .update(supervisorOverrides)
+              .set({
+                consumedBySaleId: payload.id,
+                consumedAt: new Date(),
+              })
+              .where(eq(supervisorOverrides.id, verifiedOverride.id));
+
             await tx.insert(auditLogs).values({
-              actor: payload.supervisorOverrideBy,
+              actor: verifiedOverride.supervisorName,
               action: "pos_sale_supervisor_override",
               entityType: "sale",
               entityId: payload.id,
               detailsJson: {
+                overrideId: verifiedOverride.id,
                 receiptNo: payload.receiptNo,
                 cashier: actor.fullName,
-                supervisor: payload.supervisorOverrideBy,
-                reason: payload.priceOverrideReason ?? "In-lane supervisor approval",
+                supervisorId: verifiedOverride.supervisorUserId,
+                supervisor: verifiedOverride.supervisorName,
+                supervisorRole: verifiedOverride.supervisorRole,
+                reason: verifiedOverride.reason,
               },
             });
           }
@@ -977,52 +1300,39 @@ export async function posRoutes(app: FastifyInstance) {
           for (const l of orderedLines) {
             const baseUnits = l.baseUnitsSold;
             if (sign === -1) {
-              let remainingToAllocate = baseUnits;
-              const fefoBatches = await tx
-                .select()
-                .from(inventoryBatches)
-                .where(
-                  and(
-                    eq(inventoryBatches.productId, l.productId),
-                    gt(inventoryBatches.qtyRemaining, 0),
-                    sql`${inventoryBatches.status} IN ('active', 'clearance')`
-                  )
-                )
-                .orderBy(asc(inventoryBatches.bestBeforeDate), asc(inventoryBatches.id))
-                .for("update");
-
-              for (const batch of fefoBatches) {
-                if (remainingToAllocate <= 0) break;
-                const take = Math.min(remainingToAllocate, batch.qtyRemaining);
-                const nextQty = batch.qtyRemaining - take;
-                await tx
-                  .update(inventoryBatches)
-                  .set({
-                    qtyRemaining: nextQty,
-                    status: nextQty === 0 ? "depleted" : batch.status,
-                  })
-                  .where(eq(inventoryBatches.id, batch.id));
-
+              const fefoRes = await depleteFefoBatchesTx(tx, l.productId, baseUnits);
+              for (const alloc of fefoRes.allocations) {
                 movementRows.push({
                   id: generateUuidV7(),
                   productId: l.productId,
-                  batchId: batch.id,
-                  qtyDelta: -take,
+                  batchId: alloc.batchId,
+                  qtyDelta: -alloc.qty,
                   unitCostCents: l.unitCostCents,
                   reason: payload.kind,
                   refId: payload.id,
                   folded: false,
                   createdAt: new Date(payload.soldAt),
                 });
-                remainingToAllocate -= take;
+                if (alloc.depletedClearance) {
+                  await tx
+                    .update(promotions)
+                    .set({ active: false })
+                    .where(
+                      and(
+                        eq(promotions.promoType, "clearance"),
+                        eq(promotions.active, true),
+                        sql`${promotions.rulesJson}->>'batchId' = ${alloc.batchId}`
+                      )
+                    );
+                }
               }
 
-              if (remainingToAllocate > 0) {
+              if (fefoRes.unbatchedRemainder > 0) {
                 movementRows.push({
                   id: generateUuidV7(),
                   productId: l.productId,
                   batchId: null,
-                  qtyDelta: -remainingToAllocate,
+                  qtyDelta: -fefoRes.unbatchedRemainder,
                   unitCostCents: l.unitCostCents,
                   reason: payload.kind,
                   refId: payload.id,
@@ -1046,11 +1356,67 @@ export async function posRoutes(app: FastifyInstance) {
                   .for("update");
                 const batchById = new Map(lockedBatches.map((b) => [b.id, b]));
 
+                const todayIso = new Date().toISOString().slice(0, 10);
                 for (const slot of batchSlots) {
                   if (remainingToRestore <= 0 || slot.remainingRestore <= 0) continue;
                   const batch = batchById.get(slot.batchId);
                   if (!batch) continue;
                   const restoreQty = Math.min(remainingToRestore, slot.remainingRestore);
+                  const isExpiredBatch =
+                    batch.status === "expired" ||
+                    (Boolean(batch.bestBeforeDate) && batch.bestBeforeDate < todayIso);
+                  if (isExpiredBatch) {
+                    if (batch.status !== "expired") {
+                      await tx
+                        .update(inventoryBatches)
+                        .set({ status: "expired" })
+                        .where(eq(inventoryBatches.id, batch.id));
+                      batch.status = "expired";
+                    }
+                    slot.remainingRestore -= restoreQty;
+                    remainingToRestore -= restoreQty;
+
+                    // Record physical return and immediate expired-batch quarantine spoilage so sellable stock stays unaffected
+                    movementRows.push(
+                      {
+                        id: generateUuidV7(),
+                        productId: l.productId,
+                        batchId: batch.id,
+                        qtyDelta: restoreQty,
+                        unitCostCents: l.unitCostCents,
+                        reason: payload.kind,
+                        refId: payload.id,
+                        folded: false,
+                        createdAt: new Date(payload.soldAt),
+                      },
+                      {
+                        id: generateUuidV7(),
+                        productId: l.productId,
+                        batchId: batch.id,
+                        qtyDelta: -restoreQty,
+                        unitCostCents: l.unitCostCents,
+                        reason: "spoilage",
+                        refId: payload.id,
+                        folded: false,
+                        createdAt: new Date(payload.soldAt),
+                      }
+                    );
+                    await tx.insert(auditLogs).values({
+                      actor: actor.fullName,
+                      action: "expired_return_quarantined",
+                      entityType: "inventory_batch",
+                      entityId: batch.id,
+                      detailsJson: {
+                        saleId: payload.id,
+                        originalSaleId: payload.originalSaleId ?? null,
+                        productId: l.productId,
+                        qtyQuarantined: restoreQty,
+                        bestBeforeDate: batch.bestBeforeDate,
+                      },
+                    });
+                    continue;
+                  }
+
                   const nextQty = batch.qtyRemaining + restoreQty;
                   const nextStatus = batch.status === "depleted" ? "active" : batch.status;
                   await tx
@@ -1096,12 +1462,12 @@ export async function posRoutes(app: FastifyInstance) {
             await tx.insert(stockMovements).values(movementRows);
           }
 
-          // Customer loyalty points accrual (1 pt / $1) or refund/void clawback
-          if (payload.customerId) {
+          // Customer loyalty points accrual (1 pt / $1) or refund/void clawback + redeemed-points restoration
+          if (effectiveCustomerId) {
             const [lockedCust] = await tx
               .select()
               .from(customers)
-              .where(eq(customers.id, payload.customerId))
+              .where(eq(customers.id, effectiveCustomerId))
               .for("update");
             if (lockedCust) {
               const pts = Math.floor(totalCents / 100);
@@ -1137,7 +1503,7 @@ export async function posRoutes(app: FastifyInstance) {
                 await tx
                   .update(customers)
                   .set({
-                    pointsBalance: Math.max(0, lockedCust.pointsBalance - pts),
+                    pointsBalance: Math.max(0, lockedCust.pointsBalance - pts + pointsToRestore),
                     lifetimeSpendCents: Math.max(0, lockedCust.lifetimeSpendCents - totalCents),
                   })
                   .where(eq(customers.id, lockedCust.id));
@@ -1147,6 +1513,14 @@ export async function posRoutes(app: FastifyInstance) {
                     saleId: payload.id,
                     pointsDelta: -pts,
                     reason: "refund_clawback",
+                  });
+                }
+                if (pointsToRestore > 0) {
+                  await tx.insert(loyaltyLedger).values({
+                    customerId: lockedCust.id,
+                    saleId: payload.id,
+                    pointsDelta: pointsToRestore,
+                    reason: "refund_restore",
                   });
                 }
               }
@@ -1171,7 +1545,7 @@ export async function posRoutes(app: FastifyInstance) {
       }
 
       if (txRejection) {
-        const rej = txRejection as { status: 400 | 404 | 409; message: string };
+        const rej = txRejection as { status: 400 | 403 | 404 | 409; message: string };
         return reply.status(rej.status).send({ error: rej.message });
       }
 
@@ -1181,9 +1555,9 @@ export async function posRoutes(app: FastifyInstance) {
 
       return reply.status(duplicate ? 200 : 201).send({
         id: payload.id,
-        receiptNo: payload.receiptNo,
+        receiptNo: persistedReceiptNo,
         duplicate,
-        totalCents,
+        totalCents: persistedTotalCents,
         pointsEarned,
       });
     }
@@ -1198,7 +1572,14 @@ export async function posRoutes(app: FastifyInstance) {
       const recent = await db
         .select()
         .from(sales)
-        .where(isCashier ? eq(sales.cashierName, req.authUser!.fullName) : undefined)
+        .where(
+          isCashier
+            ? or(
+                eq(sales.cashierUserId, req.authUser!.id),
+                and(isNull(sales.cashierUserId), eq(sales.cashierName, req.authUser!.fullName))
+              )
+            : undefined
+        )
         .orderBy(desc(sales.soldAt))
         .limit(25);
 
@@ -1216,6 +1597,9 @@ export async function posRoutes(app: FastifyInstance) {
             packLabel: saleLines.packLabel,
             packQty: saleLines.packQty,
             qtyPacks: saleLines.qtyPacks,
+            weightGrams: saleLines.weightGrams,
+            tareGrams: saleLines.tareGrams,
+            baseUnitsSold: saleLines.baseUnitsSold,
             unitPriceCents: saleLines.unitPriceCents,
             unitCostCents: saleLines.unitCostCents,
             discountCents: saleLines.discountCents,
@@ -1270,612 +1654,6 @@ export async function posRoutes(app: FastifyInstance) {
           };
         }),
       };
-    }
-  );
-
-  // Atomic stock ledger folding (rolls unfolded stock_movements into stock_baselines)
-  app.post(
-    "/api/pos/fold-ledger",
-    { preHandler: [requireRole(["owner", "manager"])] },
-    async () => {
-      const result = await db.execute(sql`
-        WITH batch AS (
-          UPDATE stock_movements
-          SET folded = true
-          WHERE folded = false
-          RETURNING product_id, qty_delta
-        ),
-        agg AS (
-          SELECT product_id, SUM(qty_delta)::int AS total_delta, COUNT(*)::int AS moved_rows
-          FROM batch
-          GROUP BY product_id
-        ),
-        upserted AS (
-          INSERT INTO stock_baselines (product_id, quantity, updated_at)
-          SELECT product_id, total_delta, now() FROM agg
-          ON CONFLICT (product_id)
-          DO UPDATE SET
-            quantity = stock_baselines.quantity + EXCLUDED.quantity,
-            updated_at = now()
-          RETURNING product_id
-        )
-        SELECT
-          (SELECT count(*)::int FROM batch) AS movements_folded,
-          (SELECT count(*)::int FROM upserted) AS products_updated;
-      `);
-      return result.rows[0];
-    }
-  );
-
-  // Shift listing, active shift lookup, opening & blind cash closeout
-  app.get(
-    "/api/pos/shifts",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async () => {
-      const rows = await db
-        .select()
-        .from(posShifts)
-        .orderBy(desc(posShifts.openedAt))
-        .limit(20);
-      return { shifts: rows };
-    }
-  );
-
-  app.get(
-    "/api/pos/shifts/active",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req) => {
-      const q = req.query as { registerCode?: string };
-      const registerCode = (q.registerCode ?? "REG-01").trim() || "REG-01";
-      const [activeShift] = await db
-        .select()
-        .from(posShifts)
-        .where(and(eq(posShifts.registerCode, registerCode), isNull(posShifts.closedAt)))
-        .orderBy(desc(posShifts.openedAt))
-        .limit(1);
-      return { shift: activeShift ?? null };
-    }
-  );
-
-  app.post(
-    "/api/pos/shifts/open",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const schema = z.object({
-        registerCode: z.string().trim().min(1).max(32).default("REG-01"),
-        openingFloatCents: z.number().int().min(0).default(30000),
-      });
-      const parsed = schema.safeParse(req.body ?? {});
-      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
-
-      const findOpen = () =>
-        db
-          .select()
-          .from(posShifts)
-          .where(
-            and(
-              eq(posShifts.registerCode, parsed.data.registerCode),
-              isNull(posShifts.closedAt)
-            )
-          )
-          .limit(1);
-
-      const [existingOpen] = await findOpen();
-      if (existingOpen) {
-        return existingOpen;
-      }
-
-      try {
-        const [created] = await db
-          .insert(posShifts)
-          .values({
-            id: generateUuidV7(),
-            registerCode: parsed.data.registerCode,
-            cashierName: req.authUser!.fullName,
-            openingFloatCents: parsed.data.openingFloatCents,
-          })
-          .returning();
-
-        return reply.status(201).send(created);
-      } catch (err) {
-        if (getPgErrorCode(err) === "23505") {
-          const [raceExisting] = await findOpen();
-          if (raceExisting) return raceExisting;
-        }
-        throw err;
-      }
-    }
-  );
-
-  app.post(
-    "/api/pos/shifts/close",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const schema = z.object({
-        registerCode: z.string().trim().min(1).max(32).default("REG-01"),
-        openingFloatCents: z.number().int().min(0).default(30000),
-        cashDropsCents: z.number().int().min(0).default(0),
-        blindCountedCashCents: z.number().int().min(0),
-      });
-      const parsed = schema.safeParse(req.body);
-      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
-
-      const actorName = req.authUser!.fullName;
-      const closedShift = await db.transaction(async (tx) => {
-        const [openShift] = await tx
-          .select()
-          .from(posShifts)
-          .where(
-            and(
-              eq(posShifts.registerCode, parsed.data.registerCode),
-              isNull(posShifts.closedAt)
-            )
-          )
-          .orderBy(desc(posShifts.openedAt))
-          .limit(1)
-          .for("update");
-
-        const windowStart =
-          openShift?.openedAt ?? new Date(new Date().setHours(0, 0, 0, 0));
-        const effectiveOpeningFloat =
-          openShift?.openingFloatCents ?? parsed.data.openingFloatCents;
-
-        // Reconcile net cash drawer movement strictly by shift_id when shift exists,
-        // plus legacy/offline sales on this register without shift_id within the shift window (M-08)
-        const cashScope = openShift
-          ? sql`${salePayments.method} = 'cash' AND (
-              ${sales.shiftId} = ${openShift.id}
-              OR (${sales.shiftId} IS NULL AND ${sales.registerCode} = ${parsed.data.registerCode} AND ${sales.soldAt} >= ${windowStart})
-            )`
-          : sql`${salePayments.method} = 'cash' AND ${sales.shiftId} IS NULL AND ${sales.registerCode} = ${parsed.data.registerCode} AND ${sales.soldAt} >= ${windowStart}`;
-
-        const [cashAgg] = await tx
-          .select({
-            cashNet: sql<number>`coalesce(sum(CASE WHEN ${sales.kind} = 'sale' THEN ${salePayments.amountCents} ELSE -${salePayments.amountCents} END), 0)::bigint`,
-          })
-          .from(salePayments)
-          .innerJoin(sales, eq(salePayments.saleId, sales.id))
-          .where(cashScope);
-
-        const expectedCash =
-          effectiveOpeningFloat +
-          Number(cashAgg?.cashNet ?? 0) -
-          parsed.data.cashDropsCents;
-        const variance = parsed.data.blindCountedCashCents - expectedCash;
-        const zReportNo = `Z-${Date.now().toString().slice(-6)}-${generateUuidV7().slice(-4).toUpperCase()}`;
-
-        const saved = openShift
-          ? (
-              await tx
-                .update(posShifts)
-                .set({
-                  cashierName: actorName,
-                  closedAt: new Date(),
-                  cashDropsCents: parsed.data.cashDropsCents,
-                  blindCountedCashCents: parsed.data.blindCountedCashCents,
-                  expectedCashCents: expectedCash,
-                  varianceCents: variance,
-                  zReportNo,
-                })
-                .where(eq(posShifts.id, openShift.id))
-                .returning()
-            )[0]
-          : (
-              await tx
-                .insert(posShifts)
-                .values({
-                  id: generateUuidV7(),
-                  registerCode: parsed.data.registerCode,
-                  cashierName: actorName,
-                  openedAt: windowStart,
-                  closedAt: new Date(),
-                  openingFloatCents: effectiveOpeningFloat,
-                  cashDropsCents: parsed.data.cashDropsCents,
-                  blindCountedCashCents: parsed.data.blindCountedCashCents,
-                  expectedCashCents: expectedCash,
-                  varianceCents: variance,
-                  zReportNo,
-                })
-                .returning()
-            )[0];
-
-        await tx.insert(auditLogs).values({
-          actor: actorName,
-          action: "z_report_close",
-          entityType: "pos_shift",
-          entityId: saved.id,
-          detailsJson: {
-            zReportNo,
-            expectedCash,
-            blindCount: parsed.data.blindCountedCashCents,
-            variance,
-          },
-        });
-
-        return saved;
-      });
-
-      return closedShift;
-    }
-  );
-
-  // =========================================================================
-  // MILESTONE 2: SE ASIA EMVCo QR PAYMENT INTENTS (KHQR / PROMPTPAY / PAYNOW)
-  // =========================================================================
-  app.post(
-    "/api/pos/payment-intents",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const parsed = CreatePaymentIntentSchema.safeParse(req.body);
-      if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() });
-      }
-      const data = parsed.data;
-      const settings = await getOrCreateStoreSettings();
-      const adapter = resolvePaymentAdapter(data.rail, settings.paymentProvider);
-      const id = generateUuidV7();
-      const billReference =
-        data.billReference ??
-        `${data.registerCode.replace(/[^A-Z0-9]/gi, "").slice(0, 6).toUpperCase()}-${id.slice(-8).toUpperCase()}`;
-      const expiresAt = new Date(Date.now() + data.ttlSeconds * 1000);
-
-      const built = await adapter.createIntent(
-        {
-          rail: data.rail,
-          amountCents: data.amountCents,
-          currencyCode: data.currencyCode,
-          billReference,
-          registerCode: data.registerCode,
-          expiresAtMs: expiresAt.getTime(),
-        },
-        settings
-      );
-
-      const [intent] = await db
-        .insert(paymentIntents)
-        .values({
-          id,
-          registerCode: data.registerCode,
-          rail: data.rail,
-          provider: built.provider,
-          status: "pending",
-          amountCents: data.amountCents,
-          currencyCode: built.currencyCode,
-          displayAmount: built.displayAmount,
-          billReference,
-          qrPayload: built.qrPayload,
-          externalRef: built.externalRef,
-          expiresAt,
-          createdBy: req.authUser!.fullName,
-        })
-        .returning();
-
-      const qrMatrix = intent.qrPayload ? generateQrMatrix(intent.qrPayload) : null;
-      return reply.status(201).send({ intent, qrMatrix });
-    }
-  );
-
-  app.get(
-    "/api/pos/payment-intents/:id",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const { id } = req.params as { id: string };
-      if (!UuidSchema.safeParse(id).success) {
-        return reply.status(400).send({ error: "Invalid payment intent ID format." });
-      }
-      const [intent] = await db
-        .select()
-        .from(paymentIntents)
-        .where(eq(paymentIntents.id, id))
-        .limit(1);
-      if (!intent) return reply.status(404).send({ error: "Payment intent not found." });
-
-      if (intent.status === "pending" && new Date(intent.expiresAt).getTime() <= Date.now()) {
-        const [expired] = await db
-          .update(paymentIntents)
-          .set({ status: "expired" })
-          .where(and(eq(paymentIntents.id, id), eq(paymentIntents.status, "pending")))
-          .returning();
-        return { intent: expired ?? intent };
-      }
-
-      return { intent };
-    }
-  );
-
-  app.post(
-    "/api/pos/payment-intents/:id/simulate-settle",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const { id } = req.params as { id: string };
-      if (!UuidSchema.safeParse(id).success) {
-        return reply.status(400).send({ error: "Invalid payment intent ID format." });
-      }
-
-      const result = await db.transaction(async (tx) => {
-        const [intent] = await tx
-          .select()
-          .from(paymentIntents)
-          .where(eq(paymentIntents.id, id))
-          .for("update");
-        if (!intent) return { status: 404 as const, error: "Payment intent not found." };
-
-        if (intent.status === "paid") {
-          return { status: 200 as const, intent, alreadyPaid: true };
-        }
-        if (intent.status !== "pending") {
-          return {
-            status: 409 as const,
-            error: `Cannot settle payment intent in "${intent.status}" state.`,
-          };
-        }
-        if (new Date(intent.expiresAt).getTime() <= Date.now()) {
-          await tx
-            .update(paymentIntents)
-            .set({ status: "expired" })
-            .where(eq(paymentIntents.id, id));
-          return { status: 409 as const, error: "Payment intent has expired. Generate a fresh QR code." };
-        }
-
-        const extRef = generateExternalSettlementRef(
-          intent.rail as "khqr" | "promptpay" | "paynow" | "card_terminal"
-        );
-        const [settled] = await tx
-          .update(paymentIntents)
-          .set({
-            status: "paid",
-            externalRef: extRef,
-            paidAt: new Date(),
-          })
-          .where(eq(paymentIntents.id, id))
-          .returning();
-
-        await tx.insert(auditLogs).values({
-          actor: req.authUser!.fullName,
-          action: "payment_intent_settled",
-          entityType: "payment_intent",
-          entityId: settled.id,
-          detailsJson: {
-            rail: settled.rail,
-            provider: settled.provider,
-            billReference: settled.billReference,
-            externalRef: extRef,
-            amountCents: settled.amountCents,
-            displayAmount: settled.displayAmount,
-            mode: "sandbox_simulate",
-          },
-        });
-
-        return { status: 200 as const, intent: settled, alreadyPaid: false };
-      });
-
-      if ("error" in result) {
-        return reply.status(result.status).send({ error: result.error });
-      }
-      return { intent: result.intent, alreadyPaid: result.alreadyPaid };
-    }
-  );
-
-  app.post(
-    "/api/pos/payment-intents/:id/cancel",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const { id } = req.params as { id: string };
-      if (!UuidSchema.safeParse(id).success) {
-        return reply.status(400).send({ error: "Invalid payment intent ID format." });
-      }
-      const [updated] = await db
-        .update(paymentIntents)
-        .set({ status: "cancelled" })
-        .where(and(eq(paymentIntents.id, id), eq(paymentIntents.status, "pending")))
-        .returning();
-      if (!updated) {
-        const [existing] = await db
-          .select()
-          .from(paymentIntents)
-          .where(eq(paymentIntents.id, id))
-          .limit(1);
-        if (!existing) return reply.status(404).send({ error: "Payment intent not found." });
-        return reply
-          .status(409)
-          .send({ error: `Cannot cancel payment intent in "${existing.status}" state.` });
-      }
-      return { intent: updated };
-    }
-  );
-
-  app.post("/api/pos/payment-intents/webhook", async (req, reply) => {
-    const rawBody = JSON.stringify(req.body ?? {});
-    const sig = req.headers["x-payment-signature"] as string | undefined;
-    if (!verifyWebhookSignature(rawBody, sig)) {
-      return reply.status(401).send({ error: "Invalid payment webhook signature." });
-    }
-    const parsed = PaymentWebhookSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() });
-    }
-    const data = parsed.data;
-
-    const result = await db.transaction(async (tx) => {
-      const [intent] = await tx
-        .select()
-        .from(paymentIntents)
-        .where(eq(paymentIntents.billReference, data.billReference))
-        .for("update");
-      if (!intent) return { status: 404 as const, error: "Bill reference not found." };
-
-      if (data.amountCents !== undefined && data.amountCents !== intent.amountCents) {
-        return {
-          status: 400 as const,
-          error: `Webhook amount mismatch (expected ${intent.amountCents}c, got ${data.amountCents}c).`,
-        };
-      }
-      if (intent.status === "paid") {
-        return { status: 200 as const, intent, idempotent: true };
-      }
-      if (intent.status !== "pending") {
-        return {
-          status: 409 as const,
-          error: `Cannot apply webhook to intent in "${intent.status}" state.`,
-        };
-      }
-
-      const [updated] = await tx
-        .update(paymentIntents)
-        .set({
-          status: data.status,
-          externalRef: data.externalRef,
-          paidAt: data.status === "paid" ? new Date() : null,
-        })
-        .where(eq(paymentIntents.id, intent.id))
-        .returning();
-
-      await tx.insert(auditLogs).values({
-        actor: "payment_gateway_webhook",
-        action: "payment_intent_webhook",
-        entityType: "payment_intent",
-        entityId: updated.id,
-        detailsJson: {
-          billReference: updated.billReference,
-          externalRef: data.externalRef,
-          status: data.status,
-          rail: updated.rail,
-        },
-      });
-
-      return { status: 200 as const, intent: updated, idempotent: false };
-    });
-
-    if ("error" in result) {
-      return reply.status(result.status).send({ error: result.error });
-    }
-    return { intent: result.intent, idempotent: result.idempotent };
-  });
-
-  // =========================================================================
-  // MILESTONE 2: HOLD / PARK & RECALL BASKETS (CROSS-LANE POS WORKFLOW)
-  // =========================================================================
-  app.get(
-    "/api/pos/parked-baskets",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async () => {
-      const baskets = await db
-        .select()
-        .from(parkedBaskets)
-        .where(eq(parkedBaskets.status, "parked"))
-        .orderBy(desc(parkedBaskets.parkedAt))
-        .limit(50);
-      return { baskets };
-    }
-  );
-
-  app.post(
-    "/api/pos/parked-baskets",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const parsed = ParkBasketSchema.safeParse(req.body);
-      if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() });
-      }
-      const data = parsed.data;
-      const id = generateUuidV7();
-      const holdCode = `HOLD-${id.slice(-4).toUpperCase()}`;
-
-      const [basket] = await db
-        .insert(parkedBaskets)
-        .values({
-          id,
-          holdCode,
-          registerCode: data.registerCode,
-          cashierName: req.authUser!.fullName,
-          customerLabel: data.customerLabel ?? null,
-          customerId: data.customerId ?? null,
-          couponCode: data.couponCode ?? null,
-          linesJson: data.lines,
-          subtotalCents: data.subtotalCents,
-          itemCount: data.lines.length,
-          note: data.note ?? null,
-          status: "parked",
-        })
-        .returning();
-
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: "basket_park",
-        entityType: "parked_basket",
-        entityId: basket.id,
-        detailsJson: {
-          holdCode: basket.holdCode,
-          registerCode: basket.registerCode,
-          itemCount: basket.itemCount,
-          subtotalCents: basket.subtotalCents,
-        },
-      });
-
-      return reply.status(201).send({ basket });
-    }
-  );
-
-  app.post(
-    "/api/pos/parked-baskets/:id/recall",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const { id } = req.params as { id: string };
-      if (!UuidSchema.safeParse(id).success) {
-        return reply.status(400).send({ error: "Invalid parked basket ID format." });
-      }
-
-      const [recalled] = await db
-        .update(parkedBaskets)
-        .set({
-          status: "recalled",
-          recalledAt: new Date(),
-          recalledBy: req.authUser!.fullName,
-        })
-        .where(and(eq(parkedBaskets.id, id), eq(parkedBaskets.status, "parked")))
-        .returning();
-
-      if (!recalled) {
-        const [existing] = await db
-          .select({ status: parkedBaskets.status })
-          .from(parkedBaskets)
-          .where(eq(parkedBaskets.id, id))
-          .limit(1);
-        if (!existing) return reply.status(404).send({ error: "Parked basket not found." });
-        return reply
-          .status(409)
-          .send({ error: `Basket has already been ${existing.status}.` });
-      }
-
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: "basket_recall",
-        entityType: "parked_basket",
-        entityId: recalled.id,
-        detailsJson: { holdCode: recalled.holdCode, recalledBy: req.authUser!.fullName },
-      });
-
-      return { basket: recalled };
-    }
-  );
-
-  app.delete(
-    "/api/pos/parked-baskets/:id",
-    { preHandler: [requireRole(["owner", "manager", "cashier"])] },
-    async (req, reply) => {
-      const { id } = req.params as { id: string };
-      if (!UuidSchema.safeParse(id).success) {
-        return reply.status(400).send({ error: "Invalid parked basket ID format." });
-      }
-      const [cancelled] = await db
-        .update(parkedBaskets)
-        .set({ status: "cancelled" })
-        .where(and(eq(parkedBaskets.id, id), eq(parkedBaskets.status, "parked")))
-        .returning();
-      if (!cancelled) {
-        return reply.status(404).send({ error: "Active parked basket not found." });
-      }
-      return { ok: true, id: cancelled.id };
     }
   );
 }

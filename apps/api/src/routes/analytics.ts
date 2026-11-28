@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   CreateShiftExperimentSchema,
@@ -30,11 +31,23 @@ import { env } from "../config/env.js";
 import { buildCsvDocument } from "../lib/helpers.js";
 import { evaluateShiftExperiment } from "../lib/shiftDid.js";
 import { requireAuth, requireRole } from "../plugins/auth.js";
+import { createRateLimiter } from "../plugins/security.js";
 
 const execFileAsync = promisify(execFile);
+let localRecomputeInFlight = false;
 
 export async function analyticsRoutes(app: FastifyInstance) {
   const analyticsReadOnly = [requireRole(["owner", "manager", "accountant"])];
+  const recomputeLimiter = createRateLimiter({
+    keyPrefix: "analytics_recompute",
+    windowMs: 5 * 60_000,
+    max: env.isTest ? 100 : 5,
+  });
+  const exportLimiter = createRateLimiter({
+    keyPrefix: "analytics_csv_exports",
+    windowMs: 60_000,
+    max: env.isTest ? 300 : 20,
+  });
 
   // Executive Overview KPIs, Daily Trend & Hourly Traffic Heatmap
   app.get("/api/analytics/overview", { preHandler: analyticsReadOnly }, async (req) => {
@@ -49,53 +62,56 @@ export async function analyticsRoutes(app: FastifyInstance) {
         db.execute(sql`
           SELECT
             COUNT(*) FILTER (WHERE kind = 'sale')::int AS receipt_count,
-            COALESCE(SUM(total_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS gross_sales_cents,
-            COALESCE(SUM(discount_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS discounts_cents,
-            COALESCE(SUM(tax_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS tax_cents,
-            COALESCE(SUM(total_cost_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS cogs_cents,
-            COALESCE(SUM(total_cents - tax_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS net_sales_cents
+            COUNT(*) FILTER (WHERE kind IN ('void', 'refund'))::int AS reversal_count,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN total_cents ELSE -total_cents END), 0)::bigint AS gross_sales_cents,
+            COALESCE(SUM(total_cents) FILTER (WHERE kind IN ('void', 'refund')), 0)::bigint AS refunds_voids_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN discount_cents ELSE -discount_cents END), 0)::bigint AS discounts_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN tax_cents ELSE -tax_cents END), 0)::bigint AS tax_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN total_cost_cents ELSE -total_cost_cents END), 0)::bigint AS cogs_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN (total_cents - tax_cents) ELSE -(total_cents - tax_cents) END), 0)::bigint AS net_sales_cents
           FROM sales
           WHERE sold_at >= now() - (${days} || ' days')::interval
         `),
         db.execute(sql`
           SELECT
             to_char(date_trunc('day', sold_at), 'YYYY-MM-DD') AS day,
-            COUNT(*)::int AS receipts,
-            COALESCE(SUM(total_cents), 0)::bigint AS sales_cents,
-            COALESCE(SUM(total_cents - tax_cents - total_cost_cents), 0)::bigint AS profit_cents
+            COUNT(*) FILTER (WHERE kind = 'sale')::int AS receipts,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN total_cents ELSE -total_cents END), 0)::bigint AS sales_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN (total_cents - tax_cents - total_cost_cents) ELSE -(total_cents - tax_cents - total_cost_cents) END), 0)::bigint AS profit_cents
           FROM sales
-          WHERE kind = 'sale' AND sold_at >= now() - (${days} || ' days')::interval
+          WHERE sold_at >= now() - (${days} || ' days')::interval
           GROUP BY 1
           ORDER BY 1 ASC
         `),
         db.execute(sql`
           SELECT
             EXTRACT(HOUR FROM sold_at)::int AS hour,
-            COUNT(*)::int AS receipts,
-            COALESCE(SUM(total_cents), 0)::bigint AS sales_cents
+            COUNT(*) FILTER (WHERE kind = 'sale')::int AS receipts,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN total_cents ELSE -total_cents END), 0)::bigint AS sales_cents
           FROM sales
-          WHERE kind = 'sale' AND sold_at >= now() - (${days} || ' days')::interval
+          WHERE sold_at >= now() - (${days} || ' days')::interval
           GROUP BY 1
           ORDER BY 1 ASC
         `),
         db.execute(sql`
           SELECT
             p.method,
-            COUNT(*)::int AS tx_count,
-            COALESCE(SUM(p.amount_cents), 0)::bigint AS total_cents
+            COUNT(*) FILTER (WHERE s.kind = 'sale')::int AS tx_count,
+            COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN p.amount_cents ELSE -p.amount_cents END), 0)::bigint AS total_cents
           FROM sale_payments p
           JOIN sales s ON s.id = p.sale_id
-          WHERE s.kind = 'sale' AND s.sold_at >= now() - (${days} || ' days')::interval
+          WHERE s.sold_at >= now() - (${days} || ' days')::interval
           GROUP BY 1
           ORDER BY total_cents DESC
         `),
         db.execute(sql`
           SELECT
-            COALESCE(SUM(ABS(qty_delta) * unit_cost_cents), 0)::bigint AS shrink_cost_cents
-          FROM stock_movements
-          WHERE reason IN ('spoilage', 'damage', 'count_adj')
-            AND qty_delta < 0
-            AND created_at >= now() - (${days} || ' days')::interval
+            COALESCE(SUM(ROUND((ABS(sm.qty_delta)::numeric * sm.unit_cost_cents) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS shrink_cost_cents
+          FROM stock_movements sm
+          JOIN products p ON p.id = sm.product_id
+          WHERE sm.reason IN ('spoilage', 'damage', 'count_adj')
+            AND sm.qty_delta < 0
+            AND sm.created_at >= now() - (${days} || ' days')::interval
         `),
         db.execute(sql`
           WITH unfolded AS (
@@ -107,7 +123,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
           SELECT
             COUNT(*)::int AS total_skus,
             (SELECT COUNT(*)::int FROM product_barcodes) AS total_barcodes,
-            COALESCE(SUM(GREATEST(0, COALESCE(b.quantity, 0) + COALESCE(u.delta, 0)) * p.avg_cost_cents), 0)::bigint AS inventory_cost_value_cents
+            COALESCE(SUM(ROUND((GREATEST(0, COALESCE(b.quantity, 0) + COALESCE(u.delta, 0))::numeric * p.avg_cost_cents) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS inventory_cost_value_cents
           FROM products p
           LEFT JOIN stock_baselines b ON b.product_id = p.id
           LEFT JOIN unfolded u ON u.product_id = p.id
@@ -130,7 +146,9 @@ export async function analyticsRoutes(app: FastifyInstance) {
       days,
       kpis: {
         receiptCount: receipts,
+        reversalCount: Number(kpi.reversal_count ?? 0),
         grossSalesCents: grossSales,
+        refundsVoidsCents: Number(kpi.refunds_voids_cents ?? 0),
         netSalesCents: netSales,
         discountsCents: Number(kpi.discounts_cents ?? 0),
         taxCents: Number(kpi.tax_cents ?? 0),
@@ -175,21 +193,22 @@ export async function analyticsRoutes(app: FastifyInstance) {
       sales_by_dept AS (
         SELECT
           d.id AS department_id,
-          COALESCE(SUM(sl.line_total_cents - sl.tax_cents), 0)::bigint AS net_sales_60d,
-          COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold), 0)::bigint AS cogs_60d,
-          COALESCE(SUM(sl.base_units_sold), 0)::int AS units_60d
+          COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN (sl.line_total_cents - sl.tax_cents) ELSE -(sl.line_total_cents - sl.tax_cents) END), 0)::bigint AS net_sales_60d,
+          COALESCE(SUM(ROUND(((CASE WHEN s.kind = 'sale' THEN 1 ELSE -1 END) * sl.unit_cost_cents::numeric * sl.base_units_sold) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS cogs_60d,
+          COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN sl.base_units_sold ELSE -sl.base_units_sold END), 0)::int AS units_60d
         FROM sale_lines sl
-        JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+        JOIN sales s ON s.id = sl.sale_id
         JOIN products p ON p.id = sl.product_id
         JOIN categories c ON c.id = p.category_id
         JOIN departments d ON d.id = c.department_id
+        WHERE s.sold_at >= now() - interval '60 days'
         GROUP BY d.id
       ),
       inv_by_dept AS (
         SELECT
           d.id AS department_id,
           COUNT(p.id)::int AS sku_count,
-          COALESCE(SUM(GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0)) * p.avg_cost_cents), 0)::bigint AS stock_cost_cents
+          COALESCE(SUM(ROUND((GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::numeric * p.avg_cost_cents) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS stock_cost_cents
         FROM products p
         JOIN categories c ON c.id = p.category_id
         JOIN departments d ON d.id = c.department_id
@@ -601,7 +620,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
   // Recompute Python Shift Diagnostics & ML Worker on Demand (decoupled HTTP worker or local dev fallback - H-02)
   app.post(
     "/api/analytics/shift-diagnostics/recompute",
-    { preHandler: [requireRole(["owner", "manager"])] },
+    { preHandler: [requireRole(["owner", "manager"]), recomputeLimiter] },
     async (req, reply) => {
       const workerBaseUrl = (process.env.ANALYTICS_WORKER_URL?.trim() || env.analyticsWorkerUrl)?.replace(
         /\/+$/,
@@ -653,8 +672,14 @@ export async function analyticsRoutes(app: FastifyInstance) {
         }
       }
 
-      // Local monorepo development fallback when ANALYTICS_WORKER_URL is not configured
-      const repoRoot = path.resolve(process.cwd(), "../..");
+      if (localRecomputeInFlight) {
+        return reply.status(409).send({
+          error: "A local analytics recompute is already running.",
+        });
+      }
+
+      // Resolve monorepo root relative to module URL so API cwd does not break local worker fallback
+      const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
       const scriptPath = path.join(repoRoot, "services", "analytics", "run_all.py");
       if (!fs.existsSync(scriptPath)) {
         return reply.status(503).send({
@@ -670,6 +695,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
           ? posixPy
           : "python3";
 
+      localRecomputeInFlight = true;
       try {
         const { stdout } = await execFileAsync(pyBin, [scriptPath], {
           cwd: repoRoot,
@@ -691,6 +717,8 @@ export async function analyticsRoutes(app: FastifyInstance) {
         return reply.status(500).send({
           error: "Analytics worker recompute failed. Check server logs for details.",
         });
+      } finally {
+        localRecomputeInFlight = false;
       }
     }
   );
@@ -715,6 +743,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
               p.sku,
               p.name,
               p.brand,
+              p.unit_mode,
               d.name AS department_name,
               (COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::int AS on_hand_units,
               p.avg_cost_cents,
@@ -733,7 +762,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
             brand,
             department_name,
             on_hand_units,
-            (GREATEST(0, on_hand_units) * avg_cost_cents)::bigint AS tied_capital_cents,
+            ROUND((GREATEST(0, on_hand_units)::numeric * avg_cost_cents) / CASE WHEN unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)::bigint AS tied_capital_cents,
             units_60d
           FROM live
           WHERE units_60d <= 2 AND on_hand_units > 10
@@ -741,18 +770,23 @@ export async function analyticsRoutes(app: FastifyInstance) {
           LIMIT 25
         `),
         db.execute(sql`
-          WITH live_stock AS (
+          WITH unfolded AS (
+            SELECT product_id, COALESCE(SUM(qty_delta), 0)::int AS delta
+            FROM stock_movements
+            WHERE folded = false
+            GROUP BY product_id
+          ),
+          live_stock AS (
             SELECT
               p.id,
               p.sku,
               p.name,
-              COALESCE(sb.quantity, 0) + COALESCE(SUM(sm.qty_delta) FILTER (WHERE sm.folded = false), 0) AS on_hand
+              (COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::int AS on_hand
             FROM products p
             LEFT JOIN stock_baselines sb ON sb.product_id = p.id
-            LEFT JOIN stock_movements sm ON sm.product_id = p.id
-            GROUP BY p.id, p.sku, p.name, sb.quantity
+            LEFT JOIN unfolded u ON u.product_id = p.id
           )
-          SELECT id, sku, name, on_hand::int AS on_hand_units
+          SELECT id, sku, name, on_hand AS on_hand_units
           FROM live_stock
           WHERE on_hand < 0
           ORDER BY on_hand ASC
@@ -777,46 +811,35 @@ export async function analyticsRoutes(app: FastifyInstance) {
     }
   );
 
-  // Accounting Journal Export (supports ?days=7|30|60|all)
+  // Accounting Journal Export (supports ?days=7|30|60|all, bounded at 730 days max)
   app.get(
     "/api/exports/accounting.csv",
-    { preHandler: analyticsReadOnly },
+    { preHandler: [...analyticsReadOnly, exportLimiter] },
     async (req, reply) => {
       const q = req.query as { days?: string };
-      let parsedDays: number | null = null;
+      let effectiveDays = 730;
       if (q.days && q.days !== "all") {
         const raw = Number(q.days);
-        parsedDays = Number.isFinite(raw) ? Math.min(365, Math.max(1, Math.trunc(raw))) : 30;
+        effectiveDays = Number.isFinite(raw) ? Math.min(730, Math.max(1, Math.trunc(raw))) : 30;
       }
 
-      const res = parsedDays
-        ? await db.execute(sql`
-            SELECT
-              to_char(date_trunc('day', s.sold_at), 'YYYY-MM-DD') AS date,
-              COUNT(*) FILTER (WHERE s.kind = 'sale')::int AS receipts,
-              COALESCE(SUM(s.subtotal_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS gross_sales_cents,
-              COALESCE(SUM(s.discount_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS discounts_cents,
-              COALESCE(SUM(s.tax_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS vat_collected_cents,
-              COALESCE(SUM(s.total_cents - s.tax_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS net_revenue_cents,
-              COALESCE(SUM(s.total_cost_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS cogs_cents
-            FROM sales s
-            WHERE s.sold_at >= now() - (${parsedDays} || ' days')::interval
-            GROUP BY 1
-            ORDER BY 1 DESC
-          `)
-        : await db.execute(sql`
-            SELECT
-              to_char(date_trunc('day', s.sold_at), 'YYYY-MM-DD') AS date,
-              COUNT(*) FILTER (WHERE s.kind = 'sale')::int AS receipts,
-              COALESCE(SUM(s.subtotal_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS gross_sales_cents,
-              COALESCE(SUM(s.discount_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS discounts_cents,
-              COALESCE(SUM(s.tax_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS vat_collected_cents,
-              COALESCE(SUM(s.total_cents - s.tax_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS net_revenue_cents,
-              COALESCE(SUM(s.total_cost_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS cogs_cents
-            FROM sales s
-            GROUP BY 1
-            ORDER BY 1 DESC
-          `);
+      const res = await db.execute(sql`
+        SELECT
+          to_char(date_trunc('day', s.sold_at), 'YYYY-MM-DD') AS date,
+          COUNT(*) FILTER (WHERE s.kind = 'sale')::int AS receipts,
+          COALESCE(SUM(s.subtotal_cents) FILTER (WHERE s.kind = 'sale'), 0)::bigint AS gross_sales_cents,
+          COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN s.discount_cents ELSE -s.discount_cents END), 0)::bigint AS discounts_cents,
+          COALESCE(SUM(s.total_cents) FILTER (WHERE s.kind IN ('void', 'refund')), 0)::bigint AS returns_voids_cents,
+          COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN s.tax_cents ELSE -s.tax_cents END), 0)::bigint AS vat_collected_cents,
+          COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN (s.total_cents - s.tax_cents) ELSE -(s.total_cents - s.tax_cents) END), 0)::bigint AS net_revenue_cents,
+          COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN s.total_cost_cents ELSE -s.total_cost_cents END), 0)::bigint AS cogs_cents
+        FROM sales s
+        WHERE s.sold_at >= now() - (${effectiveDays} || ' days')::interval
+        GROUP BY 1
+        ORDER BY 1 DESC
+      `);
+
+      reply.header("X-Max-Days", String(effectiveDays));
 
       const toUsd = (v: unknown) => (Number(v ?? 0) / 100).toFixed(2);
       const csv = buildCsvDocument(
@@ -825,6 +848,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
           "Receipts",
           "GrossSalesUSD",
           "DiscountsUSD",
+          "ReturnsVoidsUSD",
           "VATCollectedUSD",
           "NetRevenueUSD",
           "COGS_USD",
@@ -838,6 +862,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
             Number(r.receipts ?? 0),
             toUsd(r.gross_sales_cents),
             toUsd(r.discounts_cents),
+            toUsd(r.returns_voids_cents),
             toUsd(r.vat_collected_cents),
             toUsd(net),
             toUsd(cogs),
@@ -849,7 +874,7 @@ export async function analyticsRoutes(app: FastifyInstance) {
       reply.header("Content-Type", "text/csv; charset=utf-8");
       reply.header(
         "Content-Disposition",
-        `attachment; filename="supermarket-os-accounting-journal-${parsedDays ? `${parsedDays}d` : "all"}.csv"`
+        `attachment; filename="supermarket-os-accounting-journal-${q.days && q.days !== "all" ? `${effectiveDays}d` : `all-${effectiveDays}d`}.csv"`
       );
       return csv;
     }

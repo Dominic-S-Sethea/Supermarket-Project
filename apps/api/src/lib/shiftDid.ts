@@ -94,6 +94,18 @@ export function computeDidStats(
     const rng = seededLcg(42);
     const nBoot = 400;
     const boots: number[] = [];
+    const pairedPre = preTarget.length === preControl.length;
+    const pairedPost = postTarget.length === postControl.length;
+    const samplePairedMean = (a: number[], b: number[]): [number, number] => {
+      let sa = 0;
+      let sb = 0;
+      for (let i = 0; i < a.length; i++) {
+        const idx = Math.floor(rng() * a.length);
+        sa += a[idx];
+        sb += b[idx];
+      }
+      return [sa / a.length, sb / a.length];
+    };
     const sampleMean = (arr: number[]) => {
       let s = 0;
       for (let i = 0; i < arr.length; i++) {
@@ -102,10 +114,12 @@ export function computeDidStats(
       return s / arr.length;
     };
     for (let b = 0; b < nBoot; b++) {
-      const bPreT = sampleMean(preTarget);
-      const bPostT = sampleMean(postTarget);
-      const bPreC = sampleMean(preControl);
-      const bPostC = sampleMean(postControl);
+      const [bPreT, bPreC] = pairedPre
+        ? samplePairedMean(preTarget, preControl)
+        : [sampleMean(preTarget), sampleMean(preControl)];
+      const [bPostT, bPostC] = pairedPost
+        ? samplePairedMean(postTarget, postControl)
+        : [sampleMean(postTarget), sampleMean(postControl)];
       const bScale = bPreC > 1e-6 ? bPreT / bPreC : 1.0;
       boots.push(bPostT - bPreT - (bPostC - bPreC) * bScale);
     }
@@ -151,18 +165,34 @@ export async function evaluateShiftExperiment(
   const maxDate = spec.preEndDate > spec.postEndDate ? spec.preEndDate : spec.postEndDate;
 
   const res = await db.execute(sql`
+    WITH days AS (
+      SELECT generate_series(${minDate}::date, ${maxDate}::date, interval '1 day')::date AS day_dt
+    ),
+    shifts AS (
+      SELECT unnest(ARRAY[${spec.targetShift}, ${spec.controlShift}]::text[]) AS shift_key
+    ),
+    daily_sales AS (
+      SELECT
+        DATE(sold_at) AS day_dt,
+        CASE
+          WHEN EXTRACT(HOUR FROM sold_at) < 12 THEN 'morning'
+          WHEN EXTRACT(HOUR FROM sold_at) < 17 THEN 'afternoon'
+          ELSE 'evening'
+        END AS shift_key,
+        COALESCE(SUM(CASE WHEN kind = 'sale' THEN total_cents ELSE -total_cents END), 0)::bigint AS rev_cents
+      FROM sales
+      WHERE DATE(sold_at) >= ${minDate}::date
+        AND DATE(sold_at) <= ${maxDate}::date
+      GROUP BY 1, 2
+    )
     SELECT
-      to_char(DATE(sold_at), 'YYYY-MM-DD') AS day_str,
-      CASE
-        WHEN EXTRACT(HOUR FROM sold_at) < 12 THEN 'morning'
-        WHEN EXTRACT(HOUR FROM sold_at) < 17 THEN 'afternoon'
-        ELSE 'evening'
-      END AS shift_key,
-      COALESCE(SUM(total_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS rev_cents
-    FROM sales
-    WHERE DATE(sold_at) >= ${minDate}::date
-      AND DATE(sold_at) <= ${maxDate}::date
-    GROUP BY 1, 2
+      to_char(d.day_dt, 'YYYY-MM-DD') AS day_str,
+      sh.shift_key,
+      COALESCE(ds.rev_cents, 0)::bigint AS rev_cents
+    FROM days d
+    CROSS JOIN shifts sh
+    LEFT JOIN daily_sales ds ON ds.day_dt = d.day_dt AND ds.shift_key = sh.shift_key
+    ORDER BY d.day_dt ASC, sh.shift_key ASC
   `);
 
   const preT: number[] = [];

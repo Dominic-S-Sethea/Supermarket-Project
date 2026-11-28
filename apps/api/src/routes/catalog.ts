@@ -38,6 +38,16 @@ import { createRateLimiter } from "../plugins/security.js";
 
 const UuidSchema = z.string().uuid();
 
+function isSafeHttpsUrl(raw: string | undefined | null): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw.trim());
+    return parsed.protocol === "https:" ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function catalogRoutes(app: FastifyInstance) {
   const importLimiter = createRateLimiter({
     keyPrefix: "csv_import",
@@ -106,29 +116,34 @@ export async function catalogRoutes(app: FastifyInstance) {
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
       const data = parsed.data;
       const now = new Date();
-      const [created] = await db
-        .insert(promotions)
-        .values({
-          name: data.name,
-          promoType: data.promoType,
-          priority: data.priority,
-          combinable: data.combinable,
-          minMarginGuardBp: data.minMarginGuardBp,
-          daypartStartHour: data.daypartStartHour ?? null,
-          daypartEndHour: data.daypartEndHour ?? null,
-          startsAt: data.startsAt ? new Date(data.startsAt) : now,
-          endsAt: data.endsAt ? new Date(data.endsAt) : new Date(now.getTime() + 30 * 86400_000),
-          active: true,
-          rulesJson: data.rulesJson,
-        })
-        .returning();
+      const actor = req.authUser!;
+      const created = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .insert(promotions)
+          .values({
+            name: data.name,
+            promoType: data.promoType,
+            priority: data.priority,
+            combinable: data.combinable,
+            minMarginGuardBp: data.minMarginGuardBp,
+            daypartStartHour: data.daypartStartHour ?? null,
+            daypartEndHour: data.daypartEndHour ?? null,
+            startsAt: data.startsAt ? new Date(data.startsAt) : now,
+            endsAt: data.endsAt ? new Date(data.endsAt) : new Date(now.getTime() + 30 * 86400_000),
+            active: true,
+            rulesJson: data.rulesJson,
+          })
+          .returning();
 
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: "promo_create",
-        entityType: "promotion",
-        entityId: created.id,
-        detailsJson: { name: created.name, promoType: created.promoType },
+        await tx.insert(auditLogs).values({
+          actor: actor.fullName,
+          actorUserId: actor.id,
+          action: "promo_create",
+          entityType: "promotion",
+          entityId: row.id,
+          detailsJson: { name: row.name, promoType: row.promoType },
+        });
+        return row;
       });
 
       return reply.status(201).send(created);
@@ -149,20 +164,26 @@ export async function catalogRoutes(app: FastifyInstance) {
       const parsed = schema.safeParse(req.body);
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
 
-      const [updated] = await db
-        .update(promotions)
-        .set({ active: parsed.data.active })
-        .where(eq(promotions.id, id))
-        .returning();
-      if (!updated) return reply.status(404).send({ error: "Promotion not found." });
+      const actor = req.authUser!;
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(promotions)
+          .set({ active: parsed.data.active })
+          .where(eq(promotions.id, id))
+          .returning();
+        if (!row) return null;
 
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: "promo_toggle",
-        entityType: "promotion",
-        entityId: updated.id,
-        detailsJson: { name: updated.name, active: updated.active },
+        await tx.insert(auditLogs).values({
+          actor: actor.fullName,
+          actorUserId: actor.id,
+          action: "promo_toggle",
+          entityType: "promotion",
+          entityId: row.id,
+          detailsJson: { name: row.name, active: row.active },
+        });
+        return row;
       });
+      if (!updated) return reply.status(404).send({ error: "Promotion not found." });
 
       return { promotion: updated };
     }
@@ -586,6 +607,10 @@ export async function catalogRoutes(app: FastifyInstance) {
             isOrderableCase: parsed.data.isOrderableCase,
           })
           .returning();
+        await tx
+          .update(products)
+          .set({ updatedAt: new Date() })
+          .where(eq(products.id, id));
         return inserted;
       });
 
@@ -642,6 +667,10 @@ export async function catalogRoutes(app: FastifyInstance) {
             status: "pending",
           });
         }
+        await tx
+          .update(products)
+          .set({ updatedAt: new Date() })
+          .where(eq(products.id, id));
         return row;
       });
 
@@ -689,6 +718,10 @@ export async function catalogRoutes(app: FastifyInstance) {
         await tx
           .delete(productBarcodes)
           .where(and(eq(productBarcodes.id, barcodeId), eq(productBarcodes.productId, id)));
+        await tx
+          .update(products)
+          .set({ updatedAt: new Date() })
+          .where(eq(products.id, id));
         return { errorStatus: null };
       });
 
@@ -1068,7 +1101,7 @@ export async function catalogRoutes(app: FastifyInstance) {
           brand: data.product.brands ?? "",
           sizeLabel: data.product.quantity ?? "",
           categories: data.product.categories ?? "",
-          imageUrl: data.product.image_front_small_url ?? null,
+          imageUrl: isSafeHttpsUrl(data.product.image_front_small_url),
         };
       } catch {
         return { found: false, offline: true };
@@ -1171,32 +1204,41 @@ ${buildZplBarcodeCommand(r.barcode)}
 
       const nextRecalled = parsed.data.recalled;
       const nextReason = nextRecalled ? (parsed.data.reason?.trim() ?? "Food-safety recall") : null;
+      const actor = req.authUser!;
 
-      const [updated] = await db
-        .update(products)
-        .set({
-          recalled: nextRecalled,
-          recallReason: nextReason,
-          recalledAt: nextRecalled ? new Date() : null,
-          updatedAt: new Date(),
-        })
-        .where(eq(products.id, id))
-        .returning({
-          id: products.id,
-          sku: products.sku,
-          name: products.name,
-          recalled: products.recalled,
-          recallReason: products.recallReason,
-          recalledAt: products.recalledAt,
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(products)
+          .set({
+            recalled: nextRecalled,
+            recallReason: nextReason,
+            recalledAt: nextRecalled ? new Date() : null,
+            updatedAt: new Date(),
+          })
+          .where(eq(products.id, id))
+          .returning({
+            id: products.id,
+            sku: products.sku,
+            name: products.name,
+            recalled: products.recalled,
+            recallReason: products.recallReason,
+            recalledAt: products.recalledAt,
+          });
+        if (!row) return null;
+
+        await tx.insert(auditLogs).values({
+          actor: actor.fullName,
+          actorUserId: actor.id,
+          action: nextRecalled ? "product_recall_activate" : "product_recall_clear",
+          entityType: "product",
+          entityId: row.id,
+          detailsJson: { sku: row.sku, name: row.name, reason: nextReason },
         });
-
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: nextRecalled ? "product_recall_activate" : "product_recall_clear",
-        entityType: "product",
-        entityId: updated.id,
-        detailsJson: { sku: updated.sku, name: updated.name, reason: nextReason },
+        return row;
       });
+      if (!updated) {
+        return reply.status(404).send({ error: "Product not found." });
+      }
 
       return { product: updated };
     }

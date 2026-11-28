@@ -1,12 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import {
   computeEffectiveUnitCostCents,
+  computeInventoryValueCents,
   computeMovingWeightedAvgCostCents,
   computeNetMarginBp,
   computeSuggestedSellPriceCents,
   CreateGrnSchema,
   CreatePurchaseOrderSchema,
   generateUuidV7,
+  type UnitMode,
   UpdatePoStatusSchema,
   UpdateVarianceStatusSchema,
 } from "@supermarket/shared";
@@ -30,12 +32,12 @@ import {
   purchaseOrderLines,
   purchaseOrders,
   shelfTagQueue,
-  stockBaselines,
   stockMovements,
   suppliers,
   taxRates,
 } from "../db/index.js";
 import { getPgErrorCode } from "../app.js";
+import { depleteFefoBatchesTx, getLiveStockForProductsTx } from "../lib/stockLedger.js";
 import { requireRole } from "../plugins/auth.js";
 
 const UuidSchema = z.string().uuid();
@@ -68,6 +70,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
           bestBeforeDate: inventoryBatches.bestBeforeDate,
           qtyRemaining: inventoryBatches.qtyRemaining,
           unitCostCents: inventoryBatches.unitCostCents,
+          unitMode: products.unitMode,
           status: inventoryBatches.status,
         })
         .from(inventoryBatches)
@@ -84,15 +87,30 @@ export async function inventoryRoutes(app: FastifyInstance) {
         .orderBy(asc(inventoryBatches.bestBeforeDate))
         .limit(120);
 
+      const canSeeFinancials =
+        req.authUser?.role === "owner" ||
+        req.authUser?.role === "manager" ||
+        req.authUser?.role === "accountant";
       const todayMs = Date.now();
       const items = rows.map((r) => {
         const daysLeft = Math.ceil(
           (new Date(r.bestBeforeDate).getTime() - todayMs) / 86400_000
         );
+        if (!canSeeFinancials) {
+          const { unitCostCents: _uc, ...pub } = r;
+          return {
+            ...pub,
+            daysLeft,
+          };
+        }
         return {
           ...r,
           daysLeft,
-          atRiskCostCents: r.qtyRemaining * r.unitCostCents,
+          atRiskCostCents: computeInventoryValueCents(
+            r.qtyRemaining,
+            r.unitCostCents,
+            r.unitMode as UnitMode
+          ),
         };
       });
 
@@ -132,7 +150,13 @@ export async function inventoryRoutes(app: FastifyInstance) {
             .where(eq(inventoryBatches.id, id))
             .for("update");
           if (!lockedBatch || lockedBatch.qtyRemaining <= 0) {
-            return { empty: true as const };
+            return { errorStatus: 400 as const, error: "Batch has 0 remaining units" };
+          }
+          if (lockedBatch.status === "clearance") {
+            return { errorStatus: 409 as const, error: "Batch is already marked for clearance." };
+          }
+          if (lockedBatch.status === "expired") {
+            return { errorStatus: 409 as const, error: "Cannot place an expired batch on clearance." };
           }
 
           await tx
@@ -159,7 +183,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
           const now = new Date();
           const endsAt = new Date(
             Math.max(
-              now.getTime() + 7 * 86400_000,
+              now.getTime() + 86400_000,
               new Date(lockedBatch.bestBeforeDate).getTime() + 86400_000
             )
           );
@@ -178,6 +202,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
               rulesJson: {
                 productIds: [lockedBatch.productId],
                 discountBp: discountPct * 100,
+                batchId: lockedBatch.id,
               },
             })
             .returning();
@@ -204,6 +229,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
 
           await tx.insert(auditLogs).values({
             actor: actorName,
+            actorUserId: req.authUser!.id,
             action: "expiry_markdown",
             entityType: "inventory_batch",
             entityId: id,
@@ -214,11 +240,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
             },
           });
 
-          return { empty: false as const, promotionId: promo.id };
+          return { errorStatus: null, promotionId: promo.id };
         });
 
-        if (result.empty) {
-          return reply.status(400).send({ error: "Batch has 0 remaining units" });
+        if (result.errorStatus) {
+          return reply.status(result.errorStatus).send({ error: result.error });
         }
         return { status: "clearance", batchId: id, promotionId: result.promotionId };
       }
@@ -232,6 +258,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
         if (!lockedBatch || lockedBatch.qtyRemaining <= 0) {
           return null;
         }
+        const [prodMeta] = await tx
+          .select({ unitMode: products.unitMode })
+          .from(products)
+          .where(eq(products.id, lockedBatch.productId))
+          .limit(1);
 
         await tx
           .update(inventoryBatches)
@@ -256,7 +287,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
           entityId: id,
           detailsJson: {
             qtyWrittenOff: lockedBatch.qtyRemaining,
-            costCents: lockedBatch.qtyRemaining * lockedBatch.unitCostCents,
+            costCents: computeInventoryValueCents(
+              lockedBatch.qtyRemaining,
+              lockedBatch.unitCostCents,
+              (prodMeta?.unitMode ?? "each") as UnitMode
+            ),
           },
         });
 
@@ -294,7 +329,8 @@ export async function inventoryRoutes(app: FastifyInstance) {
         .from(marginAlerts)
         .innerJoin(products, eq(marginAlerts.productId, products.id))
         .where(eq(marginAlerts.resolved, false))
-        .orderBy(desc(marginAlerts.createdAt));
+        .orderBy(desc(marginAlerts.createdAt))
+        .limit(200);
 
       return { alerts: rows };
     }
@@ -311,28 +347,35 @@ export async function inventoryRoutes(app: FastifyInstance) {
       }
       const bodySchema = z.object({
         customPriceCents: z.number().int().min(1).max(10_000_000).optional(),
+        allowBelowFloor: z.boolean().optional(),
       });
       const parsedBody = bodySchema.safeParse(req.body ?? {});
       if (!parsedBody.success) {
         return reply.status(400).send({ error: parsedBody.error.flatten() });
       }
       const actorName = req.authUser!.fullName;
+      const isOwner = req.authUser!.role === "owner";
 
       const [alert] = await db
         .select()
         .from(marginAlerts)
         .where(eq(marginAlerts.id, id));
       if (!alert) return reply.status(404).send({ error: "Alert not found" });
+      if (alert.resolved) {
+        return reply.status(409).send({ error: "Margin alert is already resolved." });
+      }
 
       const newSellPrice = parsedBody.data.customPriceCents ?? alert.suggestedSellPriceCents;
 
       const updatedRes = await db.transaction(async (tx) => {
-        const [claimed] = await tx
-          .update(marginAlerts)
-          .set({ resolved: true })
-          .where(and(eq(marginAlerts.id, id), eq(marginAlerts.resolved, false)))
-          .returning();
-        if (!claimed) return null;
+        const [lockedAlert] = await tx
+          .select()
+          .from(marginAlerts)
+          .where(eq(marginAlerts.id, id))
+          .for("update");
+        if (!lockedAlert || lockedAlert.resolved) {
+          return { errorStatus: 409 as const, error: "Margin alert is already resolved." };
+        }
 
         const [prod] = await tx
           .select({
@@ -344,68 +387,103 @@ export async function inventoryRoutes(app: FastifyInstance) {
           })
           .from(products)
           .innerJoin(taxRates, eq(products.taxRateId, taxRates.id))
-          .where(eq(products.id, alert.productId));
+          .where(eq(products.id, lockedAlert.productId));
 
         const allBarcodes = await tx
           .select()
           .from(productBarcodes)
-          .where(eq(productBarcodes.productId, alert.productId))
+          .where(eq(productBarcodes.productId, lockedAlert.productId))
           .for("update");
         const primaryBc = allBarcodes.find((b) => b.isPrimary) ?? allBarcodes[0];
-        const oldPrimaryPrice = Math.max(1, primaryBc?.sellPriceCents ?? alert.currentSellPriceCents);
-        const scaleRatio = newSellPrice / oldPrimaryPrice;
 
-        for (const bc of allBarcodes) {
-          if (bc.isPrimary) {
-            await tx
-              .update(productBarcodes)
-              .set({ sellPriceCents: newSellPrice })
-              .where(eq(productBarcodes.id, bc.id));
-          } else {
-            const scaled = Math.ceil((bc.sellPriceCents * scaleRatio) / 5) * 5;
-            const packFloor = prod
-              ? computeSuggestedSellPriceCents(
-                  Math.max(prod.avgCostCents, alert.newCostCents) * bc.packQty,
-                  prod.minMarginBp,
-                  prod.taxRateBp,
-                  prod.taxInclusive,
-                  5
-                )
-              : scaled;
-            await tx
-              .update(productBarcodes)
-              .set({ sellPriceCents: Math.max(scaled, packFloor) })
-              .where(eq(productBarcodes.id, bc.id));
+        if (parsedBody.data.customPriceCents !== undefined && prod) {
+          const basisCost = Math.max(prod.avgCostCents, lockedAlert.newCostCents);
+          const primaryFloor = computeSuggestedSellPriceCents(
+            basisCost * (primaryBc?.packQty ?? 1),
+            prod.minMarginBp,
+            prod.taxRateBp,
+            prod.taxInclusive,
+            1
+          );
+          if (
+            newSellPrice < primaryFloor &&
+            !(isOwner && parsedBody.data.allowBelowFloor === true)
+          ) {
+            return {
+              errorStatus: 400 as const,
+              error: `Custom price (${newSellPrice}c) breaches category net margin floor price (${primaryFloor}c). Only Store Owner with explicit override may apply below-floor pricing.`,
+            };
           }
         }
 
-        if (primaryBc && newSellPrice !== primaryBc.sellPriceCents) {
-          await tx.insert(shelfTagQueue).values({
-            productId: alert.productId,
-            barcode: primaryBc.barcode,
-            oldPriceCents: primaryBc.sellPriceCents,
-            newPriceCents: newSellPrice,
-            reason: "cost_change",
-            status: "pending",
-          });
+        await tx
+          .update(marginAlerts)
+          .set({ resolved: true })
+          .where(eq(marginAlerts.id, id));
+
+        const oldPrimaryPrice = Math.max(1, primaryBc?.sellPriceCents ?? lockedAlert.currentSellPriceCents);
+        const scaleRatio = newSellPrice / oldPrimaryPrice;
+        const tagInserts: (typeof shelfTagQueue.$inferInsert)[] = [];
+
+        for (const bc of allBarcodes) {
+          const targetPrice = bc.isPrimary
+            ? newSellPrice
+            : Math.max(
+                Math.ceil((bc.sellPriceCents * scaleRatio) / 5) * 5,
+                prod
+                  ? computeSuggestedSellPriceCents(
+                      Math.max(prod.avgCostCents, lockedAlert.newCostCents) * bc.packQty,
+                      prod.minMarginBp,
+                      prod.taxRateBp,
+                      prod.taxInclusive,
+                      5
+                    )
+                  : Math.ceil((bc.sellPriceCents * scaleRatio) / 5) * 5
+              );
+
+          if (targetPrice !== bc.sellPriceCents) {
+            await tx
+              .update(productBarcodes)
+              .set({ sellPriceCents: targetPrice })
+              .where(eq(productBarcodes.id, bc.id));
+
+            tagInserts.push({
+              productId: lockedAlert.productId,
+              barcode: bc.barcode,
+              oldPriceCents: bc.sellPriceCents,
+              newPriceCents: targetPrice,
+              reason: "cost_change",
+              status: "pending",
+            });
+          }
         }
+
+        if (tagInserts.length > 0) {
+          await tx.insert(shelfTagQueue).values(tagInserts);
+        }
+        await tx
+          .update(products)
+          .set({ updatedAt: new Date() })
+          .where(eq(products.id, lockedAlert.productId));
 
         await tx.insert(auditLogs).values({
           actor: actorName,
+          actorUserId: req.authUser!.id,
           action: "price_update_margin_alert",
           entityType: "product",
-          entityId: alert.productId,
+          entityId: lockedAlert.productId,
           detailsJson: {
-            oldSellPriceCents: alert.currentSellPriceCents,
+            oldSellPriceCents: lockedAlert.currentSellPriceCents,
             newSellPriceCents: newSellPrice,
             updatedPackTiers: allBarcodes.length,
+            tagsQueued: tagInserts.length,
           },
         });
-        return { updatedPackTiers: allBarcodes.length };
+        return { errorStatus: null, updatedPackTiers: allBarcodes.length };
       });
 
-      if (!updatedRes) {
-        return reply.status(409).send({ error: "Margin alert is already resolved." });
+      if (updatedRes.errorStatus) {
+        return reply.status(updatedRes.errorStatus).send({ error: updatedRes.error });
       }
 
       return {
@@ -543,6 +621,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
       if (!sup) return reply.status(404).send({ error: "Supplier not found." });
 
       const uniquePids = Array.from(new Set(data.lines.map((l) => l.productId)));
+      if (uniquePids.length !== data.lines.length) {
+        return reply.status(400).send({
+          error: "Purchase order lines must reference each productId at most once.",
+        });
+      }
       const foundProds = await db
         .select({ id: products.id })
         .from(products)
@@ -776,6 +859,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
           const lockedProds = await tx
             .select({
               id: products.id,
+              unitMode: products.unitMode,
               avgCostCents: products.avgCostCents,
               minMarginBp: products.minMarginBp,
               taxRateId: products.taxRateId,
@@ -797,18 +881,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
                   .from(taxRates)
                   .where(inArray(taxRates.id, taxIds))
               : [];
-          const baselineRows = await tx
-            .select({ productId: stockBaselines.productId, quantity: stockBaselines.quantity })
-            .from(stockBaselines)
-            .where(inArray(stockBaselines.productId, uniquePids));
-          const unfoldedRows = await tx
-            .select({
-              productId: stockMovements.productId,
-              delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
-            })
-            .from(stockMovements)
-            .where(and(inArray(stockMovements.productId, uniquePids), eq(stockMovements.folded, false)))
-            .groupBy(stockMovements.productId);
+          const liveStockMap = await getLiveStockForProductsTx(tx, uniquePids);
           const primaryBcRows = await tx
             .select()
             .from(productBarcodes)
@@ -822,18 +895,10 @@ export async function inventoryRoutes(app: FastifyInstance) {
               {
                 ...p,
                 currentAvgCostCents: p.avgCostCents,
-                currentStock: 0,
+                currentStock: liveStockMap.get(p.id) ?? 0,
               },
             ])
           );
-          for (const b of baselineRows) {
-            const st = prodStateMap.get(b.productId);
-            if (st) st.currentStock += Number(b.quantity ?? 0);
-          }
-          for (const u of unfoldedRows) {
-            const st = prodStateMap.get(u.productId);
-            if (st) st.currentStock += Number(u.delta ?? 0);
-          }
           const taxMap = new Map(taxRows.map((t) => [t.id, t]));
           const primaryBcMap = new Map(primaryBcRows.map((b) => [b.productId, b]));
 
@@ -842,7 +907,13 @@ export async function inventoryRoutes(app: FastifyInstance) {
           );
           const receivedSummaryByProduct = new Map<
             string,
-            { cases: number; totalUnits: number; invoiceCents: number }
+            {
+              paidCases: number;
+              bonusCases: number;
+              paidUnits: number;
+              totalUnits: number;
+              invoiceCents: number;
+            }
           >();
 
           const grnLineInserts: (typeof grnLines.$inferInsert)[] = [];
@@ -860,12 +931,16 @@ export async function inventoryRoutes(app: FastifyInstance) {
             if (!prodState) continue;
 
             const prevSum = receivedSummaryByProduct.get(line.productId) ?? {
-              cases: 0,
+              paidCases: 0,
+              bonusCases: 0,
+              paidUnits: 0,
               totalUnits: 0,
               invoiceCents: 0,
             };
             receivedSummaryByProduct.set(line.productId, {
-              cases: prevSum.cases + line.paidCases + line.freeBonusCases,
+              paidCases: prevSum.paidCases + line.paidCases,
+              bonusCases: prevSum.bonusCases + line.freeBonusCases,
+              paidUnits: prevSum.paidUnits + paidUnits,
               totalUnits: prevSum.totalUnits + totalUnits,
               invoiceCents: prevSum.invoiceCents + line.invoiceLineTotalCents,
             });
@@ -873,7 +948,8 @@ export async function inventoryRoutes(app: FastifyInstance) {
             const effectiveUnitCost = computeEffectiveUnitCostCents(
               line.invoiceLineTotalCents,
               paidUnits,
-              freeUnits
+              freeUnits,
+              prodState.unitMode as UnitMode
             );
             const prevAvgCost = prodState.currentAvgCostCents;
             const newAvgCost = computeMovingWeightedAvgCostCents(
@@ -1019,21 +1095,28 @@ export async function inventoryRoutes(app: FastifyInstance) {
             let allReceived = poLines.length > 0;
             for (const pl of poLines) {
               const summary = receivedSummaryByProduct.get(pl.productId);
-              const added = summary?.cases ?? 0;
+              const added = summary?.paidCases ?? 0;
               const nextReceived = pl.receivedCases + added;
+              const priorOpenShort = openShortByProduct.get(pl.productId);
+              const orderedUnits = pl.orderedCases * pl.caseQty;
+              const receivedUnitsTotal = nextReceived * pl.caseQty;
+
               if (added > 0) {
                 await tx
                   .update(purchaseOrderLines)
                   .set({ receivedCases: nextReceived })
                   .where(eq(purchaseOrderLines.id, pl.id));
 
-                const orderedUnits = pl.orderedCases * pl.caseQty;
-                const receivedUnitsTotal = nextReceived * pl.caseQty;
+                const prodUnitMode = (prodStateMap.get(pl.productId)?.unitMode ?? "each") as UnitMode;
                 const invUnitCost =
-                  summary && summary.totalUnits > 0
-                    ? Math.round(summary.invoiceCents / summary.totalUnits)
+                  summary && summary.paidUnits > 0
+                    ? computeEffectiveUnitCostCents(
+                        summary.invoiceCents,
+                        summary.paidUnits,
+                        0,
+                        prodUnitMode
+                      )
                     : pl.unitCostCents;
-                const priorOpenShort = openShortByProduct.get(pl.productId);
 
                 if (nextReceived < pl.orderedCases) {
                   const unitDiff = orderedUnits - receivedUnitsTotal;
@@ -1043,7 +1126,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
                       .update(grnVariances)
                       .set({
                         receivedQtyUnits: receivedUnitsTotal,
-                        financialImpactCents: unitDiff * pl.unitCostCents,
+                        financialImpactCents: computeInventoryValueCents(
+                          unitDiff,
+                          pl.unitCostCents,
+                          prodUnitMode
+                        ),
                       })
                       .where(eq(grnVariances.id, priorOpenShort.id));
                   } else if (!data.partialDelivery) {
@@ -1057,7 +1144,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
                       receivedQtyUnits: receivedUnitsTotal,
                       poUnitCostCents: pl.unitCostCents,
                       invoiceUnitCostCents: invUnitCost,
-                      financialImpactCents: unitDiff * pl.unitCostCents,
+                      financialImpactCents: computeInventoryValueCents(
+                        unitDiff,
+                        pl.unitCostCents,
+                        prodUnitMode
+                      ),
                       status: "open",
                     });
                     variancesCreated++;
@@ -1088,7 +1179,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
                       receivedQtyUnits: receivedUnitsTotal,
                       poUnitCostCents: pl.unitCostCents,
                       invoiceUnitCostCents: invUnitCost,
-                      financialImpactCents: overUnits * invUnitCost,
+                      financialImpactCents: computeInventoryValueCents(
+                        overUnits,
+                        invUnitCost,
+                        prodUnitMode
+                      ),
                       status: "open",
                     });
                     variancesCreated++;
@@ -1100,6 +1195,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
                   pl.unitCostCents > 0 &&
                   Math.abs(costDiff) > Math.max(2, Math.round(pl.unitCostCents * 0.01))
                 ) {
+                  const impactedUnits = summary?.paidUnits ?? added * pl.caseQty;
                   await tx.insert(grnVariances).values({
                     grnId: grn.id,
                     poId: data.poId,
@@ -1107,14 +1203,34 @@ export async function inventoryRoutes(app: FastifyInstance) {
                     productId: pl.productId,
                     varianceType: costDiff > 0 ? "cost_overcharge" : "cost_savings",
                     orderedQtyUnits: orderedUnits,
-                    receivedQtyUnits: summary?.totalUnits ?? added * pl.caseQty,
+                    receivedQtyUnits: impactedUnits,
                     poUnitCostCents: pl.unitCostCents,
                     invoiceUnitCostCents: invUnitCost,
-                    financialImpactCents: Math.abs(costDiff) * (summary?.totalUnits ?? added * pl.caseQty),
+                    financialImpactCents: computeInventoryValueCents(
+                      impactedUnits,
+                      Math.abs(costDiff),
+                      prodUnitMode
+                    ),
                     status: "open",
                   });
                   variancesCreated++;
                 }
+              } else if (!data.partialDelivery && pl.receivedCases < pl.orderedCases && !priorOpenShort) {
+                const unitDiff = orderedUnits - receivedUnitsTotal;
+                await tx.insert(grnVariances).values({
+                  grnId: grn.id,
+                  poId: data.poId,
+                  supplierId: data.supplierId,
+                  productId: pl.productId,
+                  varianceType: "short_delivery",
+                  orderedQtyUnits: orderedUnits,
+                  receivedQtyUnits: receivedUnitsTotal,
+                  poUnitCostCents: pl.unitCostCents,
+                  invoiceUnitCostCents: pl.unitCostCents,
+                  financialImpactCents: unitDiff * pl.unitCostCents,
+                  status: "open",
+                });
+                variancesCreated++;
               }
               if (nextReceived < pl.orderedCases) {
                 allReceived = false;
@@ -1204,6 +1320,7 @@ export async function inventoryRoutes(app: FastifyInstance) {
         const [lockedProd] = await tx
           .select({
             id: products.id,
+            unitMode: products.unitMode,
             avgCostCents: products.avgCostCents,
           })
           .from(products)
@@ -1211,24 +1328,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
           .for("update");
         if (!lockedProd) return null;
 
-        const [baseline] = await tx
-          .select({ quantity: stockBaselines.quantity })
-          .from(stockBaselines)
-          .where(eq(stockBaselines.productId, lockedProd.id))
-          .limit(1);
-        const [unfolded] = await tx
-          .select({
-            delta: sql<number>`coalesce(sum(${stockMovements.qtyDelta}), 0)::int`,
-          })
-          .from(stockMovements)
-          .where(
-            and(eq(stockMovements.productId, lockedProd.id), eq(stockMovements.folded, false))
-          );
-
-        const expectedUnits = Number(baseline?.quantity ?? 0) + Number(unfolded?.delta ?? 0);
+        const liveMap = await getLiveStockForProductsTx(tx, [lockedProd.id]);
+        const expectedUnits = liveMap.get(lockedProd.id) ?? 0;
         const varianceUnits = parsed.data.countedBaseUnits - expectedUnits;
 
-        if (varianceUnits !== 0) {
+        if (varianceUnits > 0) {
           await tx.insert(stockMovements).values({
             id: generateUuidV7(),
             productId: lockedProd.id,
@@ -1237,6 +1341,31 @@ export async function inventoryRoutes(app: FastifyInstance) {
             reason: "count_adj",
             folded: false,
           });
+        } else if (varianceUnits < 0) {
+          const fefoRes = await depleteFefoBatchesTx(tx, lockedProd.id, Math.abs(varianceUnits));
+          const adjMovements: (typeof stockMovements.$inferInsert)[] = fefoRes.allocations.map((a) => ({
+            id: generateUuidV7(),
+            productId: lockedProd.id,
+            batchId: a.batchId,
+            qtyDelta: -a.qty,
+            unitCostCents: lockedProd.avgCostCents,
+            reason: "count_adj",
+            folded: false,
+          }));
+          if (fefoRes.unbatchedRemainder > 0) {
+            adjMovements.push({
+              id: generateUuidV7(),
+              productId: lockedProd.id,
+              batchId: null,
+              qtyDelta: -fefoRes.unbatchedRemainder,
+              unitCostCents: lockedProd.avgCostCents,
+              reason: "count_adj",
+              folded: false,
+            });
+          }
+          if (adjMovements.length > 0) {
+            await tx.insert(stockMovements).values(adjMovements);
+          }
         }
 
         await tx.insert(auditLogs).values({
@@ -1256,7 +1385,11 @@ export async function inventoryRoutes(app: FastifyInstance) {
           expectedUnits,
           countedUnits: parsed.data.countedBaseUnits,
           varianceUnits,
-          varianceCostCents: varianceUnits * lockedProd.avgCostCents,
+          varianceCostCents: computeInventoryValueCents(
+            varianceUnits,
+            lockedProd.avgCostCents,
+            lockedProd.unitMode as UnitMode
+          ),
         };
       });
 

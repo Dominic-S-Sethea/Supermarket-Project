@@ -111,3 +111,58 @@ export function buildCsvDocument(headers: string[], rows: unknown[][]): string {
   }
   return lines.join("\r\n");
 }
+
+/**
+ * Escapes PostgreSQL LIKE/ILIKE metacharacters (%, _, \) in user search queries.
+ */
+export function escapeLikePattern(input: string): string {
+  return input.replace(/[\\%_]/g, "\\$&");
+}
+
+/**
+ * Resolves the 0..23 hour of day for a timestamp in an explicit IANA store timezone.
+ */
+export function getHourInTimezone(date: Date, timeZone: string): number {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      hour: "2-digit",
+    }).formatToParts(date);
+    const rawHour = Number(parts.find((p) => p.type === "hour")?.value);
+    if (Number.isInteger(rawHour)) {
+      return rawHour === 24 ? 0 : Math.max(0, Math.min(23, rawHour));
+    }
+  } catch {
+    // Fallback cleanly if a custom timezone string is unparseable
+  }
+  return date.getUTCHours();
+}
+
+/**
+ * Enforces bounded POS sale timestamps against future clock-skew and arbitrary historical backdating.
+ */
+export function validateSoldAtBounds(
+  soldAtIso: string,
+  nowMs = Date.now(),
+  maxBackdateHours = 72,
+  maxFutureSkewSec = 300
+): { ok: true; soldDate: Date } | { ok: false; error: string } {
+  const soldMs = Date.parse(soldAtIso);
+  if (!Number.isFinite(soldMs)) {
+    return { ok: false, error: "Invalid soldAt timestamp." };
+  }
+  if (soldMs - nowMs > maxFutureSkewSec * 1000) {
+    return {
+      ok: false,
+      error: `Sale timestamp soldAt cannot be more than ${maxFutureSkewSec}s in the future.`,
+    };
+  }
+  if (nowMs - soldMs > maxBackdateHours * 3600_000) {
+    return {
+      ok: false,
+      error: `Sale timestamp soldAt exceeds the maximum offline backdating window (${maxBackdateHours}h).`,
+    };
+  }
+  return { ok: true, soldDate: new Date(soldMs) };
+}

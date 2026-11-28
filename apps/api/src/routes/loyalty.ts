@@ -5,6 +5,7 @@ import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getPgErrorCode } from "../app.js";
 import { auditLogs, customers, db, targetedCoupons } from "../db/index.js";
+import { escapeLikePattern } from "../lib/helpers.js";
 import { requireRole } from "../plugins/auth.js";
 
 const UuidSchema = z.string().uuid();
@@ -24,20 +25,49 @@ export async function loyaltyRoutes(app: FastifyInstance) {
     { preHandler: [requireRole(["owner", "manager", "cashier", "accountant"])] },
     async (req) => {
       const q = req.query as { search?: string; segment?: string };
+      const isCashier = req.authUser?.role === "cashier";
       const conditions = [];
       const search = (q.search ?? "").trim();
+      if (isCashier && search.length < 3) {
+        return { summary: null, customers: [] };
+      }
       if (search.length > 0) {
-        const pattern = `%${search}%`;
+        const pattern = `%${escapeLikePattern(search)}%`;
         conditions.push(
-          or(
-            ilike(customers.phone, pattern),
-            ilike(customers.fullName, pattern),
-            ilike(customers.email, pattern)
-          )
+          isCashier
+            ? or(ilike(customers.phone, pattern), ilike(customers.fullName, pattern))
+            : or(
+                ilike(customers.phone, pattern),
+                ilike(customers.fullName, pattern),
+                ilike(customers.email, pattern)
+              )
         );
       }
-      if (q.segment && q.segment !== "all") {
+      if (!isCashier && q.segment && q.segment !== "all") {
         conditions.push(eq(customers.rfmSegment, q.segment));
+      }
+
+      if (isCashier) {
+        const rows = await db
+          .select({
+            id: customers.id,
+            phone: customers.phone,
+            fullName: customers.fullName,
+            pointsBalance: customers.pointsBalance,
+            rfmSegment: customers.rfmSegment,
+          })
+          .from(customers)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .orderBy(desc(customers.createdAt))
+          .limit(10);
+
+        return {
+          summary: null,
+          customers: rows.map((r) => ({
+            ...r,
+            phone: r.phone.length >= 4 ? `***-${r.phone.slice(-4)}` : "***",
+          })),
+        };
       }
 
       const rows = await db
@@ -101,25 +131,30 @@ export async function loyaltyRoutes(app: FastifyInstance) {
       if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
 
       try {
-        const [created] = await db
-          .insert(customers)
-          .values({
-            phone: parsed.data.phone.trim(),
-            fullName: parsed.data.fullName.trim(),
-            email: parsed.data.email ?? null,
-            pointsBalance: 0,
-            lifetimeSpendCents: 0,
-            visits60d: 0,
-            rfmSegment: "New",
-          })
-          .returning();
+        const actor = req.authUser!;
+        const created = await db.transaction(async (tx) => {
+          const [row] = await tx
+            .insert(customers)
+            .values({
+              phone: parsed.data.phone.trim(),
+              fullName: parsed.data.fullName.trim(),
+              email: parsed.data.email ?? null,
+              pointsBalance: 0,
+              lifetimeSpendCents: 0,
+              visits60d: 0,
+              rfmSegment: "New",
+            })
+            .returning();
 
-        await db.insert(auditLogs).values({
-          actor: req.authUser!.fullName,
-          action: "customer_enroll",
-          entityType: "customer",
-          entityId: created.id,
-          detailsJson: { phone: created.phone, fullName: created.fullName },
+          await tx.insert(auditLogs).values({
+            actor: actor.fullName,
+            actorUserId: actor.id,
+            action: "customer_enroll",
+            entityType: "customer",
+            entityId: row.id,
+            detailsJson: { phone: row.phone, fullName: row.fullName },
+          });
+          return row;
         });
 
         return reply.status(201).send({ customer: created });
@@ -139,7 +174,7 @@ export async function loyaltyRoutes(app: FastifyInstance) {
   // =========================================================================
   app.get(
     "/api/loyalty/coupons",
-    { preHandler: [requireRole(["owner", "manager", "cashier", "accountant"])] },
+    { preHandler: [requireRole(["owner", "manager", "accountant"])] },
     async (req, reply) => {
       const q = req.query as { status?: string };
       if (q.status && !["all", "active", "redeemed", "expired"].includes(q.status)) {
@@ -233,31 +268,36 @@ export async function loyaltyRoutes(app: FastifyInstance) {
       const validUntil = new Date(now.getTime() + data.validDays * 86400_000);
 
       try {
-        const [created] = await db
-          .insert(targetedCoupons)
-          .values({
-            code,
-            customerId: data.customerId ?? null,
-            rfmSegment: data.rfmSegment ?? null,
-            discountCents: data.discountCents,
-            minBasketCents: data.minBasketCents,
-            validFrom: now,
-            validUntil,
-          })
-          .returning();
+        const actor = req.authUser!;
+        const created = await db.transaction(async (tx) => {
+          const [row] = await tx
+            .insert(targetedCoupons)
+            .values({
+              code,
+              customerId: data.customerId ?? null,
+              rfmSegment: data.rfmSegment ?? null,
+              discountCents: data.discountCents,
+              minBasketCents: data.minBasketCents,
+              validFrom: now,
+              validUntil,
+            })
+            .returning();
 
-        await db.insert(auditLogs).values({
-          actor: req.authUser!.fullName,
-          action: "coupon_issue",
-          entityType: "targeted_coupon",
-          entityId: created.id,
-          detailsJson: {
-            code: created.code,
-            discountCents: created.discountCents,
-            minBasketCents: created.minBasketCents,
-            customerId: created.customerId,
-            rfmSegment: created.rfmSegment,
-          },
+          await tx.insert(auditLogs).values({
+            actor: actor.fullName,
+            actorUserId: actor.id,
+            action: "coupon_issue",
+            entityType: "targeted_coupon",
+            entityId: row.id,
+            detailsJson: {
+              code: row.code,
+              discountCents: row.discountCents,
+              minBasketCents: row.minBasketCents,
+              customerId: row.customerId,
+              rfmSegment: row.rfmSegment,
+            },
+          });
+          return row;
         });
 
         return reply.status(201).send({ coupon: created });

@@ -14,7 +14,7 @@ import {
   users,
 } from "../db/index.js";
 import { hashPin, requireAuth, requireRole } from "../plugins/auth.js";
-import { createRateLimiter } from "../plugins/security.js";
+import { createRateLimiter, unlockUserLogin } from "../plugins/security.js";
 import { getOrCreateStoreSettings } from "../services/payments.js";
 
 const UuidSchema = z.string().uuid();
@@ -82,30 +82,35 @@ export async function adminRoutes(app: FastifyInstance) {
       const pinHash = await hashPin(parsed.data.pin);
 
       try {
-        const [created] = await db
-          .insert(users)
-          .values({
-            username,
-            fullName: parsed.data.fullName.trim(),
-            role: parsed.data.role,
-            pinHash,
-            active: true,
-          })
-          .returning({
-            id: users.id,
-            username: users.username,
-            fullName: users.fullName,
-            role: users.role,
-            active: users.active,
-            createdAt: users.createdAt,
-          });
+        const actor = req.authUser!;
+        const created = await db.transaction(async (tx) => {
+          const [row] = await tx
+            .insert(users)
+            .values({
+              username,
+              fullName: parsed.data.fullName.trim(),
+              role: parsed.data.role,
+              pinHash,
+              active: true,
+            })
+            .returning({
+              id: users.id,
+              username: users.username,
+              fullName: users.fullName,
+              role: users.role,
+              active: users.active,
+              createdAt: users.createdAt,
+            });
 
-        await db.insert(auditLogs).values({
-          actor: req.authUser!.fullName,
-          action: "user_create",
-          entityType: "user",
-          entityId: created.id,
-          detailsJson: { username: created.username, role: created.role },
+          await tx.insert(auditLogs).values({
+            actor: actor.fullName,
+            actorUserId: actor.id,
+            action: "user_create",
+            entityType: "user",
+            entityId: row.id,
+            detailsJson: { username: row.username, role: row.role },
+          });
+          return row;
         });
 
         return reply.status(201).send({ user: created });
@@ -139,24 +144,9 @@ export async function adminRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: "Provide at least one field to update." });
       }
 
-      const [existing] = await db.select().from(users).where(eq(users.id, id)).limit(1);
-      if (!existing) return reply.status(404).send({ error: "Staff user not found." });
-
-      const nextRole = (data.role ?? existing.role) as import("@supermarket/shared").UserRole;
-      if (data.pin !== undefined) {
-        const { validateCredentialStrength } = await import("@supermarket/shared");
-        const credErr = validateCredentialStrength(data.pin, nextRole);
-        if (credErr) return reply.status(400).send({ error: credErr });
-      }
-
-      const patch: Partial<typeof users.$inferInsert> = {};
-      if (data.fullName !== undefined) patch.fullName = data.fullName.trim();
-      if (data.role !== undefined) patch.role = data.role;
-      if (data.active !== undefined) patch.active = data.active;
-      if (data.pin !== undefined) patch.pinHash = await hashPin(data.pin);
-
-      const roleChanged = data.role !== undefined && data.role !== existing.role;
-      const shouldRevokeSessions = data.active === false || data.pin !== undefined || roleChanged;
+      const pinHash = data.pin !== undefined ? await hashPin(data.pin) : undefined;
+      const { validateCredentialStrength } = await import("@supermarket/shared");
+      const actor = req.authUser!;
 
       const txResult = await db.transaction(async (tx) => {
         const [lockedTarget] = await tx
@@ -165,6 +155,21 @@ export async function adminRoutes(app: FastifyInstance) {
           .where(eq(users.id, id))
           .for("update");
         if (!lockedTarget) return { status: 404 as const, error: "Staff user not found." };
+
+        const nextRole = (data.role ?? lockedTarget.role) as import("@supermarket/shared").UserRole;
+        if (data.pin !== undefined) {
+          const credErr = validateCredentialStrength(data.pin, nextRole);
+          if (credErr) return { status: 400 as const, error: credErr };
+        }
+
+        const patch: Partial<typeof users.$inferInsert> = {};
+        if (data.fullName !== undefined) patch.fullName = data.fullName.trim();
+        if (data.role !== undefined) patch.role = data.role;
+        if (data.active !== undefined) patch.active = data.active;
+        if (pinHash !== undefined) patch.pinHash = pinHash;
+
+        const roleChanged = data.role !== undefined && data.role !== lockedTarget.role;
+        const shouldRevokeSessions = data.active === false || data.pin !== undefined || roleChanged;
 
         // Lock active owner rows inside the transaction to prevent concurrent last-owner lockout TOCTOU
         const demotingOrDisablingOwner =
@@ -209,7 +214,8 @@ export async function adminRoutes(app: FastifyInstance) {
         }
 
         await tx.insert(auditLogs).values({
-          actor: req.authUser!.fullName,
+          actor: actor.fullName,
+          actorUserId: actor.id,
           action: data.pin !== undefined ? "user_pin_reset" : "user_update",
           entityType: "user",
           entityId: id,
@@ -241,41 +247,84 @@ export async function adminRoutes(app: FastifyInstance) {
       if (!UuidSchema.safeParse(id).success) {
         return reply.status(400).send({ error: "Invalid user ID format." });
       }
-      const [target] = await db
-        .select({ id: users.id, username: users.username })
-        .from(users)
-        .where(eq(users.id, id))
-        .limit(1);
-      if (!target) return reply.status(404).send({ error: "Staff user not found." });
+      const actor = req.authUser!;
+      const txRes = await db.transaction(async (tx) => {
+        const [target] = await tx
+          .select({ id: users.id, username: users.username })
+          .from(users)
+          .where(eq(users.id, id))
+          .limit(1);
+        if (!target) return null;
 
-      const now = new Date();
-      const revoked = await db
-        .update(userSessions)
-        .set({ revokedAt: now })
-        .where(
-          and(
-            eq(userSessions.userId, id),
-            isNull(userSessions.revokedAt),
-            gt(userSessions.expiresAt, now)
+        const now = new Date();
+        const revoked = await tx
+          .update(userSessions)
+          .set({ revokedAt: now })
+          .where(
+            and(
+              eq(userSessions.userId, id),
+              isNull(userSessions.revokedAt),
+              gt(userSessions.expiresAt, now)
+            )
           )
-        )
-        .returning({ jti: userSessions.jti });
+          .returning({ jti: userSessions.jti });
 
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: "user_sessions_revoke",
-        entityType: "user",
-        entityId: id,
-        detailsJson: { username: target.username, sessionsRevoked: revoked.length },
+        await tx.insert(auditLogs).values({
+          actor: actor.fullName,
+          actorUserId: actor.id,
+          action: "user_sessions_revoke",
+          entityType: "user",
+          entityId: id,
+          detailsJson: { username: target.username, sessionsRevoked: revoked.length },
+        });
+        return { userId: id, sessionsRevoked: revoked.length };
       });
+      if (!txRes) return reply.status(404).send({ error: "Staff user not found." });
 
-      return { userId: id, sessionsRevoked: revoked.length };
+      return txRes;
+    }
+  );
+
+  app.post(
+    "/api/admin/users/:id/unlock",
+    { preHandler: [requireRole(["owner", "manager"]), adminMutationLimiter] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid user ID format." });
+      }
+      const actor = req.authUser!;
+      const unlocked = await db.transaction(async (tx) => {
+        const [target] = await tx
+          .select({ id: users.id, username: users.username, fullName: users.fullName })
+          .from(users)
+          .where(eq(users.id, id))
+          .limit(1);
+        if (!target) return null;
+
+        await tx.insert(auditLogs).values({
+          actor: actor.fullName,
+          actorUserId: actor.id,
+          action: "auth_unlock",
+          entityType: "user",
+          entityId: target.id,
+          detailsJson: { username: target.username },
+        });
+        return target;
+      });
+      if (!unlocked) return reply.status(404).send({ error: "Staff user not found." });
+
+      unlockUserLogin(unlocked.username);
+      return { ok: true, userId: unlocked.id, username: unlocked.username };
     }
   );
 
   // =========================================================================
   // IMMUTABLE AUDIT LOG EXPLORER
   // =========================================================================
+  let auditFacetsCache: { actions: string[]; entityTypes: string[]; cachedAt: number } | null = null;
+  const AUDIT_FACETS_TTL_MS = 60_000;
+
   app.get(
     "/api/admin/audit-logs",
     { preHandler: [requireRole(["owner", "manager", "accountant"])] },
@@ -297,13 +346,14 @@ export async function adminRoutes(app: FastifyInstance) {
       const offset = (page - 1) * pageSize;
 
       const conditions = [];
-      if (q.actor?.trim()) conditions.push(ilike(auditLogs.actor, `%${q.actor.trim()}%`));
-      if (q.action?.trim() && q.action !== "all") conditions.push(eq(auditLogs.action, q.action.trim()));
+      if (q.actor?.trim()) conditions.push(ilike(auditLogs.actor, `%${q.actor.trim().slice(0, 120)}%`));
+      if (q.action?.trim() && q.action !== "all") conditions.push(eq(auditLogs.action, q.action.trim().slice(0, 80)));
       if (q.entityType?.trim() && q.entityType !== "all") {
-        conditions.push(eq(auditLogs.entityType, q.entityType.trim()));
+        conditions.push(eq(auditLogs.entityType, q.entityType.trim().slice(0, 80)));
       }
-      if (q.search?.trim()) {
-        const pat = `%${q.search.trim()}%`;
+      const cleanSearch = q.search?.trim().slice(0, 120) ?? "";
+      if (cleanSearch) {
+        const pat = `%${cleanSearch}%`;
         conditions.push(
           or(
             ilike(auditLogs.actor, pat),
@@ -313,6 +363,9 @@ export async function adminRoutes(app: FastifyInstance) {
           )
         );
       }
+
+      const facetsFresh =
+        auditFacetsCache !== null && Date.now() - auditFacetsCache.cachedAt < AUDIT_FACETS_TTL_MS;
 
       const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
       const [rows, countRes, facetActions, facetEntities] = await Promise.all([
@@ -327,24 +380,32 @@ export async function adminRoutes(app: FastifyInstance) {
           .select({ total: sql<number>`count(*)::int` })
           .from(auditLogs)
           .where(whereClause),
-        db
-          .selectDistinct({ action: auditLogs.action })
-          .from(auditLogs)
-          .orderBy(auditLogs.action),
-        db
-          .selectDistinct({ entityType: auditLogs.entityType })
-          .from(auditLogs)
-          .orderBy(auditLogs.entityType),
+        facetsFresh
+          ? Promise.resolve(null)
+          : db.selectDistinct({ action: auditLogs.action }).from(auditLogs).orderBy(auditLogs.action),
+        facetsFresh
+          ? Promise.resolve(null)
+          : db
+              .selectDistinct({ entityType: auditLogs.entityType })
+              .from(auditLogs)
+              .orderBy(auditLogs.entityType),
       ]);
+
+      const facets = facetsFresh && auditFacetsCache
+        ? { actions: auditFacetsCache.actions, entityTypes: auditFacetsCache.entityTypes }
+        : {
+            actions: (facetActions ?? []).map((a) => a.action),
+            entityTypes: (facetEntities ?? []).map((e) => e.entityType),
+          };
+      if (!facetsFresh) {
+        auditFacetsCache = { ...facets, cachedAt: Date.now() };
+      }
 
       return {
         page,
         pageSize,
         total: Number(countRes[0]?.total ?? 0),
-        facets: {
-          actions: facetActions.map((a) => a.action),
-          entityTypes: facetEntities.map((e) => e.entityType),
-        },
+        facets,
         logs: rows,
       };
     }
@@ -444,25 +505,55 @@ export async function adminRoutes(app: FastifyInstance) {
       }
 
       const existing = await getOrCreateStoreSettings();
-      const [updated] = await db
-        .update(storeSettings)
-        .set({
-          ...updates,
-          updatedAt: new Date(),
-        })
-        .where(eq(storeSettings.id, existing.id))
-        .returning();
+      const ownerOnlySettlementFields = new Set([
+        "paymentProvider",
+        "khqrAccountId",
+        "khqrMerchantId",
+        "khqrAcquiringBank",
+        "khqrCity",
+        "promptpayProxy",
+        "paynowUen",
+        "fiscalProvider",
+      ]);
+      const updatedKeys = Object.keys(updates) as (keyof typeof updates)[];
+      if (
+        req.authUser!.role !== "owner" &&
+        updatedKeys.some((k) => ownerOnlySettlementFields.has(String(k)))
+      ) {
+        return reply.status(403).send({
+          error: "Only the Store Owner can modify payment settlement accounts or fiscal providers.",
+        });
+      }
 
-      await db.insert(auditLogs).values({
-        actor: req.authUser!.fullName,
-        action: "store_settings_update",
-        entityType: "store_settings",
-        entityId: updated.id,
-        detailsJson: { updatedFields: Object.keys(updates) },
+      const changes: Record<string, { before: unknown; after: unknown }> = {};
+      for (const k of updatedKeys) {
+        changes[String(k)] = {
+          before: (existing as Record<string, unknown>)[String(k)] ?? null,
+          after: updates[k] ?? null,
+        };
+      }
+
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(storeSettings)
+          .set({
+            ...updates,
+            updatedAt: new Date(),
+          })
+          .where(eq(storeSettings.id, existing.id))
+          .returning();
+
+        await tx.insert(auditLogs).values({
+          actor: req.authUser!.fullName,
+          action: "store_settings_update",
+          entityType: "store_settings",
+          entityId: row.id,
+          detailsJson: { updatedFields: updatedKeys, changes },
+        });
+        return row;
       });
 
       return { settings: updated };
     }
   );
 }
-
