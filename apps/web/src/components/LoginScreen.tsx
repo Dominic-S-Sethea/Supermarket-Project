@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { KeyRound, ShieldCheck, Database } from "lucide-react";
 import { apiPost } from "../api";
@@ -44,20 +44,29 @@ export function LoginScreen({
   const [username, setUsername] = useState("");
   const [pin, setPin] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [errorField, setErrorField] = useState<"username" | "pin" | "both" | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const usernameRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    usernameRef.current?.focus();
+  }, []);
 
   const submitLogin = async (u = username, p = pin) => {
     const cleanUser = u.trim();
     const cleanPin = p.trim();
     if (!cleanUser) {
       setError("Enter your staff username.");
+      setErrorField("username");
       return;
     }
     if (cleanPin.length < 4 || cleanPin.length > 64) {
       setError("Staff PIN or password must be 4 to 64 characters.");
+      setErrorField("pin");
       return;
     }
     setError(null);
+    setErrorField(null);
     setSubmitting(true);
     try {
       const res = await apiPost<{ user: SessionUser }>("/api/auth/login", {
@@ -67,6 +76,7 @@ export function LoginScreen({
       onLoggedIn(res.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign-in failed");
+      setErrorField("both");
     } finally {
       setSubmitting(false);
     }
@@ -121,12 +131,13 @@ export function LoginScreen({
         )}
 
         {error && (
-          <div className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
+          <div id="login-error-alert" className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
             {error}
           </div>
         )}
 
         <form
+          noValidate
           className="stack-md"
           style={{ gap: 12 }}
           onSubmit={(e) => {
@@ -137,11 +148,14 @@ export function LoginScreen({
           <div className="field">
             <label htmlFor="login-username">Username</label>
             <input
+              ref={usernameRef}
               id="login-username"
               className="input"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               autoComplete="username"
+              aria-invalid={Boolean(error && (errorField === "username" || errorField === "both")) || undefined}
+              aria-describedby={error ? "login-error-alert" : undefined}
               disabled={submitting}
               required
             />
@@ -155,6 +169,8 @@ export function LoginScreen({
               value={pin}
               onChange={(e) => setPin(e.target.value)}
               autoComplete="current-password"
+              aria-invalid={Boolean(error && (errorField === "pin" || errorField === "both")) || undefined}
+              aria-describedby={error ? "login-error-alert" : undefined}
               disabled={submitting}
               minLength={4}
               maxLength={64}

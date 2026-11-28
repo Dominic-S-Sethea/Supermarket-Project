@@ -1,19 +1,12 @@
-import { expect, test, type Page } from "@playwright/test";
-
-async function loginAsOwner(page: Page) {
-  await page.goto("/");
-  await expect(page.locator("#login-username")).toBeVisible();
-  await page.fill("#login-username", "owner");
-  await page.fill("#login-pin", "1111");
-  await page.click("#login-submit-btn");
-  await expect(page.locator("#logout-btn")).toBeVisible();
-}
+import { expect, test } from "@playwright/test";
+import { attachErrorGuards, E2E_ORIGIN, loginAsOwner } from "./helpers";
 
 test.describe("Flagship Milestone 2: SE Asia EMVCo QR, Dual-Currency Split Tender, CFD, Hold/Recall & Supervisor PIN", () => {
   test("completes split-tender checkout (KHQR dynamic QR + dual-currency KHR cash) while mirroring live to /customer-display", async ({
     page,
     context,
   }) => {
+    const guard = attachErrorGuards(page);
     await loginAsOwner(page);
     await page.click("#nav-pos");
     await expect(page.locator("#pos-barcode-input")).toBeVisible();
@@ -75,9 +68,11 @@ test.describe("Flagship Milestone 2: SE Asia EMVCo QR, Dual-Currency Split Tende
 
     await expect(cfdPage.locator("#cfd-paid-banner")).toContainText("Payment Complete");
     await cfdPage.close();
+    guard.assertClean();
   });
 
   test("parks an active basket via Hold/Recall and restores all items cleanly", async ({ page }) => {
+    const guard = attachErrorGuards(page);
     await loginAsOwner(page);
     await page.click("#nav-pos");
     await expect(page.locator("button.quick-sku-btn").last()).toBeVisible();
@@ -113,11 +108,18 @@ test.describe("Flagship Milestone 2: SE Asia EMVCo QR, Dual-Currency Split Tende
 
     // Original item restored intact
     await expect(basketPanel).toContainText(targetName);
+    guard.assertClean();
   });
 
   test("verifies in-lane Supervisor PIN override without signing out cashier and updates Flagship Store Settings FX rate", async ({
     page,
   }) => {
+    const guard = attachErrorGuards(page, {
+      allowApiErrors: [
+        { method: "POST", pathIncludes: "/api/auth/verify-override", status: 401 },
+        { method: "POST", pathIncludes: "/api/pos/supervisor-override", status: 401 },
+      ],
+    });
     await loginAsOwner(page);
     await page.click("#nav-pos");
     await expect(page.locator("#open-supervisor-override-btn")).toBeVisible();
@@ -165,11 +167,12 @@ test.describe("Flagship Milestone 2: SE Asia EMVCo QR, Dual-Currency Split Tende
         Number(nextFx).toLocaleString()
       );
     } finally {
-      await page.request
-        .patch("/api/store-settings", {
-          data: { secondaryFxRate: Number(originalFx) || 4100 },
-        })
-        .catch(() => {});
+      const res = await page.request.patch("/api/store-settings", {
+        headers: { Origin: E2E_ORIGIN },
+        data: { secondaryFxRate: Number(originalFx) || 4100 },
+      });
+      expect(res.ok(), `Store settings FX cleanup failed with HTTP ${res.status()}`).toBeTruthy();
     }
+    guard.assertClean();
   });
 });

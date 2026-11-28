@@ -19,13 +19,13 @@ interface PhantomItem {
   brand: string;
   aisleLocation: string;
   departmentName: string;
-  avgCostCents: number;
+  avgCostCents?: number;
   bookStockUnits: number;
   avgDailyUnits: number;
   daysSinceLastSale: number;
   voidRefundScore: number;
   phantomProb: number;
-  estimatedValueAtRiskCents: number;
+  estimatedValueAtRiskCents?: number;
   status: string;
 }
 
@@ -33,7 +33,7 @@ interface PhantomSummary {
   totalFlagged: number;
   openCount: number;
   verifiedCount: number;
-  openAtRiskCents: number;
+  openAtRiskCents?: number;
   avgPhantomProb: number;
 }
 
@@ -50,7 +50,7 @@ interface MarkdownItem {
   daysLeft: number;
   qtyRemaining: number;
   currentSellPriceCents: number;
-  unitCostCents: number;
+  unitCostCents?: number;
   recommendedDiscountBp: number;
   recommendedPromoPriceCents: number;
   predictedClearanceUnits: number;
@@ -92,10 +92,12 @@ export function ShelfIntegrityTab({
   canManage,
   onFeedback,
   onError,
+  onCatalogChanged,
 }: {
   canManage: boolean;
   onFeedback: (msg: string) => void;
   onError: (msg: string) => void;
+  onCatalogChanged?: () => void;
 }) {
   const [phantomItems, setPhantomItems] = useState<PhantomItem[]>([]);
   const [phantomSummary, setPhantomSummary] = useState<PhantomSummary | null>(null);
@@ -203,6 +205,7 @@ export function ShelfIntegrityTab({
       onFeedback(
         `Applied ${formatBp(res.discountBp)} dynamic markdown on ${item.sku} (${formatMoney(res.promoPriceCents)}) and queued a 07:30 clearance shelf tag.`
       );
+      onCatalogChanged?.();
       await loadAll();
     } catch (err) {
       onError(err instanceof Error ? err.message : "Failed applying dynamic markdown");
@@ -266,7 +269,9 @@ export function ShelfIntegrityTab({
             {phantomSummary?.openCount ?? 0}
           </div>
           <div className="kpi-meta">
-            {formatMoney(phantomSummary?.openAtRiskCents ?? 0)} book stock at risk ·{" "}
+            {typeof phantomSummary?.openAtRiskCents === "number"
+              ? `${formatMoney(phantomSummary.openAtRiskCents)} book stock at risk · `
+              : ""}
             {phantomSummary?.verifiedCount ?? 0} verified
           </div>
         </div>
@@ -348,8 +353,18 @@ export function ShelfIntegrityTab({
                   type="button"
                   className="btn btn-sm"
                   onClick={() => {
-                    void navigator.clipboard?.writeText(printedZpl.zpl);
-                    onFeedback("Copied Zebra ZPL batch payload to clipboard.");
+                    if (!navigator.clipboard?.writeText) {
+                      onError("Clipboard copy unavailable in this browser context — use Download .zpl instead.");
+                      return;
+                    }
+                    void navigator.clipboard
+                      .writeText(printedZpl.zpl)
+                      .then(() => {
+                        onFeedback("Copied Zebra ZPL batch payload to clipboard.");
+                      })
+                      .catch(() => {
+                        onError("Clipboard copy failed or blocked over HTTP — use Download .zpl instead.");
+                      });
                   }}
                 >
                   <Copy size={12} /> Copy ZPL
@@ -474,7 +489,7 @@ export function ShelfIntegrityTab({
           </div>
         </div>
 
-        <div className="table-wrap" role="region" aria-label="Phantom stock audit table" tabIndex={0}>
+        <div className="table-wrap" role="region" aria-label="Dynamic FEFO markdown recommendations" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -577,7 +592,7 @@ export function ShelfIntegrityTab({
           </div>
         </div>
 
-        <div className="table-wrap" role="region" aria-label="Dynamic FEFO markdown recommendations" tabIndex={0}>
+        <div className="table-wrap" role="region" aria-label="Phantom stock audit table" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>
@@ -624,7 +639,9 @@ export function ShelfIntegrityTab({
                     <td className="text-right mono">{p.avgDailyUnits.toFixed(1)}</td>
                     <td className="text-right mono">{p.daysSinceLastSale.toFixed(1)}d</td>
                     <td className="text-right mono" style={{ fontWeight: 600 }}>
-                      {formatMoney(p.estimatedValueAtRiskCents)}
+                      {typeof p.estimatedValueAtRiskCents === "number"
+                        ? formatMoney(p.estimatedValueAtRiskCents)
+                        : "—"}
                     </td>
                     <td>
                       <span

@@ -5,6 +5,10 @@ import { ModalDialog, SlideDrawer } from "../components/AccessibleDialog";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { HourlyFootfallChart } from "../components/HourlyFootfallChart";
 import { LoginScreen } from "../components/LoginScreen";
+import {
+  RecentReceiptsModal,
+  ShiftCloseModal,
+} from "../components/PosModals";
 import { PosScanBar } from "../components/PosScanBar";
 import { SalesTrendChart } from "../components/SalesTrendChart";
 import { SubTabBar } from "../components/SubTabBar";
@@ -15,6 +19,7 @@ import {
   setClientErrorReporter,
 } from "../lib/telemetry";
 import { THEME_STORAGE_KEY, useTheme } from "../lib/theme";
+import { useSpatial3DPanels } from "../lib/spatial3d";
 import { CatalogView } from "../views/CatalogView";
 
 afterEach(() => {
@@ -41,7 +46,7 @@ describe("LoginScreen security & error-state behavior (C-02, M-19)", () => {
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
-  it("validates short PINs and submits credentials to /api/auth/login", async () => {
+  it("validates short PINs with accessible ARIA links and submits credentials to /api/auth/login", async () => {
     const onLoggedIn = vi.fn();
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
@@ -53,14 +58,24 @@ describe("LoginScreen security & error-state behavior (C-02, M-19)", () => {
     );
 
     render(<LoginScreen onLoggedIn={onLoggedIn} />);
+    const usernameInput = screen.getByLabelText(/Username/i);
+    const pinInput = screen.getByLabelText(/Staff PIN/i);
+    const form = screen.getByRole("button", { name: /Sign In/i }).closest("form")!;
 
-    fireEvent.change(screen.getByLabelText(/Username/i), { target: { value: "owner" } });
-    fireEvent.change(screen.getByLabelText(/Staff PIN/i), { target: { value: "12" } });
-    fireEvent.submit(screen.getByRole("button", { name: /Sign In/i }).closest("form")!);
-    expect(screen.getByRole("alert")).toHaveTextContent(/4 to 64 characters/i);
+    expect(document.activeElement).toBe(usernameInput);
+    expect(form).toHaveAttribute("novalidate");
+
+    fireEvent.change(usernameInput, { target: { value: "owner" } });
+    fireEvent.change(pinInput, { target: { value: "12" } });
+    fireEvent.submit(form);
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveAttribute("id", "login-error-alert");
+    expect(alert).toHaveTextContent(/4 to 64 characters/i);
+    expect(pinInput).toHaveAttribute("aria-invalid", "true");
+    expect(pinInput).toHaveAttribute("aria-describedby", "login-error-alert");
     expect(fetchSpy).not.toHaveBeenCalled();
 
-    fireEvent.change(screen.getByLabelText(/Staff PIN/i), { target: { value: "1111" } });
+    fireEvent.change(pinInput, { target: { value: "1111" } });
     fireEvent.click(screen.getByRole("button", { name: /Sign In/i }));
 
     await waitFor(() => {
@@ -248,29 +263,29 @@ describe("ThemeSwitcher & useTheme (Blue-Navy, Dark, Light)", () => {
     return <ThemeSwitcher theme={theme} onChange={setTheme} variant="sidebar" />;
   }
 
-  it("defaults to Blue-Navy and switches cleanly between Dark and Light with persistence", () => {
+  it("defaults to Warm Editorial Light and switches cleanly between Navy and Dark with persistence", () => {
     window.localStorage.removeItem(THEME_STORAGE_KEY);
     delete document.documentElement.dataset.theme;
 
     render(<ThemeHarness />);
 
+    const lightBtn = screen.getByRole("button", { name: /Light/i });
     const navyBtn = screen.getByRole("button", { name: /Navy/i });
     const darkBtn = screen.getByRole("button", { name: /Dark/i });
-    const lightBtn = screen.getByRole("button", { name: /Light/i });
 
+    expect(lightBtn).toHaveAttribute("aria-pressed", "true");
+    expect(document.documentElement.dataset.theme).toBe("light");
+
+    fireEvent.click(navyBtn);
     expect(navyBtn).toHaveAttribute("aria-pressed", "true");
+    expect(lightBtn).toHaveAttribute("aria-pressed", "false");
     expect(document.documentElement.dataset.theme).toBe("navy");
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("navy");
 
     fireEvent.click(darkBtn);
     expect(darkBtn).toHaveAttribute("aria-pressed", "true");
-    expect(navyBtn).toHaveAttribute("aria-pressed", "false");
     expect(document.documentElement.dataset.theme).toBe("dark");
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
-
-    fireEvent.click(lightBtn);
-    expect(lightBtn).toHaveAttribute("aria-pressed", "true");
-    expect(document.documentElement.dataset.theme).toBe("light");
-    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
 
     window.localStorage.removeItem(THEME_STORAGE_KEY);
   });
@@ -386,19 +401,84 @@ describe("AccessibleDialog background inert isolation & stacked scroll lock", ()
     expect(container.getAttribute("aria-hidden")).toBeNull();
     expect((container as HTMLElement & { inert?: boolean }).inert).toBe(false);
   });
+
+  it("supports initialFocusRef, skips hidden elements in focus cycle, and ignores mouse-drag backdrop releases", async () => {
+    const onClose = vi.fn();
+    function FocusHarness() {
+      const inputRef = useRef<HTMLInputElement>(null);
+      return (
+        <SlideDrawer
+          open
+          onClose={onClose}
+          ariaLabel="Preferred Focus Drawer"
+          initialFocusRef={inputRef}
+        >
+          <button type="button">Header Action</button>
+          <button type="button" hidden>
+            Hidden Action
+          </button>
+          <input ref={inputRef} aria-label="Target Input" />
+        </SlideDrawer>
+      );
+    }
+
+    render(<FocusHarness />);
+    const headerBtn = screen.getByRole("button", { name: "Header Action" });
+    const targetInput = screen.getByLabelText("Target Input");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(targetInput);
+    });
+
+    // Tab wraps past hidden button back to visible Header Action
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(headerBtn);
+
+    // Mousedown inside dialog followed by backdrop click does not dismiss
+    const backdrop = document.querySelector(".overlay-backdrop")!;
+    fireEvent.mouseDown(targetInput);
+    fireEvent.click(backdrop);
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Direct mousedown + click on backdrop dismisses cleanly
+    fireEvent.mouseDown(backdrop);
+    fireEvent.click(backdrop);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("PosScanBar & HourlyFootfallChart localized interaction state", () => {
-  it("submits barcode, clears only when accepted, and focuses when active", () => {
+  it("submits barcode, exposes ARIA error/disabled states, clears only when accepted, and focuses when active", () => {
     const onScan = vi.fn((code: string) => code === "8850000000014");
     function Harness() {
       const ref = useRef<HTMLInputElement>(null);
-      return <PosScanBar inputRef={ref} isActive disabled={false} onScan={onScan} />;
+      const [invalid, setInvalid] = useState(true);
+      const [inputDisabled, setInputDisabled] = useState(false);
+      return (
+        <>
+          <PosScanBar
+            inputRef={ref}
+            isActive
+            disabled={false}
+            inputDisabled={inputDisabled}
+            invalid={invalid}
+            errorId="pos-scan-error-alert"
+            onScan={onScan}
+          />
+          <button type="button" onClick={() => setInvalid(false)}>
+            Clear Error
+          </button>
+          <button type="button" onClick={() => setInputDisabled(true)}>
+            Lock Scan
+          </button>
+        </>
+      );
     }
 
     render(<Harness />);
     const input = screen.getByLabelText(/Scan EAN-13, UPC-A, GS1 scale barcode/i);
     expect(document.activeElement).toBe(input);
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input).toHaveAttribute("aria-describedby", "pos-scan-error-alert");
 
     fireEvent.change(input, { target: { value: "0000" } });
     fireEvent.submit(input.closest("form")!);
@@ -409,6 +489,12 @@ describe("PosScanBar & HourlyFootfallChart localized interaction state", () => {
     fireEvent.submit(input.closest("form")!);
     expect(onScan).toHaveBeenCalledWith("8850000000014");
     expect(input).toHaveValue("");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear Error" }));
+    expect(input).not.toHaveAttribute("aria-invalid");
+
+    fireEvent.click(screen.getByRole("button", { name: "Lock Scan" }));
+    expect(input).toBeDisabled();
   });
 
   it("reveals hourly funnel readout on keyboard focus", () => {
@@ -623,7 +709,7 @@ describe("Flagship Milestone 2: QrCodeSvg, PosCheckoutModal & CustomerDisplayVie
         grandTotalCents={1000}
         storeSettings={{
           id: "store-1",
-          storeCode: "FLAGSHIP",
+          code: "FLAGSHIP",
           legalName: "SupermarketOS Flagship Co., Ltd.",
           storeName: "SupermarketOS Flagship Market",
           address: "123 Norodom Blvd",
@@ -755,6 +841,215 @@ describe("Flagship Milestone 2: QrCodeSvg, PosCheckoutModal & CustomerDisplayVie
     ).toBeInTheDocument();
 
     localStorage.removeItem(CFD_STORAGE_KEY);
+  });
+});
+
+describe("POS Destructive Guardrails & Blind Close Controls", () => {
+  it("requires confirmation before voiding/refunding receipts and highlights Void as btn-danger", () => {
+    const onVoidOrRefund = vi.fn();
+    render(
+      <RecentReceiptsModal
+        open
+        canVoidOrRefund
+        loadingRecent={false}
+        recentSales={[
+          {
+            id: "s1",
+            registerCode: "REG-01",
+            receiptNo: "REG-01-TEST9999",
+            kind: "sale",
+            originalSaleId: null,
+            customerId: null,
+            cashierName: "Elena Morales",
+            totalCents: 1450,
+            soldAt: new Date().toISOString(),
+            alreadyVoided: false,
+            lines: [
+              {
+                id: "l1",
+                productId: "p1",
+                productName: "Sparkling Water",
+                scannedBarcode: "8850000000014",
+                packLabel: "Single",
+                packQty: 1,
+                qtyPacks: 1,
+                unitPriceCents: 1450,
+                unitCostCents: 900,
+                discountCents: 0,
+                taxRateBp: 0,
+                taxCents: 0,
+                lineTotalCents: 1450,
+              },
+            ],
+            payments: [{ id: "pm1", method: "cash", amountCents: 1450 }],
+          },
+        ]}
+        recentError={null}
+        busyReceiptId={null}
+        onVoidOrRefund={onVoidOrRefund}
+        onClose={vi.fn()}
+      />
+    );
+
+    const voidBtn = screen.getByRole("button", { name: /^Void$/i });
+    expect(voidBtn).toHaveClass("btn-danger");
+
+    fireEvent.click(voidBtn);
+    expect(onVoidOrRefund).not.toHaveBeenCalled();
+    expect(screen.getByText(/Confirm VOID:/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Confirm Void/i }));
+    expect(onVoidOrRefund).toHaveBeenCalledTimes(1);
+    expect(onVoidOrRefund).toHaveBeenCalledWith(expect.objectContaining({ id: "s1" }), "void");
+  });
+
+  it("disables ShiftCloseModal submission when blind cash count is empty and enables on valid entry", () => {
+    function BlindHarness() {
+      const [val, setVal] = useState("");
+      return (
+        <ShiftCloseModal
+          open
+          activeShift={{
+            id: "sh1",
+            registerCode: "REG-01",
+            openingFloatCents: 30000,
+            openedAt: new Date().toISOString(),
+          }}
+          blindCashInput={val}
+          fallbackFloatInput="300.00"
+          closingShift={false}
+          shiftError={null}
+          zReportResult={null}
+          onBlindCashChange={setVal}
+          onFallbackFloatChange={vi.fn()}
+          onSubmit={vi.fn()}
+          onClose={vi.fn()}
+        />
+      );
+    }
+
+    render(<BlindHarness />);
+    const submitBtn = screen.getByRole("button", {
+      name: /Submit Blind Count & Generate Z-Report/i,
+    });
+    const blindInput = screen.getByLabelText(/Physical Cash Counted in Drawer/i);
+    expect(blindInput).toHaveValue("");
+    expect(submitBtn).toBeDisabled();
+
+    fireEvent.change(blindInput, { target: { value: "312.50" } });
+    expect(submitBtn).toBeEnabled();
+  });
+});
+
+describe("useSpatial3DPanels cursor-reactive 3D elevation & reduced motion", () => {
+  function mockMatchMedia(reducedMotion: boolean) {
+    return (query: string) => ({
+      matches: query.includes("prefers-reduced-motion") ? reducedMotion : query.includes("pointer: fine"),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    });
+  }
+
+  function SpatialHarness() {
+    useSpatial3DPanels();
+    return (
+      <section className="panel" data-testid="outer-panel">
+        <div className="kpi-tile" data-testid="inner-tile">
+          <span>Live Tile</span>
+        </div>
+      </section>
+    );
+  }
+
+  it("applies is-3d-active and cursor tilt CSS variables on inner card and cleans up on pointerleave", async () => {
+    const origMatchMedia = window.matchMedia;
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: mockMatchMedia(false),
+    });
+
+    try {
+      render(<SpatialHarness />);
+      const outer = screen.getByTestId("outer-panel");
+      const inner = screen.getByTestId("inner-tile");
+
+      vi.spyOn(inner, "getBoundingClientRect").mockReturnValue({
+        x: 0,
+        y: 0,
+        left: 0,
+        top: 0,
+        right: 200,
+        bottom: 100,
+        width: 200,
+        height: 100,
+        toJSON: () => ({}),
+      });
+
+      const moveEvent = new Event("pointermove", { bubbles: true }) as PointerEvent;
+      Object.defineProperties(moveEvent, {
+        clientX: { value: 180 },
+        clientY: { value: 20 },
+        pointerType: { value: "mouse" },
+        buttons: { value: 0 },
+      });
+      inner.dispatchEvent(moveEvent);
+
+      await waitFor(() => {
+        expect(inner).toHaveClass("is-3d-active");
+      });
+      expect(outer).not.toHaveClass("is-3d-active");
+      expect(inner.style.getPropertyValue("--rx")).toMatch(/^-?\d+(\.\d+)?deg$/);
+      expect(inner.style.getPropertyValue("--ry")).toMatch(/^-?\d+(\.\d+)?deg$/);
+      expect(inner.style.getPropertyValue("--gx")).toBe("90.0%");
+      expect(inner.style.getPropertyValue("--gy")).toBe("20.0%");
+
+      document.documentElement.dispatchEvent(new Event("pointerleave"));
+      expect(inner).not.toHaveClass("is-3d-active");
+      expect(inner.style.getPropertyValue("--rx")).toBe("");
+    } finally {
+      Object.defineProperty(window, "matchMedia", {
+        configurable: true,
+        writable: true,
+        value: origMatchMedia,
+      });
+    }
+  });
+
+  it("stays disabled when prefers-reduced-motion: reduce matches", async () => {
+    const origMatchMedia = window.matchMedia;
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: mockMatchMedia(true),
+    });
+
+    try {
+      render(<SpatialHarness />);
+      const inner = screen.getByTestId("inner-tile");
+      const moveEvent = new Event("pointermove", { bubbles: true }) as PointerEvent;
+      Object.defineProperties(moveEvent, {
+        clientX: { value: 120 },
+        clientY: { value: 40 },
+        pointerType: { value: "mouse" },
+        buttons: { value: 0 },
+      });
+      inner.dispatchEvent(moveEvent);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(inner).not.toHaveClass("is-3d-active");
+      expect(inner.style.getPropertyValue("--rx")).toBe("");
+    } finally {
+      Object.defineProperty(window, "matchMedia", {
+        configurable: true,
+        writable: true,
+        value: origMatchMedia,
+      });
+    }
   });
 });
 

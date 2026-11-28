@@ -1,5 +1,6 @@
 import type { PaymentMethod, StoreSettingsDto } from "@supermarket/shared/dtos";
-import type { PromotionRule } from "@supermarket/shared/pricing";
+import { generateUuidV7 } from "@supermarket/shared/money";
+import { evaluateCart, type CartInputLine, type PromotionRule } from "@supermarket/shared/pricing";
 import { ApiError } from "../api.ts";
 
 const DB_NAME = "supermarket_os_pos_cache";
@@ -90,9 +91,11 @@ export interface QueuedPosSale {
   kind: "sale";
   soldAt: string;
   cashierName: string;
+  originCashierId?: string | null;
   ageVerified: boolean;
   customerId?: string | null;
   couponCode?: string | null;
+  supervisorOverrideId?: string | null;
   supervisorOverrideBy?: string | null;
   lines: {
     id: string;
@@ -232,6 +235,60 @@ export function saveOfflineQueue(
   }
 }
 
+let offlineQueueMutex: Promise<void> = Promise.resolve();
+
+/**
+ * Serialize read-modify-write operations on offline queues across async flushes and tabs.
+ */
+export async function withOfflineQueueLock<T>(fn: () => Promise<T>): Promise<T> {
+  if (typeof navigator !== "undefined" && navigator.locks && typeof navigator.locks.request === "function") {
+    return navigator.locks.request("supermarket_os_offline_queue_v1", () => fn());
+  }
+  const prev = offlineQueueMutex;
+  let release!: () => void;
+  offlineQueueMutex = new Promise<void>((res) => {
+    release = res;
+  });
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+export function enqueueOfflineSaleResult(
+  sale: QueuedPosSale,
+  storage: Pick<Storage, "getItem" | "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): { queue: QueuedPosSale[]; saved: boolean } {
+  const existing = loadOfflineQueue(storage);
+  if (existing.some((s) => s.id === sale.id)) {
+    return { queue: existing, saved: true };
+  }
+  const next = [...existing, sale];
+  const saved = saveOfflineQueue(next, storage);
+  return { queue: saved ? next : existing, saved };
+}
+
+/**
+ * Remove only completed/quarantined sale IDs from the freshest queue snapshot
+ * so concurrent sales added during async network calls are never overwritten.
+ */
+export function removeOfflineSalesByIds(
+  saleIds: Iterable<string>,
+  storage: Pick<Storage, "getItem" | "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): { queue: QueuedPosSale[]; saved: boolean } {
+  const idSet = new Set(saleIds);
+  const existing = loadOfflineQueue(storage);
+  const next = existing.filter((s) => !idSet.has(s.id));
+  const saved = saveOfflineQueue(next, storage);
+  return { queue: saved ? next : existing, saved };
+}
+
 /**
  * Synchronously append a sale to persistent offline storage before React state commits
  * so an immediate 401 unmount cannot lose the receipt.
@@ -242,13 +299,7 @@ export function enqueueOfflineSale(
     ? localStorage
     : undefined
 ): QueuedPosSale[] {
-  const existing = loadOfflineQueue(storage);
-  if (existing.some((s) => s.id === sale.id)) {
-    return existing;
-  }
-  const next = [...existing, sale];
-  saveOfflineQueue(next, storage);
-  return next;
+  return enqueueOfflineSaleResult(sale, storage).queue;
 }
 
 export function loadDeadLetterQueue(
@@ -283,16 +334,25 @@ export function saveDeadLetterQueue(
   }
 }
 
+export function appendDeadLetterSaleResult(
+  entry: DeadLetterPosSale,
+  storage: Pick<Storage, "getItem" | "setItem"> | undefined = typeof localStorage !== "undefined"
+    ? localStorage
+    : undefined
+): { queue: DeadLetterPosSale[]; saved: boolean } {
+  const existing = loadDeadLetterQueue(storage).filter((d) => d.sale.id !== entry.sale.id);
+  const next = [entry, ...existing];
+  const saved = saveDeadLetterQueue(next, storage);
+  return { queue: saved ? next : loadDeadLetterQueue(storage), saved };
+}
+
 export function appendDeadLetterSale(
   entry: DeadLetterPosSale,
   storage: Pick<Storage, "getItem" | "setItem"> | undefined = typeof localStorage !== "undefined"
     ? localStorage
     : undefined
 ): DeadLetterPosSale[] {
-  const existing = loadDeadLetterQueue(storage).filter((d) => d.sale.id !== entry.sale.id);
-  const next = [entry, ...existing];
-  saveDeadLetterQueue(next, storage);
-  return next;
+  return appendDeadLetterSaleResult(entry, storage).queue;
 }
 
 export function removeDeadLetterSale(
@@ -304,6 +364,110 @@ export function removeDeadLetterSale(
   const next = loadDeadLetterQueue(storage).filter((d) => d.sale.id !== saleId);
   saveDeadLetterQueue(next, storage);
   return next;
+}
+
+/**
+ * Recompute line discounts, VAT, and totals without a rejected/expired coupon,
+ * and adjust non-intent-locked tender legs so `SUM(payments) === grandTotalCents`.
+ */
+export function rebuildSaleWithoutCoupon(
+  sale: QueuedPosSale,
+  productsMap: Map<string, PosBootstrapSnapshot["products"][number]>,
+  taxMap: Map<string, PosBootstrapSnapshot["taxRates"][number]>,
+  promos: PromotionRule[]
+): QueuedPosSale {
+  const cartLines: CartInputLine[] = sale.lines.map((l) => {
+    const prod = productsMap.get(l.productId);
+    const tax = prod ? taxMap.get(prod.taxRateId) : undefined;
+    const isMeasured =
+      prod?.unitMode === "weight_g" ||
+      prod?.unitMode === "volume_ml" ||
+      (typeof l.weightGrams === "number" && l.weightGrams > 0);
+    return {
+      lineKey: l.id,
+      productId: l.productId,
+      categoryId: prod?.categoryId ?? "",
+      sku: prod?.sku ?? l.productId,
+      name: prod?.name ?? l.packLabel,
+      scannedBarcode: l.scannedBarcode,
+      packLabel: l.packLabel,
+      packQty: l.packQty,
+      qtyPacks: l.qtyPacks,
+      unitMode: prod?.unitMode ?? (isMeasured ? "weight_g" : "each"),
+      weightGrams: l.weightGrams ?? null,
+      tareGrams: l.tareGrams ?? 0,
+      unitPriceCents: l.unitPriceCents,
+      unitCostCents: l.unitCostCents,
+      taxRateBp: tax?.rateBp ?? l.taxRateBp,
+      taxInclusive: tax?.isInclusive ?? true,
+      requiresAgeCheck: prod?.requiresAgeCheck ?? false,
+    };
+  });
+
+  const soldDate = new Date(sale.soldAt);
+  const evalNow = Number.isNaN(soldDate.getTime()) ? new Date() : soldDate;
+  const evaluated = evaluateCart(cartLines, promos, {
+    evalHour: evalNow.getHours(),
+    evalNow,
+    couponDiscountCents: 0,
+  });
+
+  const evalByKey = new Map(evaluated.lines.map((el) => [el.lineKey, el]));
+  const updatedLines = sale.lines.map((l) => {
+    const el = evalByKey.get(l.id);
+    if (!el) return l;
+    return {
+      ...l,
+      discountCents: el.discountCents,
+      taxRateBp: el.taxRateBp,
+      taxCents: el.taxCents,
+      lineTotalCents: el.lineTotalCents,
+    };
+  });
+
+  const targetTotal = evaluated.grandTotalCents;
+  const existingTotal = sale.payments.reduce((s, p) => s + p.amountCents, 0);
+  let delta = targetTotal - existingTotal;
+  let updatedPayments = sale.payments.map((p) => ({ ...p }));
+
+  if (delta > 0) {
+    const adjustableCash = updatedPayments.find((p) => p.method === "cash" && !p.paymentIntentId);
+    if (adjustableCash) {
+      adjustableCash.amountCents += delta;
+      adjustableCash.tenderedCents = (adjustableCash.tenderedCents ?? adjustableCash.amountCents - delta) + delta;
+    } else {
+      updatedPayments.push({
+        id: generateUuidV7(),
+        method: "cash",
+        amountCents: delta,
+        tenderedCents: delta,
+        changeCents: 0,
+        currencyCode: updatedPayments[0]?.currencyCode ?? "USD",
+      });
+    }
+  } else if (delta < 0) {
+    let toReduce = -delta;
+    updatedPayments = updatedPayments
+      .map((p) => {
+        if (toReduce <= 0 || p.paymentIntentId) return p;
+        const cut = Math.min(toReduce, p.amountCents);
+        toReduce -= cut;
+        const nextAmount = p.amountCents - cut;
+        return {
+          ...p,
+          amountCents: nextAmount,
+          tenderedCents: Math.max(nextAmount, (p.tenderedCents ?? p.amountCents) - cut),
+        };
+      })
+      .filter((p) => p.amountCents > 0);
+  }
+
+  return {
+    ...sale,
+    couponCode: null,
+    lines: updatedLines,
+    payments: updatedPayments,
+  };
 }
 
 export interface LocalParkedBasketRecord {
@@ -417,6 +581,11 @@ export async function loadPosCache(): Promise<PosBootstrapSnapshot | null> {
 
 export async function savePosCache(snapshot: PosBootstrapSnapshot): Promise<boolean> {
   if (!isValidPosSnapshot(snapshot)) return false;
+  // Never persist wholesale avgCostCents into shared workstation IndexedDB
+  const sanitizedSnapshot: PosBootstrapSnapshot = {
+    ...snapshot,
+    products: snapshot.products.map(({ avgCostCents: _cost, ...pub }) => pub),
+  };
   let db: IDBDatabase | null = null;
   try {
     db = await openDb();
@@ -436,7 +605,7 @@ export async function savePosCache(snapshot: PosBootstrapSnapshot): Promise<bool
       };
       const tx = openedDb.transaction(STORE_NAME, "readwrite");
       const store = tx.objectStore(STORE_NAME);
-      store.put(snapshot, KEY);
+      store.put(sanitizedSnapshot, KEY);
       tx.oncomplete = () => finish(true);
       tx.onerror = () => finish(false);
       tx.onabort = () => finish(false);

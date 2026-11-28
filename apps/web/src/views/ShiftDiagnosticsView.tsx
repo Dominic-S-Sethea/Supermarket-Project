@@ -470,6 +470,7 @@ export function ShiftDiagnosticsView({
 
       {banner && (
         <div
+          role={banner.kind === "red" ? "alert" : "status"}
           className={`banner ${
             banner.kind === "green" ? "banner-green" : banner.kind === "amber" ? "banner-amber" : "banner-red"
           }`}
@@ -819,7 +820,7 @@ export function ShiftDiagnosticsView({
                     </p>
                   </div>
                 </div>
-                <div className="table-wrap" role="region" aria-label="Controlled experiment results" tabIndex={0}>
+                <div className="table-wrap" role="region" aria-label="Morning-only market basket rules" tabIndex={0}>
                   <table className="data-table">
                     <thead>
                       <tr>

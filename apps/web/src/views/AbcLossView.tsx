@@ -190,7 +190,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
       </header>
 
       {errorMsg && (
-        <div className="banner banner-red" style={{ marginBottom: 16 }}>
+        <div className="banner banner-red" role="alert" style={{ marginBottom: 16 }}>
           <span>{errorMsg}</span>
           <button type="button" className="btn btn-sm" onClick={() => setErrorMsg(null)}>
             Dismiss
@@ -478,7 +478,7 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
               </p>
             </div>
           </div>
-          <div className="table-wrap" role="region" aria-label="Shrinkage ledger" tabIndex={0}>
+          <div className="table-wrap" role="region" aria-label="Dead-stock capital traps" tabIndex={0}>
             <table className="data-table">
               <thead>
                 <tr>

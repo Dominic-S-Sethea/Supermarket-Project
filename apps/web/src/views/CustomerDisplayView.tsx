@@ -42,6 +42,7 @@ export function CustomerDisplayView() {
   const [state, setState] = useState<CfdStatePayload>(
     () => readCfdState() ?? DEFAULT_IDLE_STATE
   );
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     document.title = `${state.storeName} — Customer Display`;
@@ -51,9 +52,25 @@ export function CustomerDisplayView() {
     const initial = readCfdState();
     if (initial) setState(initial);
     return subscribeCfdState((next) => {
-      setState(next);
+      setState(next ?? DEFAULT_IDLE_STATE);
     });
   }, []);
+
+  const activeQrStatus = state.activeQr?.status ?? null;
+  useEffect(() => {
+    if (activeQrStatus !== "pending") return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 5_000);
+    return () => window.clearInterval(id);
+  }, [activeQrStatus]);
+
+  const isQrExpired = Boolean(
+    state.activeQr &&
+      state.activeQr.status === "pending" &&
+      Number.isFinite(Date.parse(state.activeQr.expiresAt)) &&
+      Date.parse(state.activeQr.expiresAt) <= nowMs
+  );
+  const effectiveQrStatus = isQrExpired ? "expired" : state.activeQr?.status ?? null;
 
   const secondaryTotal =
     state.secondaryCurrency && state.grandTotalCents > 0
@@ -287,18 +304,18 @@ export function CustomerDisplayView() {
                 </div>
                 <span
                   className={`tag mono ${
-                    state.activeQr.status === "paid"
+                    effectiveQrStatus === "paid"
                       ? "tag-green"
-                      : state.activeQr.status === "pending"
+                      : effectiveQrStatus === "pending"
                         ? "tag-amber"
                         : "tag-red"
                   }`}
                 >
-                  {state.activeQr.status.toUpperCase()}
+                  {(effectiveQrStatus ?? state.activeQr.status).toUpperCase()}
                 </span>
               </div>
 
-              {state.activeQr.qrPayload && state.activeQr.status !== "paid" && (
+              {state.activeQr.qrPayload && effectiveQrStatus === "pending" && (
                 <QrCodeSvg
                   payload={state.activeQr.qrPayload}
                   sizePx={236}
@@ -306,7 +323,13 @@ export function CustomerDisplayView() {
                 />
               )}
 
-              {state.activeQr.status === "paid" && (
+              {effectiveQrStatus === "expired" && (
+                <div className="banner banner-red" role="alert" style={{ width: "100%", justifyContent: "center" }}>
+                  <span>Payment QR expired — please ask the cashier to generate a fresh QR code.</span>
+                </div>
+              )}
+
+              {effectiveQrStatus === "paid" && (
                 <div className="banner banner-green" style={{ width: "100%", justifyContent: "center" }}>
                   <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontWeight: 700 }}>
                     <CheckCircle2 size={16} aria-hidden="true" />

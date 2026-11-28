@@ -4,6 +4,7 @@ import { formatMoney } from "@supermarket/shared/money";
 import { KeyRound, PauseCircle, PlayCircle, ShieldAlert, Trash2, X } from "lucide-react";
 import { apiPost } from "../api";
 import { ModalDialog } from "./AccessibleDialog";
+import { ConfirmActionButton } from "./ConfirmActionButton";
 
 export interface LocalOrServerParkedBasket {
   id: string;
@@ -177,15 +178,14 @@ export function PosParkedBasketsModal({
                         >
                           <PlayCircle size={12} aria-hidden="true" /> Recall
                         </button>
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          aria-label={`Discard parked basket ${b.holdCode}`}
+                        <ConfirmActionButton
+                          label={<Trash2 size={12} aria-hidden="true" />}
+                          confirmLabel="Discard"
+                          ariaLabel={`Discard parked basket ${b.holdCode}`}
+                          confirmAriaLabel={`Confirm discard parked basket ${b.holdCode}`}
                           disabled={busyId !== null}
-                          onClick={() => void onDiscard(b)}
-                        >
-                          <Trash2 size={12} aria-hidden="true" />
-                        </button>
+                          onConfirm={() => onDiscard(b)}
+                        />
                       </div>
                     </td>
                   </tr>

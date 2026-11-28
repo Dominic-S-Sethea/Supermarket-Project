@@ -1,7 +1,10 @@
+import { useEffect, useState } from "react";
+import type { PaymentMethod } from "@supermarket/shared/dtos";
 import { formatMoney } from "@supermarket/shared/money";
 import { AlertTriangle, RefreshCw, RotateCcw, ShieldCheck, X } from "lucide-react";
 import type { DeadLetterPosSale } from "../lib/posCache";
 import { ModalDialog } from "./AccessibleDialog";
+import { ConfirmActionButton } from "./ConfirmActionButton";
 
 export interface RecentSaleLine {
   id: string;
@@ -11,6 +14,9 @@ export interface RecentSaleLine {
   packLabel: string;
   packQty: number;
   qtyPacks: number;
+  weightGrams?: number | null;
+  tareGrams?: number | null;
+  baseUnitsSold?: number;
   unitPriceCents: number;
   unitCostCents: number;
   discountCents: number;
@@ -21,8 +27,11 @@ export interface RecentSaleLine {
 
 export interface RecentSalePayment {
   id: string;
-  method: "cash" | "card" | "mobile_pay" | "voucher";
+  method: PaymentMethod;
   amountCents: number;
+  currencyCode?: string;
+  foreignAmount?: number | null;
+  fxRateUsed?: number | null;
 }
 
 export interface RecentSaleRow {
@@ -195,6 +204,21 @@ export function RecentReceiptsModal({
   onVoidOrRefund: (sale: RecentSaleRow, kind: "void" | "refund") => void;
   onClose: () => void;
 }) {
+  const [pendingReversal, setPendingReversal] = useState<{
+    sale: RecentSaleRow;
+    kind: "void" | "refund";
+  } | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setPendingReversal(null);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    setPendingReversal(null);
+  }, [recentSales]);
+
   return (
     <ModalDialog
       open={open}
@@ -220,6 +244,44 @@ export function RecentReceiptsModal({
       {recentError && (
         <div className="banner banner-red" role="alert">
           {recentError}
+        </div>
+      )}
+      {pendingReversal && (
+        <div
+          id="receipt-reversal-confirm-banner"
+          className="banner banner-red"
+          role="alert"
+          style={{ flexWrap: "wrap" }}
+        >
+          <span>
+            <strong>Confirm {pendingReversal.kind === "void" ? "VOID" : "REFUND"}:</strong>{" "}
+            Receipt <span className="mono">{pendingReversal.sale.receiptNo}</span> (
+            <span className="mono">{formatMoney(pendingReversal.sale.totalCents)}</span>) will post an
+            irreversible ledger reversal and restock items.
+          </span>
+          <div style={{ display: "inline-flex", gap: 8 }}>
+            <button
+              id="confirm-receipt-reversal-btn"
+              type="button"
+              className={`btn btn-sm ${pendingReversal.kind === "void" ? "btn-danger" : "btn-amber"}`}
+              disabled={busyReceiptId !== null}
+              onClick={() => {
+                const target = pendingReversal;
+                setPendingReversal(null);
+                onVoidOrRefund(target.sale, target.kind);
+              }}
+            >
+              {pendingReversal.kind === "void" ? "Confirm Void" : "Confirm Refund"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={busyReceiptId !== null}
+              onClick={() => setPendingReversal(null)}
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
       <div className="table-wrap" role="region" aria-label="Receipt lookup results" tabIndex={0} style={{ maxHeight: 420, overflowY: "auto" }}>
@@ -277,20 +339,20 @@ export function RecentReceiptsModal({
                   {canVoidOrRefund && (
                     <td className="text-right">
                       {s.kind === "sale" && !s.alreadyVoided && s.lines.length > 0 ? (
-                        <div style={{ display: "inline-flex", gap: 6 }}>
+                        <div style={{ display: "inline-flex", gap: 10 }}>
                           <button
                             type="button"
                             className="btn btn-amber btn-sm"
                             disabled={busyReceiptId !== null}
-                            onClick={() => onVoidOrRefund(s, "refund")}
+                            onClick={() => setPendingReversal({ sale: s, kind: "refund" })}
                           >
                             <RotateCcw size={12} aria-hidden="true" /> Refund
                           </button>
                           <button
                             type="button"
-                            className="btn btn-sm"
+                            className="btn btn-danger btn-sm"
                             disabled={busyReceiptId !== null}
-                            onClick={() => onVoidOrRefund(s, "void")}
+                            onClick={() => setPendingReversal({ sale: s, kind: "void" })}
                           >
                             Void
                           </button>
@@ -335,6 +397,10 @@ export function ShiftCloseModal({
   onSubmit: () => void;
   onClose: () => void;
 }) {
+  const parsedCash = Number(blindCashInput);
+  const blindValid =
+    blindCashInput.trim() !== "" && Number.isFinite(parsedCash) && parsedCash >= 0;
+
   return (
     <ModalDialog
       open={open}
@@ -385,6 +451,8 @@ export function ShiftCloseModal({
         <input
           id="blind-cash-input"
           className="input mono"
+          inputMode="decimal"
+          placeholder="0.00"
           value={blindCashInput}
           onChange={(e) => onBlindCashChange(e.target.value)}
           disabled={closingShift}
@@ -392,9 +460,10 @@ export function ShiftCloseModal({
       </div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         <button
+          id="submit-blind-close-btn"
           type="button"
           className="btn btn-primary"
-          disabled={closingShift}
+          disabled={closingShift || !blindValid}
           onClick={onSubmit}
         >
           {closingShift ? "Closing Shift..." : "Submit Blind Count & Generate Z-Report"}
@@ -507,13 +576,13 @@ export function DeadLetterModal({
                     Export JSON
                   </a>
                   {canVoidOrRefund && (
-                    <button
-                      type="button"
+                    <ConfirmActionButton
+                      label="Dismiss (Reconciled)"
+                      confirmLabel="Confirm Dismiss"
                       className="btn btn-danger btn-sm"
-                      onClick={() => onDismiss(entry.sale.id)}
-                    >
-                      Dismiss (Reconciled)
-                    </button>
+                      confirmClassName="btn btn-danger btn-sm"
+                      onConfirm={() => onDismiss(entry.sale.id)}
+                    />
                   )}
                 </div>
               </div>

@@ -637,7 +637,7 @@ export function OverviewView({
             </p>
           </div>
         </div>
-        <div className="table-wrap" role="region" aria-label="Top selling SKUs" tabIndex={0}>
+        <div className="table-wrap" role="region" aria-label="Department profitability and GMROII" tabIndex={0}>
           <table className="data-table">
             <thead>
               <tr>

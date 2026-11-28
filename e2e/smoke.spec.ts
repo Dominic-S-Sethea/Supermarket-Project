@@ -1,48 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
-
-function attachErrorGuards(page: Page) {
-  const consoleErrors: string[] = [];
-  const pageErrors: string[] = [];
-  const serverErrors: string[] = [];
-
-  page.on("console", (msg) => {
-    if (msg.type() === "error") {
-      consoleErrors.push(msg.text());
-    }
-  });
-  page.on("pageerror", (err) => {
-    pageErrors.push(String(err));
-  });
-  page.on("response", (res) => {
-    const url = res.url();
-    if (url.includes("/api/") && res.status() >= 400) {
-      // Allow intentional negative-path checks if tagged, otherwise record
-      serverErrors.push(`${res.status()} ${res.request().method()} ${url}`);
-    }
-  });
-
-  return {
-    assertClean() {
-      expect(pageErrors, `Uncaught page errors: ${pageErrors.join(" | ")}`).toEqual([]);
-      expect(consoleErrors, `Console errors: ${consoleErrors.join(" | ")}`).toEqual([]);
-      expect(serverErrors, `Unexpected API >=400 responses: ${serverErrors.join(" | ")}`).toEqual([]);
-    },
-  };
-}
-
-async function loginAs(page: Page, username: string, pin: string) {
-  await page.goto("/");
-  await expect(page.locator("#login-username")).toBeVisible();
-  await page.fill("#login-username", username);
-  await page.fill("#login-pin", pin);
-  await page.click("#login-submit-btn");
-  await expect(page.locator("#logout-btn")).toBeVisible();
-}
-
-async function logout(page: Page) {
-  await page.click("#logout-btn");
-  await expect(page.locator("#login-username")).toBeVisible();
-}
+import { expect, test } from "@playwright/test";
+import { attachErrorGuards, loginAs, logout } from "./helpers";
 
 test.describe("SupermarketOS Full-Stack E2E Smoke Suite", () => {
   test("1. enforces RBAC login & sidebar tab isolation across owner, manager, cashier1, and clerk1", async ({

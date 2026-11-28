@@ -86,6 +86,7 @@ export function CatalogInspectorDrawer({
   selected,
   canEditCatalog,
   canCycleCount,
+  canPrintZpl = true,
   drawerNotice,
   drawerBusy,
   zplOutput,
@@ -111,6 +112,7 @@ export function CatalogInspectorDrawer({
   selected: CatalogProductItem | null;
   canEditCatalog: boolean;
   canCycleCount: boolean;
+  canPrintZpl?: boolean;
   drawerNotice: StatusNotice | null;
   drawerBusy: boolean;
   zplOutput: string | null;
@@ -246,14 +248,16 @@ export function CatalogInspectorDrawer({
                 <Barcode size={15} aria-hidden="true" style={{ verticalAlign: "middle", marginRight: 6 }} />
                 Linked Multi-UOM Barcodes (Pack-Breaking)
               </h3>
-              <button
-                type="button"
-                className="btn btn-sm"
-                disabled={drawerBusy}
-                onClick={() => onGenerateZpl(selected.id)}
-              >
-                <Printer size={13} aria-hidden="true" /> ZPL Shelf Tag
-              </button>
+              {canPrintZpl && (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={drawerBusy}
+                  onClick={() => onGenerateZpl(selected.id)}
+                >
+                  <Printer size={13} aria-hidden="true" /> ZPL Shelf Tag
+                </button>
+              )}
             </div>
             <div className="table-wrap" role="region" aria-label="Product pack-tier barcodes" tabIndex={0}>
               <table className="data-table">
@@ -463,7 +467,7 @@ export function CatalogInspectorDrawer({
                     id="activate-recall-btn"
                     type="button"
                     className="btn btn-danger btn-sm"
-                    disabled={drawerBusy || recallReasonInput.trim().length < 3}
+                    disabled={drawerBusy || recallReasonInput.trim().length < 4}
                     onClick={() => onToggleRecall(selected.id, true)}
                   >
                     <ShieldAlert size={13} aria-hidden="true" /> Activate Instant POS Recall Block

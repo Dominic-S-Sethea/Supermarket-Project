@@ -3,6 +3,7 @@ import type { UserRole } from "@supermarket/shared/dtos";
 import { formatMoney } from "@supermarket/shared/money";
 import { ArrowRight, ClipboardList, Sparkles, Truck } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { ConfirmActionButton } from "../components/ConfirmActionButton";
 import { PageHeading } from "../components/PageHeading";
 
 interface DraftPo {
@@ -223,7 +224,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
         </div>
       )}
       {feedback && (
-        <div className="banner banner-green" style={{ marginBottom: 14 }}>
+        <div className="banner banner-green" role="status" style={{ marginBottom: 14 }}>
           <span>{feedback}</span>
           <button type="button" className="btn btn-sm" onClick={() => setFeedback(null)}>
             Dismiss
@@ -296,7 +297,7 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
               <p className="panel-desc">Stored in PostgreSQL with full audit trail.</p>
             </div>
           </div>
-          <div className="table-wrap" role="region" aria-label="Reorder recommendations" tabIndex={0}>
+          <div className="table-wrap" role="region" aria-label="Persisted purchase orders" tabIndex={0}>
             <table className="data-table">
               <thead>
                 <tr>
@@ -342,14 +343,14 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
                             >
                               Mark Sent
                             </button>
-                            <button
-                              type="button"
-                              className="btn btn-sm"
+                            <ConfirmActionButton
+                              label="Cancel"
+                              confirmLabel="Confirm Cancel"
+                              ariaLabel={`Cancel purchase order ${o.poNumber}`}
+                              confirmAriaLabel={`Confirm cancel purchase order ${o.poNumber}`}
                               disabled={busyKey !== null}
-                              onClick={() => void handleStatusChange(o.id, "cancelled")}
-                            >
-                              Cancel
-                            </button>
+                              onConfirm={() => handleStatusChange(o.id, "cancelled")}
+                            />
                           </div>
                         )}
                       </td>

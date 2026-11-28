@@ -3,6 +3,7 @@ import type { UserRole } from "@supermarket/shared/dtos";
 import { computeEffectiveUnitCostCents, formatBp, formatMoney } from "@supermarket/shared/money";
 import { AlertTriangle, Award, Check, ChefHat, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { ConfirmActionButton } from "../components/ConfirmActionButton";
 import { PageHeading } from "../components/PageHeading";
 import type { ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
 import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
@@ -49,8 +50,8 @@ interface ExpiryBatch {
   lotCode: string;
   bestBeforeDate: string;
   qtyRemaining: number;
-  unitCostCents: number;
-  atRiskCostCents: number;
+  unitCostCents?: number;
+  atRiskCostCents?: number;
   daysLeft: number;
   status: string;
 }
@@ -112,10 +113,12 @@ export function OperationsView({
   suppliers,
   userRole = "owner",
   onCountsChanged,
+  onCatalogChanged,
 }: {
   suppliers: SupplierOption[];
   userRole?: UserRole;
   onCountsChanged?: () => void;
+  onCatalogChanged?: () => void;
 }) {
   const canManage = userRole === "owner" || userRole === "manager";
   const [subTab, setSubTab] = useState<OpsSubTab>(() => resolveOpsSubTab(canManage));
@@ -269,6 +272,7 @@ export function OperationsView({
       setFeedback(
         `Updated ${sku} shelf price to ${formatMoney(res.newSellPriceCents)} (scaled ${res.updatedPackTiers ?? 1} barcode tiers) and resolved alert.`
       );
+      onCatalogChanged?.();
       await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating price");
@@ -295,6 +299,7 @@ export function OperationsView({
           ? `Marked batch for ${sku} as 30% Clearance Markdown.`
           : `Wrote off expired ${sku} batch to immutable spoilage ledger.`
       );
+      onCatalogChanged?.();
       await refreshAfterMutation();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed updating batch");
@@ -327,6 +332,7 @@ export function OperationsView({
       const res = await apiPost<{
         grnId: string;
         marginAlertsTriggered: number;
+        variancesCreated?: number;
         variancesDetected?: number;
       }>("/api/purchasing/grn", {
         poId: linkedPo?.id,
@@ -348,8 +354,9 @@ export function OperationsView({
       setInvoiceNo(
         `INV-${new Date().getFullYear()}-${String(Math.floor(10000 + Math.random() * 89999))}`
       );
+      const varianceCount = res.variancesCreated ?? res.variancesDetected ?? 0;
       setFeedback(
-        `Posted GRN${linkedLabel} (+${paidUnits + freeUnits} base units added to ledger, effective cost ${formatMoney(effectiveUnitCost)}/unit). Margin alerts: ${res.marginAlertsTriggered}${res.variancesDetected ? `, 3-way variances detected: ${res.variancesDetected}` : ""}.`
+        `Posted GRN${linkedLabel} (+${paidUnits + freeUnits} base units added to ledger, effective cost ${formatMoney(effectiveUnitCost)}/unit). Margin alerts: ${res.marginAlertsTriggered}${varianceCount ? `, 3-way variances detected: ${varianceCount}` : ""}.`
       );
       await refreshAfterMutation();
     } catch (err) {
@@ -454,7 +461,7 @@ export function OperationsView({
     );
   };
 
-  const totalAtRiskCents = expiryBatches.reduce((s, b) => s + b.atRiskCostCents, 0);
+  const totalAtRiskCents = expiryBatches.reduce((s, b) => s + (b.atRiskCostCents ?? 0), 0);
 
   return (
     <div>
@@ -548,7 +555,7 @@ export function OperationsView({
       </header>
 
       {!canManage && (
-        <div className="banner banner-amber" style={{ marginBottom: 14 }}>
+        <div className="banner banner-amber" role="status" style={{ marginBottom: 14 }}>
           <span>
             Signed in as <strong className="mono">{userRole}</strong>: FEFO expiry monitoring, bakery &amp; deli production batch logging, phantom stock blind counts, 07:30 shelf tag batch printing, and daily floor checklist completion are enabled. GRN receiving, markdown approvals, and price overrides require Store Manager or Owner approval.
           </span>
@@ -615,6 +622,7 @@ export function OperationsView({
         <Suspense fallback={<div className="panel">Loading Shelf Integrity...</div>}>
           <ShelfIntegrityTab
             canManage={canManage}
+            onCatalogChanged={onCatalogChanged}
             onFeedback={(msg) => {
               setErrorMsg(null);
               setFeedback(msg);
@@ -1104,7 +1112,7 @@ export function OperationsView({
                     </td>
                     <td className="text-right mono">{b.qtyRemaining}</td>
                     <td className="text-right mono" style={{ fontWeight: 600 }}>
-                      {formatMoney(b.atRiskCostCents)}
+                      {typeof b.atRiskCostCents === "number" ? formatMoney(b.atRiskCostCents) : "—"}
                     </td>
                     {canManage && (
                       <td className="text-right">
@@ -1119,14 +1127,18 @@ export function OperationsView({
                               <Percent size={12} /> 30% Clearance
                             </button>
                           )}
-                          <button
-                            type="button"
-                            className="btn btn-sm"
+                          <ConfirmActionButton
+                            label={
+                              <>
+                                <Trash2 size={12} /> Write Off
+                              </>
+                            }
+                            confirmLabel="Confirm Write Off"
+                            ariaLabel={`Write off expired batch ${b.lotCode}`}
+                            confirmAriaLabel={`Confirm write off expired batch ${b.lotCode}`}
                             disabled={busyAction !== null}
-                            onClick={() => void handleBatchAction(b.batchId, "write_off", b.sku)}
-                          >
-                            <Trash2 size={12} /> Write Off
-                          </button>
+                            onConfirm={() => handleBatchAction(b.batchId, "write_off", b.sku)}
+                          />
                         </div>
                       </td>
                     )}

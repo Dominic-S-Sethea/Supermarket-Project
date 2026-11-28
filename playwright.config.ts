@@ -35,8 +35,16 @@ export default defineConfig({
       env: {
         ...process.env,
         NODE_ENV: e2eNodeEnv,
+        DATABASE_URL:
+          process.env.DATABASE_URL ||
+          "postgres://supermarket:supermarket_dev_password@127.0.0.1:5433/supermarket_os",
         AUTH_SECRET: e2eAuthSecret,
         COOKIE_SECURE: process.env.E2E_COOKIE_SECURE ?? "false",
+        GEMINI_API_KEY: "",
+        PAYMENT_WEBHOOK_SECRET:
+          process.env.PAYMENT_WEBHOOK_SECRET || "e2e-test-payment-webhook-secret-32chars",
+        ENABLE_SANDBOX_PAYMENT_SIMULATION:
+          process.env.E2E_ENABLE_SANDBOX_SIMULATION ?? "true",
         PORT: "4000",
         HOST: "127.0.0.1",
         CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173",

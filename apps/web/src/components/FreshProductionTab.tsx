@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UnitMode } from "@supermarket/shared/dtos";
 import { formatBp, formatMeasure, formatMoney } from "@supermarket/shared/money";
 import { ChefHat, Flame, RefreshCw } from "lucide-react";
@@ -12,10 +12,10 @@ interface RecipeIngredientRow {
   name: string;
   unitMode: UnitMode;
   baseUnitLabel: string;
-  avgCostCents: number;
+  avgCostCents?: number;
   qtyBaseUnits: number;
   onHandUnits: number;
-  estimatedLineCostCents: number;
+  estimatedLineCostCents?: number;
 }
 
 interface RecipeRow {
@@ -32,7 +32,7 @@ interface RecipeRow {
   notes: string | null;
   active: boolean;
   ingredients: RecipeIngredientRow[];
-  estimatedBatchCostCents: number;
+  estimatedBatchCostCents?: number;
 }
 
 interface ProductionBatchRow {
@@ -50,8 +50,8 @@ interface ProductionBatchRow {
   actualOutputUnits: number;
   trimWasteUnits: number;
   yieldBp: number;
-  totalIngredientCostCents: number;
-  effectiveUnitCostCents: number;
+  totalIngredientCostCents?: number;
+  effectiveUnitCostCents?: number;
   producedBy: string;
   notes: string | null;
   producedAt: string;
@@ -82,6 +82,10 @@ export function FreshProductionTab({
   const [trimWaste, setTrimWaste] = useState("0");
   const [lotCode, setLotCode] = useState("");
   const [notes, setNotes] = useState("");
+  const onErrorRef = useRef(onError);
+  const onFeedbackRef = useRef(onFeedback);
+  onErrorRef.current = onError;
+  onFeedbackRef.current = onFeedback;
 
   const loadData = useCallback(
     async (signal?: AbortSignal) => {
@@ -106,13 +110,15 @@ export function FreshProductionTab({
         });
       } catch (err) {
         if ((err as Error).name !== "AbortError") {
-          onError(err instanceof Error ? err.message : "Failed loading bakery & deli BOM recipes");
+          onErrorRef.current(
+            err instanceof Error ? err.message : "Failed loading bakery & deli BOM recipes"
+          );
         }
       } finally {
         if (!signal?.aborted) setLoading(false);
       }
     },
-    [onError]
+    []
   );
 
   useEffect(() => {
@@ -151,9 +157,10 @@ export function FreshProductionTab({
   const parsedTrim = Math.max(0, Math.trunc(Number(trimWaste) || 0));
   const previewYieldBp =
     expectedOutputUnits > 0 ? Math.round((parsedActual * 10000) / expectedOutputUnits) : 10000;
-  const previewTotalCostCents = activeRecipe
-    ? activeRecipe.estimatedBatchCostCents * multiplier
-    : 0;
+  const previewTotalCostCents =
+    activeRecipe && typeof activeRecipe.estimatedBatchCostCents === "number"
+      ? activeRecipe.estimatedBatchCostCents * multiplier
+      : 0;
   const outputIsMeasured =
     activeRecipe?.outputUnitMode === "weight_g" || activeRecipe?.outputUnitMode === "volume_ml";
   const previewEffectiveUnitCost =
@@ -169,7 +176,7 @@ export function FreshProductionTab({
   }, [batches]);
 
   const totalBatchCostCents = useMemo(
-    () => batches.reduce((s, b) => s + b.totalIngredientCostCents, 0),
+    () => batches.reduce((s, b) => s + (b.totalIngredientCostCents ?? 0), 0),
     [batches]
   );
 
@@ -399,7 +406,9 @@ export function FreshProductionTab({
                           )}
                         </td>
                         <td className="text-right mono">
-                          {formatMoney(ing.estimatedLineCostCents * multiplier)}
+                          {typeof ing.estimatedLineCostCents === "number"
+                            ? formatMoney(ing.estimatedLineCostCents * multiplier)
+                            : "—"}
                         </td>
                       </tr>
                     );
@@ -537,7 +546,11 @@ export function FreshProductionTab({
                         {formatBp(b.yieldBp)}
                       </span>
                     </td>
-                    <td className="text-right mono">{formatMoney(b.effectiveUnitCostCents)}</td>
+                    <td className="text-right mono">
+                      {typeof b.effectiveUnitCostCents === "number"
+                        ? formatMoney(b.effectiveUnitCostCents)
+                        : "—"}
+                    </td>
                     <td>{b.producedBy}</td>
                   </tr>
                 ))

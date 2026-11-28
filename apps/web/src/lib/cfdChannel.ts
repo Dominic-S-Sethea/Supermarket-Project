@@ -64,6 +64,25 @@ export function publishCfdState(state: CfdStatePayload): void {
   }
 }
 
+export function clearCfdState(): void {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(CFD_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+  try {
+    if (typeof BroadcastChannel !== "undefined") {
+      const ch = new BroadcastChannel(CFD_CHANNEL_NAME);
+      ch.postMessage({ __cfdCleared: true });
+      ch.close();
+    }
+  } catch {
+    // ignore BroadcastChannel unavailable
+  }
+}
+
 export function readCfdState(): CfdStatePayload | null {
   try {
     if (typeof localStorage === "undefined") return null;
@@ -77,14 +96,21 @@ export function readCfdState(): CfdStatePayload | null {
   }
 }
 
-export function subscribeCfdState(onUpdate: (state: CfdStatePayload) => void): () => void {
+export function subscribeCfdState(onUpdate: (state: CfdStatePayload | null) => void): () => void {
   let channel: BroadcastChannel | null = null;
   if (typeof BroadcastChannel !== "undefined") {
     try {
       channel = new BroadcastChannel(CFD_CHANNEL_NAME);
       channel.onmessage = (ev: MessageEvent) => {
-        if (ev.data && typeof ev.data === "object" && Array.isArray((ev.data as CfdStatePayload).lines)) {
-          onUpdate(ev.data as CfdStatePayload);
+        if (ev.data && typeof ev.data === "object") {
+          const msg = ev.data as { __cfdCleared?: boolean } & Partial<CfdStatePayload>;
+          if (msg.__cfdCleared === true) {
+            onUpdate(null);
+            return;
+          }
+          if (Array.isArray(msg.lines)) {
+            onUpdate(ev.data as CfdStatePayload);
+          }
         }
       };
     } catch {
@@ -93,7 +119,11 @@ export function subscribeCfdState(onUpdate: (state: CfdStatePayload) => void): (
   }
 
   const handleStorage = (ev: StorageEvent) => {
-    if (ev.key !== CFD_STORAGE_KEY || !ev.newValue) return;
+    if (ev.key !== CFD_STORAGE_KEY) return;
+    if (!ev.newValue) {
+      onUpdate(null);
+      return;
+    }
     try {
       const parsed = JSON.parse(ev.newValue) as CfdStatePayload;
       if (parsed && Array.isArray(parsed.lines)) {

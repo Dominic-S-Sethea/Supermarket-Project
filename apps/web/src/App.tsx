@@ -20,6 +20,8 @@ import { apiGet, apiPost, setUnauthorizedHandler } from "./api";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { LoginScreen, type SessionUser } from "./components/LoginScreen";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
+import { clearCfdState } from "./lib/cfdChannel";
+import { clearPosCache, loadOfflineQueue } from "./lib/posCache";
 import { useSpatial3DPanels } from "./lib/spatial3d";
 import { useTheme } from "./lib/theme";
 import { readQueryParam, syncQueryParam } from "./lib/urlSync";
@@ -108,38 +110,85 @@ export function App() {
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [meta, setMeta] = useState<MetaPayload>({ departments: [], suppliers: [] });
   const [alertCounts, setAlertCounts] = useState({ margin: 0, expiry: 0 });
-  const [apiHealthy, setApiHealthy] = useState(true);
+  const [apiStatus, setApiStatus] = useState<"live" | "degraded" | "offline">("live");
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [copilotInitialPrompt, setCopilotInitialPrompt] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [posCatalogTick, setPosCatalogTick] = useState(0);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [logoutQueueWarning, setLogoutQueueWarning] = useState(false);
+  const metaAbortRef = useRef<AbortController | null>(null);
+
+  const resetSessionClientState = useCallback(() => {
+    metaAbortRef.current?.abort();
+    metaAbortRef.current = null;
+    void clearPosCache();
+    clearCfdState();
+    setMeta({ departments: [], suppliers: [] });
+    setAlertCounts({ margin: 0, expiry: 0 });
+    setCopilotInitialPrompt(null);
+    setPosCatalogTick(0);
+    setCopilotOpen(false);
+    setMobileNavOpen(false);
+    setLogoutQueueWarning(false);
+  }, []);
 
   const loadMetaAndAlerts = useCallback(async (currentUser: SessionUser) => {
-    try {
-      const canSeeMargin = ["owner", "manager"].includes(currentUser.role);
-      const canSeeExpiry = ["owner", "manager", "stock_clerk"].includes(currentUser.role);
-      const [m, ma, exp] = await Promise.all([
-        apiGet<MetaPayload>("/api/meta"),
-        canSeeMargin
-          ? apiGet<{ alerts: unknown[] }>("/api/inventory/margin-alerts")
-          : Promise.resolve({ alerts: [] }),
-        canSeeExpiry
-          ? apiGet<{ items: unknown[] }>("/api/inventory/expiry-alerts?days=30")
-          : Promise.resolve({ items: [] }),
-      ]);
-      setMeta(m);
-      setAlertCounts({ margin: ma.alerts.length, expiry: exp.items.length });
-      setApiHealthy(true);
-    } catch {
-      setApiHealthy(false);
+    metaAbortRef.current?.abort();
+    const controller = new AbortController();
+    metaAbortRef.current = controller;
+
+    const canSeeMargin = ["owner", "manager"].includes(currentUser.role);
+    const canSeeExpiry = ["owner", "manager", "stock_clerk"].includes(currentUser.role);
+    const [metaRes, marginRes, expiryRes] = await Promise.allSettled([
+      apiGet<MetaPayload>("/api/meta", controller.signal),
+      canSeeMargin
+        ? apiGet<{ alerts: unknown[] }>("/api/inventory/margin-alerts", controller.signal)
+        : Promise.resolve(null),
+      canSeeExpiry
+        ? apiGet<{ items: unknown[] }>("/api/inventory/expiry-alerts?days=30", controller.signal)
+        : Promise.resolve(null),
+    ]);
+    if (controller.signal.aborted) return;
+
+    if (metaRes.status === "fulfilled") {
+      setMeta(metaRes.value);
+    }
+    setAlertCounts((prev) => ({
+      margin:
+        marginRes.status === "fulfilled" && marginRes.value
+          ? marginRes.value.alerts.length
+          : canSeeMargin
+            ? prev.margin
+            : 0,
+      expiry:
+        expiryRes.status === "fulfilled" && expiryRes.value
+          ? expiryRes.value.items.length
+          : canSeeExpiry
+            ? prev.expiry
+            : 0,
+    }));
+
+    const activeResults = [
+      metaRes,
+      ...(canSeeMargin ? [marginRes] : []),
+      ...(canSeeExpiry ? [expiryRes] : []),
+    ];
+    const fulfilledCount = activeResults.filter((r) => r.status === "fulfilled").length;
+    if (fulfilledCount === activeResults.length) {
+      setApiStatus("live");
+    } else if (fulfilledCount > 0) {
+      setApiStatus("degraded");
+    } else {
+      setApiStatus("offline");
     }
   }, []);
 
-  const checkSession = useCallback(async () => {
+  const checkSession = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await apiGet<{ user: SessionUser | null }>("/api/auth/me");
-      setApiHealthy(true);
+      const res = await apiGet<{ user: SessionUser | null }>("/api/auth/me", signal);
+      if (signal?.aborted) return;
+      setApiStatus("live");
       setUser(res.user);
       if (res.user) {
         const allowed = ROLE_TABS[res.user.role] ?? ["catalog"];
@@ -148,27 +197,32 @@ export function App() {
         syncQueryParam("tab", initial, { push: false });
         void loadMetaAndAlerts(res.user);
       }
-    } catch {
-      setApiHealthy(false);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setApiStatus("offline");
+      }
     } finally {
-      setAuthChecked(true);
+      if (!signal?.aborted) {
+        setAuthChecked(true);
+      }
     }
   }, [loadMetaAndAlerts]);
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
+      resetSessionClientState();
       setUser(null);
-      setCopilotOpen(false);
-      setMobileNavOpen(false);
       setSessionNotice(
         "Your session expired or was revoked. Please sign in again (any queued offline POS receipts remain saved locally)."
       );
     });
     return () => setUnauthorizedHandler(null);
-  }, []);
+  }, [resetSessionClientState]);
 
   useEffect(() => {
-    void checkSession();
+    const controller = new AbortController();
+    void checkSession(controller.signal);
+    return () => controller.abort();
   }, [checkSession]);
 
   // Sync browser Back/Forward history (`popstate`) with activeTab validated against RBAC (M-21)
@@ -288,8 +342,9 @@ export function App() {
   );
 
   const handleLoggedIn = (loggedUser: SessionUser) => {
+    resetSessionClientState();
     setSessionNotice(null);
-    setApiHealthy(true);
+    setApiStatus("live");
     setUser(loggedUser);
     const allowed = ROLE_TABS[loggedUser.role] ?? ["catalog"];
     const nextTab = resolveInitialTab(allowed);
@@ -298,22 +353,30 @@ export function App() {
     void loadMetaAndAlerts(loggedUser);
   };
 
-  const handleLogout = async () => {
+  const handleLogout = async (force = false) => {
+    const pendingOffline = loadOfflineQueue().length;
+    if (!force && pendingOffline > 0 && !logoutQueueWarning) {
+      setLogoutQueueWarning(true);
+      return;
+    }
     try {
       await apiPost("/api/auth/logout", {});
     } catch {
       // ignore logout error
     }
+    resetSessionClientState();
     setSessionNotice(null);
     setUser(null);
-    setCopilotOpen(false);
-    setMobileNavOpen(false);
+    // Shared lane workstation: the next staff member lands on their own role's default view
+    syncQueryParam("tab", null, { push: false, clearParams: ["sub"] });
   };
 
   if (!authChecked) {
     return (
       <div className="login-shell">
-        <div className="panel">Checking SupermarketOS session...</div>
+        <div className="panel" role="status" aria-live="polite">
+          Checking SupermarketOS session...
+        </div>
       </div>
     );
   }
@@ -323,7 +386,7 @@ export function App() {
       <LoginScreen
         onLoggedIn={handleLoggedIn}
         sessionNotice={sessionNotice}
-        apiHealthy={apiHealthy}
+        apiHealthy={apiStatus !== "offline"}
         onRetryConnection={() => void checkSession()}
         theme={theme}
         onThemeChange={setTheme}
@@ -404,8 +467,14 @@ export function App() {
           ) : (
             <span
               role="status"
-              className={`status-dot ${apiHealthy ? "" : "offline"}`}
-              aria-label={apiHealthy ? "API live" : "API unreachable"}
+              className={`status-dot ${apiStatus === "live" ? "" : "offline"}`}
+              aria-label={
+                apiStatus === "live"
+                  ? "API live"
+                  : apiStatus === "degraded"
+                    ? "API degraded"
+                    : "API unreachable"
+              }
             />
           )}
         </div>
@@ -510,10 +579,55 @@ export function App() {
             </button>
           </div>
           <div className="status-row">
-            <span className={`status-dot ${apiHealthy ? "" : "offline"}`} />
-            <span>{apiHealthy ? "PostgreSQL + API Live" : "API Unreachable"}</span>
+            <span className={`status-dot ${apiStatus === "live" ? "" : "offline"}`} />
+            <span>
+              {apiStatus === "live"
+                ? "PostgreSQL + API Live"
+                : apiStatus === "degraded"
+                  ? "API Degraded"
+                  : "API Unreachable"}
+            </span>
+            {apiStatus !== "live" && (
+              <button
+                id="sidebar-api-retry-btn"
+                type="button"
+                className="btn btn-sm"
+                style={{ marginLeft: "auto" }}
+                onClick={() => void loadMetaAndAlerts(user)}
+              >
+                Retry
+              </button>
+            )}
           </div>
           <div>Immutable Ledger · Integer Cents</div>
+          {logoutQueueWarning && (
+            <div
+              className="banner banner-amber"
+              role="alert"
+              style={{ marginTop: 8, padding: "8px 10px", fontSize: 11.5, flexDirection: "column", alignItems: "stretch", gap: 6 }}
+            >
+              <span>
+                Queued offline POS receipts exist locally. Sync before signing out, or confirm sign-out anyway.
+              </span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button
+                  id="confirm-logout-with-queue-btn"
+                  type="button"
+                  className="btn btn-danger btn-sm"
+                  onClick={() => void handleLogout(true)}
+                >
+                  Sign Out Anyway
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => setLogoutQueueWarning(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </aside>
 
@@ -544,10 +658,15 @@ export function App() {
                     suppliers={meta.suppliers}
                     userRole={user.role}
                     onCountsChanged={() => void loadMetaAndAlerts(user)}
+                    onCatalogChanged={() => setPosCatalogTick((t) => t + 1)}
                   />
                 )}
                 {activeTab === "loyalty" && (
-                  <LoyaltyPromosView key={`loy-${refreshTick}`} userRole={user.role} />
+                  <LoyaltyPromosView
+                    key={`loy-${refreshTick}`}
+                    userRole={user.role}
+                    onCatalogChanged={() => setPosCatalogTick((t) => t + 1)}
+                  />
                 )}
                 {activeTab === "abc-lp" && (
                   <AbcLossView key={`abc-${refreshTick}`} userRole={user.role} />
@@ -580,6 +699,7 @@ export function App() {
             {allowedTabs.includes("pos") && (
               <div style={{ display: activeTab === "pos" ? "block" : "none" }}>
                 <PosTerminalView
+                  cashierUserId={user.id}
                   cashierName={user.fullName}
                   userRole={user.role}
                   isActive={activeTab === "pos"}

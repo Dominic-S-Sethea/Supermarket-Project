@@ -90,6 +90,8 @@ export function AiCopilotDrawer({
   const dockedAsideRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const convLoadAbortRef = useRef<AbortController | null>(null);
+  const convLoadSeqRef = useRef(0);
   const streamAbortRef = useRef<AbortController | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -106,6 +108,10 @@ export function AiCopilotDrawer({
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
       streamAbortRef.current = null;
+    }
+    if (convLoadAbortRef.current) {
+      convLoadAbortRef.current.abort();
+      convLoadAbortRef.current = null;
     }
   };
 
@@ -219,6 +225,10 @@ export function AiCopilotDrawer({
 
   const loadConversation = async (id: string) => {
     abortActiveStream();
+    const controller = new AbortController();
+    convLoadAbortRef.current = controller;
+    const seq = ++convLoadSeqRef.current;
+
     setSending(false);
     setStreamingText("");
     setLiveTools([]);
@@ -227,12 +237,19 @@ export function AiCopilotDrawer({
       const data = await apiGet<{
         messages: ChatMessage[];
         actions: ProposedAction[];
-      }>(`/api/ai/conversations/${id}`);
+      }>(`/api/ai/conversations/${id}`, controller.signal);
+      if (controller.signal.aborted || convLoadSeqRef.current !== seq) return;
       setConversationId(id);
       setMessages(data.messages);
       setActions(data.actions);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed loading conversation");
+      if ((err as Error).name !== "AbortError" && convLoadSeqRef.current === seq) {
+        setError(err instanceof Error ? err.message : "Failed loading conversation");
+      }
+    } finally {
+      if (convLoadAbortRef.current === controller) {
+        convLoadAbortRef.current = null;
+      }
     }
   };
 
@@ -358,9 +375,11 @@ export function AiCopilotDrawer({
         throw new Error("Copilot stream ended unexpectedly before finishing.");
       }
     } catch (err) {
+      if (!completedTurn) {
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticUserMsg.id));
+      }
       if ((err as Error).name !== "AbortError") {
         setError(err instanceof Error ? err.message : "Failed sending message");
-        setMessages((prev) => prev.filter((m) => m.id !== optimisticUserMsg.id));
         setInput((curr) => (curr ? curr : clean));
       }
       setStreamingText("");
@@ -566,6 +585,24 @@ export function AiCopilotDrawer({
               <div style={{ fontSize: 12, color: "var(--ink-secondary)", marginTop: 4 }}>
                 {a.summary}
               </div>
+              {a.previewJson && Object.keys(a.previewJson).length > 0 && (
+                <div
+                  className="ai-action-preview"
+                  style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}
+                >
+                  {Object.entries(a.previewJson)
+                    .filter(([, val]) => val !== null && val !== undefined)
+                    .map(([key, val]) => {
+                      const displayVal =
+                        typeof val === "object" ? JSON.stringify(val) : String(val);
+                      return (
+                        <span key={key} className="tag tag-neutral mono" style={{ fontSize: 11 }}>
+                          {key}: {displayVal.slice(0, 64)}
+                        </span>
+                      );
+                    })}
+                </div>
+              )}
               {a.status === "pending" && (
                 <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                   <button
@@ -642,6 +679,7 @@ export function AiCopilotDrawer({
       open={open}
       onClose={onClose}
       labelledBy="ai-copilot-drawer-title"
+      initialFocusRef={inputRef}
       className="ai-drawer"
     >
       {panelBody}

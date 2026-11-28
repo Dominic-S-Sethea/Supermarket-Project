@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PaymentIntentDto, StoreSettingsDto } from "@supermarket/shared/dtos";
 import {
   convertFromSecondaryToPrimaryCents,
@@ -73,26 +73,57 @@ export function PosCheckoutModal({
 
   // Card / Store Credit / Loyalty Points state
   const [otherAmountInput, setOtherAmountInput] = useState("");
+  const [confirmCloseSettled, setConfirmCloseSettled] = useState(false);
+
+  const wasOpenRef = useRef(false);
+  const isOpenRef = useRef(open);
+  isOpenRef.current = open;
+  const qrReqSeqRef = useRef(0);
+  const qrActionAbortRef = useRef<AbortController | null>(null);
+
+  const cancelPendingIntent = useCallback(
+    (intent: PaymentIntentDto | null) => {
+      if (!intent || intent.status !== "pending" || simulatedOffline) return;
+      void apiPost(`/api/pos/payment-intents/${intent.id}/cancel`, {}).catch(() => {});
+    },
+    [simulatedOffline]
+  );
 
   const paidSoFarCents = legs.reduce((s, p) => s + p.amountCents, 0);
   const remainingCents = Math.max(0, grandTotalCents - paidSoFarCents);
   const remainingSecondary = secondaryCurrency
     ? convertToSecondaryCurrency(remainingCents, fxRate, roundingStep)
     : 0;
+  const usedLoyaltyPts = legs
+    .filter((l) => l.method === "loyalty_points")
+    .reduce((s, l) => s + l.amountCents, 0);
+  const availableLoyaltyPts = attachedCustomer
+    ? Math.max(0, attachedCustomer.pointsBalance - usedLoyaltyPts)
+    : 0;
+  const hasSettledQrLegs = legs.some((l) => Boolean(l.paymentIntentId));
 
+  // Initialize checkout modal strictly on open transition (never wipe settled legs on grandTotalCents/clock ticks)
   useEffect(() => {
-    if (!open) return;
-    setTab(initialTab);
-    setLegs([]);
-    setError(null);
-    setActiveIntent(null);
-    setQrRail(storeSettings?.defaultQrRail ?? "khqr");
-    const remStr = (grandTotalCents / 100).toFixed(2);
-    setCashPrimaryInput(remStr);
-    setCashSecondaryInput("0");
-    setQrAmountInput(remStr);
-    setOtherAmountInput(remStr);
-    onActiveQrChange(null);
+    if (!open) {
+      wasOpenRef.current = false;
+      qrActionAbortRef.current?.abort();
+      return;
+    }
+    if (!wasOpenRef.current) {
+      wasOpenRef.current = true;
+      setTab(initialTab);
+      setLegs([]);
+      setError(null);
+      setActiveIntent(null);
+      setConfirmCloseSettled(false);
+      setQrRail(storeSettings?.defaultQrRail ?? "khqr");
+      const remStr = (grandTotalCents / 100).toFixed(2);
+      setCashPrimaryInput(remStr);
+      setCashSecondaryInput("0");
+      setQrAmountInput(remStr);
+      setOtherAmountInput(remStr);
+      onActiveQrChange(null);
+    }
   }, [open, initialTab, grandTotalCents, storeSettings?.defaultQrRail, onActiveQrChange]);
 
   // Keep amount inputs synced to remaining balance after each partial tender leg
@@ -105,15 +136,25 @@ export function PosCheckoutModal({
     setOtherAmountInput(remStr);
   }, [remainingCents, open]);
 
+  const activeIntentId = activeIntent?.id ?? null;
+  const activeIntentStatus = activeIntent?.status ?? null;
+
   // Poll pending payment intent every 1.5s until settled/expired/cancelled
   useEffect(() => {
-    if (!open || !activeIntent || activeIntent.status !== "pending") return;
+    if (!open || !activeIntentId || activeIntentStatus !== "pending") return;
+    let cancelled = false;
+    let pollController: AbortController | null = null;
     const timer = window.setInterval(() => {
+      pollController?.abort();
+      const controller = new AbortController();
+      pollController = controller;
       void (async () => {
         try {
           const res = await apiGet<{ intent: PaymentIntentDto }>(
-            `/api/pos/payment-intents/${activeIntent.id}`
+            `/api/pos/payment-intents/${activeIntentId}`,
+            controller.signal
           );
+          if (cancelled || controller.signal.aborted || !isOpenRef.current) return;
           setActiveIntent(res.intent);
           onActiveQrChange({
             intentId: res.intent.id,
@@ -146,12 +187,16 @@ export function PosCheckoutModal({
             });
           }
         } catch {
-          // ignore transient poll hiccup
+          // ignore transient poll hiccup or abort
         }
       })();
     }, 1500);
-    return () => window.clearInterval(timer);
-  }, [open, activeIntent, onActiveQrChange]);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      pollController?.abort();
+    };
+  }, [open, activeIntentId, activeIntentStatus, onActiveQrChange]);
 
   const handleGenerateQr = async () => {
     if (qrBusy || remainingCents <= 0) return;
@@ -167,17 +212,30 @@ export function PosCheckoutModal({
       );
       return;
     }
+    if (activeIntent?.status === "pending") {
+      cancelPendingIntent(activeIntent);
+    }
+    qrActionAbortRef.current?.abort();
+    const controller = new AbortController();
+    qrActionAbortRef.current = controller;
+    const seq = ++qrReqSeqRef.current;
+
     setQrBusy(true);
     setError(null);
     try {
       const currencyCode =
         qrRail === "khqr" ? khqrCurrency : qrRail === "promptpay" ? "THB" : "SGD";
-      const res = await apiPost<{ intent: PaymentIntentDto }>("/api/pos/payment-intents", {
-        registerCode: "REG-01",
-        rail: qrRail,
-        amountCents,
-        currencyCode,
-      });
+      const res = await apiPost<{ intent: PaymentIntentDto }>(
+        "/api/pos/payment-intents",
+        {
+          registerCode: "REG-01",
+          rail: qrRail,
+          amountCents,
+          currencyCode,
+        },
+        controller.signal
+      );
+      if (controller.signal.aborted || qrReqSeqRef.current !== seq || !isOpenRef.current) return;
       setActiveIntent(res.intent);
       onActiveQrChange({
         intentId: res.intent.id,
@@ -191,21 +249,34 @@ export function PosCheckoutModal({
         expiresAt: res.intent.expiresAt,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed generating EMVCo QR payment intent");
+      if ((err as Error).name !== "AbortError" && qrReqSeqRef.current === seq && isOpenRef.current) {
+        setError(err instanceof Error ? err.message : "Failed generating EMVCo QR payment intent");
+      }
     } finally {
-      setQrBusy(false);
+      if (qrActionAbortRef.current === controller) qrActionAbortRef.current = null;
+      if (qrReqSeqRef.current === seq || !isOpenRef.current) {
+        setQrBusy(false);
+      }
     }
   };
 
   const handleSimulateSettle = async () => {
     if (!activeIntent || qrBusy) return;
+    qrActionAbortRef.current?.abort();
+    const controller = new AbortController();
+    qrActionAbortRef.current = controller;
+    const seq = ++qrReqSeqRef.current;
+    const targetIntentId = activeIntent.id;
+
     setQrBusy(true);
     setError(null);
     try {
       const res = await apiPost<{ intent: PaymentIntentDto }>(
-        `/api/pos/payment-intents/${activeIntent.id}/simulate-settle`,
-        {}
+        `/api/pos/payment-intents/${targetIntentId}/simulate-settle`,
+        {},
+        controller.signal
       );
+      if (controller.signal.aborted || qrReqSeqRef.current !== seq || !isOpenRef.current) return;
       setActiveIntent(res.intent);
       onActiveQrChange({
         intentId: res.intent.id,
@@ -237,9 +308,14 @@ export function PosCheckoutModal({
         });
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed settling sandbox payment intent");
+      if ((err as Error).name !== "AbortError" && qrReqSeqRef.current === seq && isOpenRef.current) {
+        setError(err instanceof Error ? err.message : "Failed settling sandbox payment intent");
+      }
     } finally {
-      setQrBusy(false);
+      if (qrActionAbortRef.current === controller) qrActionAbortRef.current = null;
+      if (qrReqSeqRef.current === seq || !isOpenRef.current) {
+        setQrBusy(false);
+      }
     }
   };
 
@@ -293,9 +369,9 @@ export function PosCheckoutModal({
         setError("Attach a loyalty member in the basket first to redeem loyalty points.");
         return;
       }
-      if (attachedCustomer.pointsBalance < parsed) {
+      if (availableLoyaltyPts < parsed) {
         setError(
-          `Member has ${attachedCustomer.pointsBalance} pts (${formatMoney(attachedCustomer.pointsBalance)}), insufficient for ${formatMoney(parsed)}.`
+          `Member has ${availableLoyaltyPts} unallocated pts (${formatMoney(availableLoyaltyPts)}), insufficient for ${formatMoney(parsed)}.`
         );
         return;
       }
@@ -313,13 +389,24 @@ export function PosCheckoutModal({
     ]);
   };
 
+  const handleRequestClose = (force = false) => {
+    if (!force && hasSettledQrLegs) {
+      setConfirmCloseSettled(true);
+      return;
+    }
+    cancelPendingIntent(activeIntent);
+    qrActionAbortRef.current?.abort();
+    qrReqSeqRef.current += 1;
+    setConfirmCloseSettled(false);
+    setActiveIntent(null);
+    onActiveQrChange(null);
+    onClose();
+  };
+
   return (
     <ModalDialog
       open={open}
-      onClose={() => {
-        onActiveQrChange(null);
-        onClose();
-      }}
+      onClose={() => handleRequestClose(false)}
       labelledBy="pos-checkout-modal-title"
       style={{ maxWidth: 820 }}
     >
@@ -337,14 +424,44 @@ export function PosCheckoutModal({
           type="button"
           className="btn btn-sm"
           aria-label="Close split tender checkout"
-          onClick={() => {
-            onActiveQrChange(null);
-            onClose();
-          }}
+          onClick={() => handleRequestClose(false)}
         >
           <X size={15} aria-hidden="true" />
         </button>
       </div>
+
+      {confirmCloseSettled && (
+        <div className="banner banner-red" role="alert">
+          <span>
+            This basket already has a settled bank QR payment leg. Closing now will leave the paid leg uncommitted on POS.
+          </span>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setConfirmCloseSettled(false)}
+            >
+              Keep Checkout Open
+            </button>
+            <button
+              id="confirm-close-settled-checkout-btn"
+              type="button"
+              className="btn btn-danger btn-sm"
+              onClick={() => handleRequestClose(true)}
+            >
+              Close Anyway
+            </button>
+          </div>
+        </div>
+      )}
+
+      {paidSoFarCents > grandTotalCents && (
+        <div className="banner banner-amber" role="status">
+          <span>
+            Basket total changed ({formatMoney(grandTotalCents)}) below applied tenders ({formatMoney(paidSoFarCents)}). Review or remove adjustable tender legs before finalizing.
+          </span>
+        </div>
+      )}
 
       {/* Live Split Tender Summary Strip */}
       <div className="kpi-strip" style={{ marginBottom: 0 }}>
@@ -436,6 +553,9 @@ export function PosCheckoutModal({
                 value={qrRail}
                 disabled={qrBusy}
                 onChange={(e) => {
+                  cancelPendingIntent(activeIntent);
+                  qrActionAbortRef.current?.abort();
+                  qrReqSeqRef.current += 1;
                   setQrRail(e.target.value as "khqr" | "promptpay" | "paynow");
                   setActiveIntent(null);
                   onActiveQrChange(null);
@@ -454,7 +574,14 @@ export function PosCheckoutModal({
                   className="select"
                   value={khqrCurrency}
                   disabled={qrBusy}
-                  onChange={(e) => setKhqrCurrency(e.target.value as "USD" | "KHR")}
+                  onChange={(e) => {
+                    cancelPendingIntent(activeIntent);
+                    qrActionAbortRef.current?.abort();
+                    qrReqSeqRef.current += 1;
+                    setKhqrCurrency(e.target.value as "USD" | "KHR");
+                    setActiveIntent(null);
+                    onActiveQrChange(null);
+                  }}
                 >
                   <option value="USD">USD (ISO 840)</option>
                   <option value="KHR">KHR (ISO 116 · @ {fxRate.toLocaleString()})</option>
@@ -540,15 +667,17 @@ export function PosCheckoutModal({
                 )}
                 {activeIntent.status === "pending" && (
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
-                    <button
-                      id="qr-simulate-settle-btn"
-                      type="button"
-                      className="btn btn-primary btn-sm"
-                      disabled={qrBusy}
-                      onClick={() => void handleSimulateSettle()}
-                    >
-                      <CheckCircle2 size={13} aria-hidden="true" /> Simulate Bank Settlement (Sandbox)
-                    </button>
+                    {activeIntent.provider === "mock_sandbox" && (
+                      <button
+                        id="qr-simulate-settle-btn"
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={qrBusy}
+                        onClick={() => void handleSimulateSettle()}
+                      >
+                        <CheckCircle2 size={13} aria-hidden="true" /> Simulate Bank Settlement (Sandbox)
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="btn btn-sm"
@@ -671,11 +800,11 @@ export function PosCheckoutModal({
               id="split-add-points-btn"
               type="button"
               className="btn btn-sm"
-              disabled={!attachedCustomer || attachedCustomer.pointsBalance < 1}
+              disabled={!attachedCustomer || availableLoyaltyPts < 1}
               onClick={() => handleApplyOther("loyalty_points")}
             >
               Redeem Loyalty Points
-              {attachedCustomer ? ` (${attachedCustomer.pointsBalance} pts avail.)` : " (Attach Member)"}
+              {attachedCustomer ? ` (${availableLoyaltyPts} pts avail.)` : " (Attach Member)"}
             </button>
           </div>
         </div>

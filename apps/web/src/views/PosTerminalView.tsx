@@ -36,20 +36,24 @@ import {
   type ZReportSummary,
 } from "../components/PosModals";
 import { PosScanBar } from "../components/PosScanBar";
-import { publishCfdState, type CfdActiveQr } from "../lib/cfdChannel";
+import { clearCfdState, publishCfdState, type CfdActiveQr } from "../lib/cfdChannel";
 import {
-  appendDeadLetterSale,
+  appendDeadLetterSaleResult,
   classifySaleSyncError,
-  enqueueOfflineSale,
+  DEAD_LETTER_QUEUE_KEY,
+  enqueueOfflineSaleResult,
   loadDeadLetterQueue,
   loadLocalParkedBaskets,
   loadOfflineQueue,
   loadPosCache,
   mapBootstrapPromotions,
+  OFFLINE_QUEUE_KEY,
+  rebuildSaleWithoutCoupon,
   removeDeadLetterSale,
+  removeOfflineSalesByIds,
   saveLocalParkedBaskets,
-  saveOfflineQueue,
   savePosCache,
+  withOfflineQueueLock,
   type DeadLetterPosSale,
   type PosBootstrapSnapshot,
   type QueuedPosPayment,
@@ -62,11 +66,13 @@ type BootstrapTax = PosBootstrapSnapshot["taxRates"][number];
 type BasketRule = NonNullable<PosBootstrapSnapshot["basketRules"]>[number];
 
 export function PosTerminalView({
+  cashierUserId,
   cashierName = "Elena Morales",
   userRole = "owner",
   isActive = true,
   catalogRefreshTick = 0,
 }: {
+  cashierUserId?: string;
   cashierName?: string;
   userRole?: UserRole;
   isActive?: boolean;
@@ -95,7 +101,24 @@ export function PosTerminalView({
   const [scanError, setScanError] = useState<string | null>(null);
   const [cart, setCart] = useState<CartInputLine[]>([]);
   const [ageVerified, setAgeVerified] = useState(false);
-  const [pendingAgeItem, setPendingAgeItem] = useState<BootstrapBarcode | null>(null);
+  const [pendingAgeItem, setPendingAgeItem] = useState<
+    | { kind: "barcode"; bc: BootstrapBarcode }
+    | {
+        kind: "weighted";
+        prod: BootstrapProduct;
+        primBc: BootstrapBarcode;
+        scannedBarcode: string;
+        netGrams: number;
+        tareGrams: number;
+        embeddedPriceCents: number | null;
+      }
+    | {
+        kind: "recalled";
+        lines: CartInputLine[];
+        holdCode: string;
+      }
+    | null
+  >(null);
   const [showFreshPluModal, setShowFreshPluModal] = useState(false);
   const [freshPluInitialProductId, setFreshPluInitialProductId] = useState<string | null>(null);
   const [receiptPreview, setReceiptPreview] = useState<string | null>(null);
@@ -105,6 +128,7 @@ export function PosTerminalView({
   const [submittingMethod, setSubmittingMethod] = useState<"cash" | "card" | "modal" | null>(null);
   const [syncingQueue, setSyncingQueue] = useState(false);
   const [daypartPreview, setDaypartPreview] = useState<"live" | "morning" | "evening">("live");
+  const [clockNow, setClockNow] = useState<Date>(() => new Date());
   const [removedUndoLine, setRemovedUndoLine] = useState<CartInputLine | null>(null);
 
   // Active Register Shift (hydrated from GET /api/pos/shifts/active — H-17)
@@ -134,7 +158,7 @@ export function PosTerminalView({
 
   // Blind Shift Close Modal
   const [showShiftClose, setShowShiftClose] = useState(false);
-  const [blindCashInput, setBlindCashInput] = useState("420.00");
+  const [blindCashInput, setBlindCashInput] = useState("");
   const [fallbackFloatInput, setFallbackFloatInput] = useState("300.00");
   const [closingShift, setClosingShift] = useState(false);
   const [shiftError, setShiftError] = useState<string | null>(null);
@@ -160,6 +184,7 @@ export function PosTerminalView({
   const [parkedError, setParkedError] = useState<string | null>(null);
 
   const [showSupervisorModal, setShowSupervisorModal] = useState(false);
+  const [supervisorOverrideId, setSupervisorOverrideId] = useState<string | null>(null);
   const [supervisorOverrideBy, setSupervisorOverrideBy] = useState<string | null>(null);
   const [supervisorBanner, setSupervisorBanner] = useState<string | null>(null);
 
@@ -171,9 +196,40 @@ export function PosTerminalView({
   const hasEvaluatedLinesRef = useRef(false);
   const offlineQueueRef = useRef(offlineQueue);
   const simulatedOfflineRef = useRef(simulatedOffline);
+  const showCheckoutModalRef = useRef(showCheckoutModal);
+  const daypartPreviewRef = useRef(daypartPreview);
 
   offlineQueueRef.current = offlineQueue;
   simulatedOfflineRef.current = simulatedOffline;
+  showCheckoutModalRef.current = showCheckoutModal;
+  daypartPreviewRef.current = daypartPreview;
+
+  // Periodic clock tick so live daypart promo boundary transitions evaluate without manual clicks
+  // Freeze live clock while checkout modal is open so tender entry stays stable
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (!showCheckoutModalRef.current) {
+        setClockNow(new Date());
+      }
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Cross-tab offline/dead-letter storage sync & clean CFD reset on unmount
+  useEffect(() => {
+    const onStorage = (ev: StorageEvent) => {
+      if (ev.key === OFFLINE_QUEUE_KEY) {
+        setOfflineQueue(loadOfflineQueue());
+      } else if (ev.key === DEAD_LETTER_QUEUE_KEY) {
+        setDeadLetterQueue(loadDeadLetterQueue());
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      clearCfdState();
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -262,6 +318,14 @@ export function PosTerminalView({
         return;
       }
       if (!hasEvaluatedLinesRef.current || saleLockRef.current) return;
+      if (
+        (e.key === "F7" || e.key === "F8" || e.key === "F9" || e.key === "F10") &&
+        daypartPreviewRef.current !== "live"
+      ) {
+        e.preventDefault();
+        setSyncError("Daypart preview is active — switch back to Live Clock before checking out.");
+        return;
+      }
       if (e.key === "F7") {
         e.preventDefault();
         setCheckoutInitialTab("cash");
@@ -464,7 +528,7 @@ export function PosTerminalView({
     return () => controller.abort();
   }, [catalogRefreshTick, loadBootstrap]);
 
-  const flushOfflineQueueRef = useRef<(queueToFlush?: QueuedPosSale[]) => Promise<void>>(
+  const flushOfflineQueueRef = useRef<() => Promise<void>>(
     async () => {}
   );
 
@@ -472,7 +536,7 @@ export function PosTerminalView({
   useEffect(() => {
     const handleOnline = () => {
       if (!simulatedOfflineRef.current && offlineQueueRef.current.length > 0) {
-        void flushOfflineQueueRef.current(offlineQueueRef.current);
+        void flushOfflineQueueRef.current();
       }
     };
     window.addEventListener("online", handleOnline);
@@ -480,7 +544,7 @@ export function PosTerminalView({
   }, []);
 
   const evalHour =
-    daypartPreview === "morning" ? 9 : daypartPreview === "evening" ? 18 : new Date().getHours();
+    daypartPreview === "morning" ? 9 : daypartPreview === "evening" ? 18 : clockNow.getHours();
 
   const rawBasketSubtotalCents = useMemo(
     () =>
@@ -510,10 +574,10 @@ export function PosTerminalView({
     () =>
       evaluateCart(cart, promos, {
         evalHour,
-        evalNow: new Date(),
+        evalNow: clockNow,
         couponDiscountCents: couponEligibleNow ? appliedCoupon!.discountCents : 0,
       }),
-    [cart, promos, evalHour, couponEligibleNow, appliedCoupon]
+    [cart, promos, evalHour, clockNow, couponEligibleNow, appliedCoupon]
   );
 
   hasEvaluatedLinesRef.current = evaluated.lines.length > 0;
@@ -622,9 +686,22 @@ export function PosTerminalView({
     scannedBarcode: string,
     netGrams: number,
     tareGrams: number,
-    embeddedPriceCents: number | null = null
+    embeddedPriceCents: number | null = null,
+    bypassAge = false
   ): boolean => {
     if (checkRecallBlock(prod)) return false;
+    if (prod.requiresAgeCheck && !ageVerified && !bypassAge) {
+      setPendingAgeItem({
+        kind: "weighted",
+        prod,
+        primBc,
+        scannedBarcode,
+        netGrams,
+        tareGrams,
+        embeddedPriceCents,
+      });
+      return false;
+    }
     const tax = taxMap.get(prod.taxRateId) ?? { rateBp: 0, isInclusive: true };
     const unitMode: UnitMode = prod.unitMode ?? "weight_g";
     const measureLabel = formatMeasure(netGrams, unitMode);
@@ -662,7 +739,7 @@ export function PosTerminalView({
     if (!prod) return;
     if (checkRecallBlock(prod)) return;
     if (prod.requiresAgeCheck && !ageVerified && !bypassAge) {
-      setPendingAgeItem(bc);
+      setPendingAgeItem({ kind: "barcode", bc });
       return;
     }
     const tax = taxMap.get(prod.taxRateId) ?? { rateBp: 0, isInclusive: true };
@@ -701,6 +778,7 @@ export function PosTerminalView({
   };
 
   const handleScanSubmit = (raw: string): boolean => {
+    if (saleLockRef.current) return false;
     const clean = raw.trim();
     if (!clean) return false;
 
@@ -797,46 +875,72 @@ export function PosTerminalView({
     return false;
   };
 
-  const flushOfflineQueue = async (queueToFlush = offlineQueueRef.current) => {
-    if (queueToFlush.length === 0 || flushLockRef.current) return;
+  const flushOfflineQueue = async () => {
+    if (flushLockRef.current) return;
     flushLockRef.current = true;
     setSyncingQueue(true);
     setSyncError(null);
     let synced = 0;
     let authRequired = false;
-    const remaining: QueuedPosSale[] = [];
+    let retryableRemainingCount = 0;
+    let skippedOtherCashierCount = 0;
     const permanentErrors: string[] = [];
-    let latestDeadLetters = deadLetterQueue;
 
     try {
-      for (let i = 0; i < queueToFlush.length; i++) {
-        const sale = queueToFlush[i];
-        try {
-          await apiPost("/api/pos/sales", sale);
-          synced++;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          const kind = classifySaleSyncError(err);
-          if (kind === "permanent") {
-            permanentErrors.push(`${sale.receiptNo}: ${msg}`);
-            latestDeadLetters = appendDeadLetterSale({
-              sale,
-              error: msg,
-              status: err instanceof ApiError ? err.status : null,
-              failedAt: new Date().toISOString(),
-            });
-          } else if (kind === "auth") {
-            authRequired = true;
-            remaining.push(...queueToFlush.slice(i));
-            break;
-          } else {
-            remaining.push(sale);
+      await withOfflineQueueLock(async () => {
+        const snapshotQueue = loadOfflineQueue();
+        if (snapshotQueue.length === 0) {
+          setOfflineQueue([]);
+          return;
+        }
+        for (let i = 0; i < snapshotQueue.length; i++) {
+          const sale = snapshotQueue[i];
+          if (
+            sale.originCashierId &&
+            cashierUserId &&
+            sale.originCashierId !== cashierUserId &&
+            !canVoidOrRefund
+          ) {
+            skippedOtherCashierCount += 1;
+            continue;
+          }
+          try {
+            await apiPost("/api/pos/sales", sale);
+            synced++;
+            const rm = removeOfflineSalesByIds([sale.id]);
+            setOfflineQueue(rm.queue);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const kind = classifySaleSyncError(err);
+            if (kind === "permanent") {
+              const dlqRes = appendDeadLetterSaleResult({
+                sale,
+                error: msg,
+                status: err instanceof ApiError ? err.status : null,
+                failedAt: new Date().toISOString(),
+              });
+              if (dlqRes.saved) {
+                permanentErrors.push(`${sale.receiptNo}: ${msg}`);
+                setDeadLetterQueue(dlqRes.queue);
+                const rm = removeOfflineSalesByIds([sale.id]);
+                setOfflineQueue(rm.queue);
+              } else {
+                permanentErrors.push(`${sale.receiptNo}: storage full — kept in queue`);
+                retryableRemainingCount += 1;
+              }
+            } else if (kind === "auth") {
+              authRequired = true;
+              retryableRemainingCount += snapshotQueue.length - i;
+              break;
+            } else {
+              retryableRemainingCount += 1;
+            }
           }
         }
-      }
-      saveOfflineQueue(remaining);
-      setOfflineQueue(remaining);
-      setDeadLetterQueue(latestDeadLetters);
+        const latestQueue = loadOfflineQueue();
+        setOfflineQueue(latestQueue);
+      });
+
       if (synced > 0) {
         setSyncMessage(
           `Idempotently synced ${synced} queued receipt(s) to PostgreSQL & updated FEFO batches.`
@@ -846,14 +950,18 @@ export function PosTerminalView({
       }
       if (authRequired) {
         setSyncError(
-          `Session expired — ${remaining.length} receipt(s) remain safely queued locally until you sign back in.`
+          `Session expired — ${retryableRemainingCount} receipt(s) remain safely queued locally until you sign back in.`
         );
       } else if (permanentErrors.length > 0) {
         setSyncError(
           `Quarantined ${permanentErrors.length} rejected receipt(s) in Dead-Letter Queue for manager review: ${permanentErrors.join("; ")}`
         );
-      } else if (remaining.length > 0 && synced === 0) {
-        setSyncError(`Still offline — ${remaining.length} receipt(s) remain queued locally.`);
+      } else if (skippedOtherCashierCount > 0 && synced === 0) {
+        setSyncError(
+          `${skippedOtherCashierCount} offline receipt(s) belong to another cashier — have that cashier sign in or have a manager/owner sync.`
+        );
+      } else if (retryableRemainingCount > 0 && synced === 0) {
+        setSyncError(`Still offline — ${retryableRemainingCount} receipt(s) remain queued locally.`);
       }
     } finally {
       flushLockRef.current = false;
@@ -868,7 +976,7 @@ export function PosTerminalView({
     setSyncError(null);
     try {
       const retrySale: QueuedPosSale = stripCoupon
-        ? { ...entry.sale, couponCode: null }
+        ? rebuildSaleWithoutCoupon(entry.sale, productsMap, taxMap, promos)
         : entry.sale;
       await apiPost("/api/pos/sales", retrySale);
       const nextDlq = removeDeadLetterSale(entry.sale.id);
@@ -1023,6 +1131,10 @@ export function PosTerminalView({
     payments: QueuedPosPayment[],
     method: "cash" | "card" | "modal" = "modal"
   ) => {
+    if (daypartPreview !== "live") {
+      setSyncError("Daypart preview is active — switch back to Live Clock before checking out.");
+      return;
+    }
     if (evaluated.lines.length === 0 || payments.length === 0 || saleLockRef.current) return;
     saleLockRef.current = true;
     setSubmittingSale(true);
@@ -1042,10 +1154,11 @@ export function PosTerminalView({
         kind: "sale",
         soldAt: nowIso,
         cashierName,
+        originCashierId: cashierUserId ?? null,
         ageVerified: evaluated.requiresAgeCheck && ageVerified,
         customerId: attachedCustomer?.id ?? null,
         couponCode: couponEligibleNow && appliedCoupon ? appliedCoupon.code : null,
-        supervisorOverrideBy,
+        supervisorOverrideId,
         lines: evaluated.lines.map((l) => ({
           id: generateUuidV7(),
           productId: l.productId,
@@ -1066,8 +1179,14 @@ export function PosTerminalView({
       };
 
       if (simulatedOffline) {
-        const nextQueue = enqueueOfflineSale(payload);
-        setOfflineQueue(nextQueue);
+        const persistRes = enqueueOfflineSaleResult(payload);
+        if (!persistRes.saved) {
+          setSyncError(
+            "Browser storage quota exceeded — receipt could NOT be saved offline. Free storage or keep this basket open."
+          );
+          return;
+        }
+        setOfflineQueue(persistRes.queue);
         setReceiptPreview(
           buildPaperReceipt(receiptNo, saleId, payments, "[OFFLINE QUEUED]", supervisorOverrideBy)
         );
@@ -1090,8 +1209,14 @@ export function PosTerminalView({
             setSyncError(msg);
             return;
           }
-          const nextQueue = enqueueOfflineSale(payload);
-          setOfflineQueue(nextQueue);
+          const persistRes = enqueueOfflineSaleResult(payload);
+          if (!persistRes.saved) {
+            setSyncError(
+              `Network sync failed (${msg}) and browser storage quota is full — receipt could NOT be saved offline. Keep this basket open and retry.`
+            );
+            return;
+          }
+          setOfflineQueue(persistRes.queue);
           setReceiptPreview(
             buildPaperReceipt(receiptNo, saleId, payments, "[OFFLINE QUEUED]", supervisorOverrideBy)
           );
@@ -1109,6 +1234,7 @@ export function PosTerminalView({
       setAttachedCustomer(null);
       setAppliedCoupon(null);
       setCouponFeedback(null);
+      setSupervisorOverrideId(null);
       setSupervisorOverrideBy(null);
       setActiveCfdQr(null);
       setShowCheckoutModal(false);
@@ -1155,6 +1281,7 @@ export function PosTerminalView({
     }
     setCart([]);
     setAgeVerified(false);
+    setSupervisorOverrideId(null);
     setSupervisorOverrideBy(null);
   };
 
@@ -1262,6 +1389,7 @@ export function PosTerminalView({
       setAttachedCustomer(null);
       setAppliedCoupon(null);
       setCouponFeedback(null);
+      setSupervisorOverrideId(null);
       setSupervisorOverrideBy(null);
       setSyncMessage(`Parked active basket as ${holdCode}. Ready for next shopper!`);
       await loadParkedBaskets();
@@ -1279,22 +1407,134 @@ export function PosTerminalView({
     setBusyParkedId(basket.id);
     setParkedError(null);
     try {
-      let recalledLines = basket.linesJson;
+      let recalledLinesRaw = basket.linesJson;
+      let targetCustomerId = basket.customerId;
+      let targetCouponCode = basket.couponCode;
       if (basket.source === "server") {
         const res = await apiPost<{ basket: ParkedBasketDto }>(
           `/api/pos/parked-baskets/${basket.id}/recall`,
           {}
         );
-        recalledLines = res.basket.linesJson;
+        recalledLinesRaw = res.basket.linesJson;
+        targetCustomerId = res.basket.customerId;
+        targetCouponCode = res.basket.couponCode;
       } else {
         const remaining = loadLocalParkedBaskets().filter((b) => b.id !== basket.id);
         saveLocalParkedBaskets(remaining);
       }
-      setCart(recalledLines as CartInputLine[]);
+
+      const rawLines = recalledLinesRaw as CartInputLine[];
+      const validatedLines: CartInputLine[] = [];
+      const blockedSkus: string[] = [];
+      for (const raw of rawLines) {
+        const prod = productsMap.get(raw.productId);
+        if (prod?.recalled) {
+          blockedSkus.push(prod.sku);
+          continue;
+        }
+        const bc =
+          barcodesMap.get(raw.scannedBarcode) ??
+          (prod ? primaryByProductMap.get(prod.id) : undefined);
+        const tax = prod ? taxMap.get(prod.taxRateId) : undefined;
+        validatedLines.push({
+          ...raw,
+          unitMode: prod?.unitMode ?? raw.unitMode ?? "each",
+          unitPriceCents: bc ? bc.sellPriceCents : raw.unitPriceCents,
+          packLabel: !raw.weightGrams && bc ? bc.packLabel : raw.packLabel,
+          packQty: bc ? bc.packQty : raw.packQty,
+          taxRateBp: tax ? tax.rateBp : raw.taxRateBp,
+          taxInclusive: tax ? tax.isInclusive : raw.taxInclusive,
+          requiresAgeCheck: prod ? prod.requiresAgeCheck : raw.requiresAgeCheck,
+        });
+      }
+
+      if (blockedSkus.length > 0) {
+        setScanError(
+          `FOOD-SAFETY RECALL BLOCK on recalled basket ${basket.holdCode}: skipped ${blockedSkus.join(", ")}.`
+        );
+      } else {
+        setScanError(null);
+      }
+
+      let restoredCustomer: PosCustomer | null = null;
+      if (targetCustomerId && !simulatedOfflineRef.current) {
+        try {
+          const custRes = await apiGet<{ customers: PosCustomer[] }>(
+            "/api/loyalty/customers?limit=200"
+          );
+          restoredCustomer = custRes.customers.find((c) => c.id === targetCustomerId) ?? null;
+        } catch {
+          restoredCustomer = null;
+        }
+      }
+      setAttachedCustomer(restoredCustomer);
+
+      let restoredCoupon: AppliedCoupon | null = null;
+      if (targetCouponCode) {
+        if (simulatedOfflineRef.current) {
+          setCouponFeedback(
+            `Coupon ${targetCouponCode} cannot be verified while offline — re-apply when online.`
+          );
+        } else {
+          try {
+            const rawSubtotal = validatedLines.reduce((s, l) => {
+              if (typeof l.embeddedPriceCents === "number" && l.embeddedPriceCents > 0) {
+                return s + l.embeddedPriceCents;
+              }
+              if (
+                (l.unitMode === "weight_g" || l.unitMode === "volume_ml") &&
+                typeof l.weightGrams === "number" &&
+                l.weightGrams > 0
+              ) {
+                return s + computeWeightedPriceCents(l.weightGrams, l.unitPriceCents);
+              }
+              return s + l.unitPriceCents * l.qtyPacks;
+            }, 0);
+            const qs = new URLSearchParams({ basketCents: String(rawSubtotal) });
+            if (restoredCustomer) qs.set("customerId", restoredCustomer.id);
+            const valRes = await apiGet<{
+              valid: boolean;
+              reason?: string;
+              coupon?: AppliedCoupon;
+            }>(
+              `/api/loyalty/coupons/validate/${encodeURIComponent(targetCouponCode)}?${qs.toString()}`
+            );
+            if (valRes.valid && valRes.coupon) {
+              restoredCoupon = valRes.coupon;
+              setCouponFeedback(
+                `Restored coupon ${valRes.coupon.code} (-${formatMoney(valRes.coupon.discountCents)}).`
+              );
+            } else {
+              setCouponFeedback(valRes.reason ?? `Coupon ${targetCouponCode} is no longer valid.`);
+            }
+          } catch {
+            setCouponFeedback(`Could not re-validate coupon ${targetCouponCode}.`);
+          }
+        }
+      } else {
+        setCouponFeedback(null);
+      }
+      setAppliedCoupon(restoredCoupon);
       setLastCompletedReceiptNo(null);
-      setSyncMessage(`Recalled parked basket ${basket.holdCode} (${recalledLines.length} line(s)).`);
+
       await loadParkedBaskets();
       setShowParkedModal(false);
+
+      if (!ageVerified && validatedLines.some((l) => l.requiresAgeCheck)) {
+        setCart(validatedLines.filter((l) => !l.requiresAgeCheck));
+        setPendingAgeItem({
+          kind: "recalled",
+          lines: validatedLines,
+          holdCode: basket.holdCode,
+        });
+        setSyncMessage(
+          `Recalled ${basket.holdCode} — confirm shopper age to restore restricted item(s).`
+        );
+        return;
+      }
+
+      setCart(validatedLines);
+      setSyncMessage(`Recalled parked basket ${basket.holdCode} (${validatedLines.length} line(s)).`);
       scanRef.current?.focus();
     } catch (err) {
       setParkedError(err instanceof Error ? err.message : "Failed recalling parked basket.");
@@ -1328,11 +1568,14 @@ export function PosTerminalView({
     if (res.actionType === "basket_void") {
       setCart([]);
       setAgeVerified(false);
+      setSupervisorOverrideId(null);
       setSupervisorOverrideBy(null);
     } else if (res.actionType === "line_void") {
       setCart((prev) => prev.slice(0, -1));
+      setSupervisorOverrideId(res.overrideId);
       setSupervisorOverrideBy(res.supervisorName);
-    } else if (res.actionType === "price_override") {
+    } else if (res.actionType === "price_override" || res.actionType === "manual_discount") {
+      setSupervisorOverrideId(res.overrideId);
       setSupervisorOverrideBy(res.supervisorName);
     }
     setSupervisorBanner(
@@ -1398,7 +1641,27 @@ export function PosTerminalView({
       const reversalId = generateUuidV7();
       const suffix = kind === "void" ? "VOID" : "RFND";
       const receiptNo = `${suffix}-${reversalId.slice(-8).toUpperCase()}`;
-      const payMethod = sale.payments[0]?.method ?? "cash";
+      const reversalPayments =
+        sale.payments.length > 0
+          ? sale.payments.map((p) => ({
+              id: generateUuidV7(),
+              method: p.method,
+              amountCents: p.amountCents,
+              tenderedCents: p.amountCents,
+              changeCents: 0,
+              currencyCode: p.currencyCode,
+              foreignAmount: p.foreignAmount ?? undefined,
+              fxRateUsed: p.fxRateUsed ?? undefined,
+            }))
+          : [
+              {
+                id: generateUuidV7(),
+                method: "cash" as const,
+                amountCents: sale.totalCents,
+                tenderedCents: sale.totalCents,
+                changeCents: 0,
+              },
+            ];
 
       await apiPost("/api/pos/sales", {
         id: reversalId,
@@ -1418,6 +1681,8 @@ export function PosTerminalView({
           packLabel: l.packLabel,
           packQty: l.packQty,
           qtyPacks: l.qtyPacks,
+          weightGrams: l.weightGrams ?? null,
+          tareGrams: l.tareGrams ?? null,
           unitPriceCents: l.unitPriceCents,
           unitCostCents: l.unitCostCents,
           discountCents: l.discountCents,
@@ -1425,15 +1690,7 @@ export function PosTerminalView({
           taxCents: l.taxCents,
           lineTotalCents: l.lineTotalCents,
         })),
-        payments: [
-          {
-            id: generateUuidV7(),
-            method: payMethod,
-            amountCents: sale.totalCents,
-            tenderedCents: sale.totalCents,
-            changeCents: 0,
-          },
-        ],
+        payments: reversalPayments,
       });
       setSyncMessage(
         `${kind === "void" ? "Voided" : "Refunded"} receipt ${sale.receiptNo} → posted ${receiptNo} (${formatMoney(sale.totalCents)} restocked to ledger).`
@@ -1495,7 +1752,7 @@ export function PosTerminalView({
         offlineQueueCount={offlineQueue.length}
         syncingQueue={syncingQueue}
         daypartPreview={daypartPreview}
-        liveHour={new Date().getHours()}
+        liveHour={clockNow.getHours()}
         onOpenPluGrid={() => {
           setFreshPluInitialProductId(null);
           setShowFreshPluModal(true);
@@ -1509,8 +1766,8 @@ export function PosTerminalView({
         onToggleOfflineSim={() => {
           const nextOffline = !simulatedOffline;
           setSimulatedOffline(nextOffline);
-          if (!nextOffline && offlineQueue.length > 0) {
-            void flushOfflineQueue(offlineQueue);
+          if (!nextOffline) {
+            void flushOfflineQueue();
           }
         }}
         onFlushOfflineQueue={() => void flushOfflineQueue()}
@@ -1526,6 +1783,7 @@ export function PosTerminalView({
         }}
         onOpenShiftClose={() => {
           setShowShiftClose(true);
+          setBlindCashInput("");
           setZReportResult(null);
           setShiftError(null);
           void loadActiveShift();
@@ -1533,10 +1791,27 @@ export function PosTerminalView({
         onDaypartChange={setDaypartPreview}
       />
 
-      {bootstrapError && (
+      {daypartPreview !== "live" && (
+        <div id="pos-daypart-preview-banner" className="banner banner-amber" role="status" style={{ marginBottom: 12 }}>
+          <span>
+            <strong>Daypart Clock Preview ({daypartPreview === "morning" ? "09:00" : "18:00"}):</strong>{" "}
+            Showing simulated promotional prices &amp; basket nudges. Switch back to Live Clock before checking out.
+          </span>
+          <button
+            id="pos-exit-daypart-preview-btn"
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setDaypartPreview("live")}
+          >
+            Return to Live Clock
+          </button>
+        </div>
+      )}
+
+      {bootstrapError && barcodesMap.size > 0 && (
         <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
           <span>{bootstrapError}</span>
-          <button type="button" className="btn btn-sm" onClick={() => void loadBootstrap()}>
+          <button type="button" className="btn btn-sm" onClick={() => void loadBootstrap(undefined, { preferLive: true })}>
             <RefreshCw size={12} aria-hidden="true" /> Retry Sync
           </button>
         </div>
@@ -1598,14 +1873,34 @@ export function PosTerminalView({
       <div className="pos-layout">
         <div className="stack-md">
           <section className="panel">
+            {!bootstrapLoading && barcodesMap.size === 0 && (
+              <div id="pos-empty-catalog-alert" className="banner banner-red" role="alert" style={{ marginBottom: 14 }}>
+                <span>
+                  <strong>POS Scanning Paused (0 SKUs Cached):</strong>{" "}
+                  {bootstrapError ?? "Local barcode catalog is empty. Sync with the Store API before ringing items."}
+                </span>
+                <button
+                  id="pos-empty-catalog-retry-btn"
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => void loadBootstrap(undefined, { preferLive: true })}
+                >
+                  <RefreshCw size={14} aria-hidden="true" /> Retry Catalog Sync
+                </button>
+              </div>
+            )}
             <PosScanBar
               inputRef={scanRef}
               isActive={isActive}
               disabled={barcodesMap.size === 0}
+              inputDisabled={submittingSale}
+              modalOpen={anyModalOpen}
+              invalid={Boolean(scanError)}
+              errorId="pos-scan-error-alert"
               onScan={handleScanSubmit}
             />
             {scanError && (
-              <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
+              <div id="pos-scan-error-alert" className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
                 <span>{scanError}</span>
                 <button type="button" className="btn btn-sm" onClick={() => setScanError(null)}>
                   Dismiss
@@ -1628,7 +1923,7 @@ export function PosTerminalView({
               </div>
             ) : quickItems.length === 0 ? (
               <div style={{ color: "var(--ink-muted)", padding: "18px 0" }}>
-                No quick-scan catalog items available. Use Retry Sync above once API connectivity is restored.
+                No quick-scan catalog items available. Use Retry Catalog Sync above once API connectivity is restored.
               </div>
             ) : (
               <div className="quick-scan-grid">
@@ -1637,6 +1932,7 @@ export function PosTerminalView({
                     key={q.barcode}
                     type="button"
                     className="quick-sku-btn"
+                    disabled={submittingSale}
                     onClick={() => handleScanSubmit(q.barcode)}
                   >
                     <span className="tag tag-blue" style={{ width: "fit-content", fontSize: 11.5 }}>
@@ -1712,6 +2008,10 @@ export function PosTerminalView({
           }}
           onQuickPay={(method) => void completeQuickSale(method)}
           onOpenCheckoutTab={(tab) => {
+            if (daypartPreview !== "live") {
+              setSyncError("Daypart preview is active — switch back to Live Clock before checking out.");
+              return;
+            }
             setCheckoutInitialTab(tab);
             setShowCheckoutModal(true);
           }}
@@ -1726,7 +2026,22 @@ export function PosTerminalView({
           const item = pendingAgeItem;
           setAgeVerified(true);
           setPendingAgeItem(null);
-          addBarcodeToCart(item, true);
+          if (item.kind === "barcode") {
+            addBarcodeToCart(item.bc, true);
+          } else if (item.kind === "weighted") {
+            addWeightedLineToCart(
+              item.prod,
+              item.primBc,
+              item.scannedBarcode,
+              item.netGrams,
+              item.tareGrams,
+              item.embeddedPriceCents,
+              true
+            );
+          } else {
+            setCart(item.lines);
+            setSyncMessage(`Recalled parked basket ${item.holdCode} (age verified).`);
+          }
           scanRef.current?.focus();
         }}
       />
@@ -1765,7 +2080,10 @@ export function PosTerminalView({
         onBlindCashChange={setBlindCashInput}
         onFallbackFloatChange={setFallbackFloatInput}
         onSubmit={() => void handleCloseShift()}
-        onClose={() => setShowShiftClose(false)}
+        onClose={() => {
+          setShowShiftClose(false);
+          setBlindCashInput("");
+        }}
       />
 
       <DeadLetterModal

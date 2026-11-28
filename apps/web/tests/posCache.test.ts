@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it } from "vitest";
 import {
   ApiError,
   apiGet,
@@ -7,20 +7,31 @@ import {
   setUnauthorizedHandler,
 } from "../src/api.ts";
 import {
+  clearCfdState,
+  CFD_STORAGE_KEY,
+  publishCfdState,
+  subscribeCfdState,
+} from "../src/lib/cfdChannel.ts";
+import {
   appendDeadLetterSale,
+  appendDeadLetterSaleResult,
   classifySaleSyncError,
   clearPosCache,
   DEAD_LETTER_QUEUE_KEY,
   enqueueOfflineSale,
+  enqueueOfflineSaleResult,
   isValidPosSnapshot,
   loadDeadLetterQueue,
   loadOfflineQueue,
   loadPosCache,
   mapBootstrapPromotions,
   OFFLINE_QUEUE_KEY,
+  rebuildSaleWithoutCoupon,
   removeDeadLetterSale,
+  removeOfflineSalesByIds,
   saveOfflineQueue,
   savePosCache,
+  withOfflineQueueLock,
   type PosBootstrapSnapshot,
   type QueuedPosSale,
 } from "../src/lib/posCache.ts";
@@ -341,6 +352,244 @@ describe("POS IndexedDB snapshot validation and promotion mapping", () => {
       assert.equal(closeCalls, 4);
     } finally {
       g.indexedDB = prevIdb;
+    }
+  });
+
+  it("strips wholesale avgCostCents before saving IndexedDB cache and clears CFD localStorage state", async () => {
+    const kv = new Map<string, unknown>();
+    const fakeIndexedDb = {
+      open: () => {
+        const req: Record<string, unknown> = {};
+        const db = {
+          objectStoreNames: { contains: () => true },
+          close: () => {},
+          transaction: () => {
+            const tx: Record<string, unknown> = {};
+            tx.objectStore = () => ({
+              put: (val: unknown, k: string) => {
+                kv.set(k, val);
+                queueMicrotask(() => {
+                  (tx.oncomplete as (() => void) | undefined)?.();
+                });
+              },
+              get: (k: string) => {
+                const getReq: Record<string, unknown> = {};
+                queueMicrotask(() => {
+                  getReq.result = kv.get(k);
+                  (getReq.onsuccess as (() => void) | undefined)?.();
+                });
+                return getReq;
+              },
+            });
+            return tx;
+          },
+        };
+        queueMicrotask(() => {
+          req.result = db;
+          (req.onsuccess as (() => void) | undefined)?.();
+        });
+        return req;
+      },
+    };
+
+    const g = globalThis as unknown as { indexedDB?: unknown };
+    const prevIdb = g.indexedDB;
+    g.indexedDB = fakeIndexedDb;
+    try {
+      const snapWithCost: PosBootstrapSnapshot = {
+        ...sampleSnapshot,
+        products: [
+          {
+            id: "prod-1",
+            sku: "SKU-1",
+            name: "Milk",
+            brand: "Farm",
+            categoryId: "cat-1",
+            taxRateId: "tax-1",
+            baseUnitLabel: "unit",
+            avgCostCents: 199,
+            requiresAgeCheck: false,
+          },
+        ],
+      };
+      assert.equal(await savePosCache(snapWithCost), true);
+      const cached = await loadPosCache();
+      assert.ok(cached);
+      assert.equal("avgCostCents" in cached.products[0], false);
+    } finally {
+      g.indexedDB = prevIdb;
+    }
+
+    if (typeof localStorage !== "undefined") {
+      publishCfdState({
+        storeName: "Flagship",
+        receiptHeader: "Hi",
+        receiptFooter: "Bye",
+        registerCode: "REG-01",
+        cashierName: "Owner",
+        primaryCurrency: "USD",
+        secondaryCurrency: "KHR",
+        secondaryFxRate: 4100,
+        secondaryRoundingStep: 100,
+        status: "ringing",
+        lines: [],
+        subtotalCents: 0,
+        discountCents: 0,
+        taxCents: 0,
+        grandTotalCents: 0,
+        activeQr: null,
+        lastReceiptNo: null,
+        updatedAt: new Date().toISOString(),
+      });
+      assert.ok(localStorage.getItem(CFD_STORAGE_KEY));
+      clearCfdState();
+      assert.equal(localStorage.getItem(CFD_STORAGE_KEY), null);
+    }
+  });
+
+  it("preserves concurrently enqueued sales on atomic ID removal, reports QuotaExceededError, and rebuilds coupon-stripped sales", async () => {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+    };
+
+    const saleA: QueuedPosSale = {
+      id: "01950000-0000-7000-8000-000000000101",
+      registerCode: "REG-01",
+      receiptNo: "REG-01-A",
+      kind: "sale",
+      soldAt: "2026-11-25T10:00:00.000Z",
+      cashierName: "Elena Morales",
+      originCashierId: "cashier-1",
+      ageVerified: false,
+      couponCode: "SAVE1",
+      lines: [
+        {
+          id: "01950000-0000-7000-8000-000000000111",
+          productId: "01950000-0000-7000-8000-000000000112",
+          scannedBarcode: "8850000000012",
+          packLabel: "Single",
+          packQty: 1,
+          qtyPacks: 1,
+          unitPriceCents: 500,
+          unitCostCents: 200,
+          discountCents: 100,
+          taxRateBp: 0,
+          taxCents: 0,
+          lineTotalCents: 400,
+        },
+      ],
+      payments: [
+        {
+          id: "01950000-0000-7000-8000-000000000113",
+          method: "khqr",
+          amountCents: 250,
+          tenderedCents: 250,
+          changeCents: 0,
+          paymentIntentId: "01950000-0000-7000-8000-000000000999",
+          currencyCode: "USD",
+        },
+        {
+          id: "01950000-0000-7000-8000-000000000114",
+          method: "cash",
+          amountCents: 150,
+          tenderedCents: 150,
+          changeCents: 0,
+          currencyCode: "USD",
+        },
+      ],
+    };
+
+    const saleB: QueuedPosSale = {
+      ...saleA,
+      id: "01950000-0000-7000-8000-000000000202",
+      receiptNo: "REG-01-B",
+      couponCode: null,
+    };
+
+    assert.equal(enqueueOfflineSaleResult(saleA, mockStorage).saved, true);
+    await withOfflineQueueLock(async () => {
+      // Simulate another tab/flow enqueueing Sale B while Sale A is flushing
+      assert.equal(enqueueOfflineSaleResult(saleB, mockStorage).saved, true);
+      const removed = removeOfflineSalesByIds([saleA.id], mockStorage);
+      assert.equal(removed.saved, true);
+      assert.deepEqual(
+        removed.queue.map((s) => s.id),
+        [saleB.id]
+      );
+    });
+    assert.deepEqual(
+      loadOfflineQueue(mockStorage).map((s) => s.receiptNo),
+      ["REG-01-B"]
+    );
+
+    // QuotaExceededError must signal saved: false rather than silently discarding receipt
+    const fullStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: () => {
+        throw new Error("QuotaExceededError");
+      },
+    };
+    const quotaRes = enqueueOfflineSaleResult(saleA, fullStorage);
+    assert.equal(quotaRes.saved, false);
+    const dlqQuotaRes = appendDeadLetterSaleResult(
+      {
+        sale: saleA,
+        error: "Expired",
+        status: 400,
+        failedAt: "2026-11-25T10:01:00.000Z",
+      },
+      fullStorage
+    );
+    assert.equal(dlqQuotaRes.saved, false);
+
+    // Rebuilding dead-letter sale without coupon clears coupon discount & balances cash leg without modifying QR leg
+    const prodMap = new Map([
+      [
+        "01950000-0000-7000-8000-000000000112",
+        {
+          id: "01950000-0000-7000-8000-000000000112",
+          sku: "SKU-500",
+          name: "Coffee",
+          brand: "Roast",
+          categoryId: "cat-1",
+          taxRateId: "tax-0",
+          baseUnitLabel: "unit",
+          unitMode: "each" as const,
+          requiresAgeCheck: false,
+        },
+      ],
+    ]);
+    const taxMap = new Map([["tax-0", { id: "tax-0", rateBp: 0, isInclusive: true }]]);
+    const rebuilt = rebuildSaleWithoutCoupon(saleA, prodMap, taxMap, []);
+    assert.equal(rebuilt.couponCode, null);
+    assert.equal(rebuilt.lines[0].discountCents, 0);
+    assert.equal(rebuilt.lines[0].lineTotalCents, 500);
+    const totalPayments = rebuilt.payments.reduce((s, p) => s + p.amountCents, 0);
+    assert.equal(totalPayments, 500);
+    const qrLeg = rebuilt.payments.find((p) => p.method === "khqr");
+    assert.equal(qrLeg?.amountCents, 250);
+
+    // CFD subscribe notifies on storage removal
+    let observed: unknown = "unset";
+    const unsub = subscribeCfdState((next) => {
+      observed = next;
+    });
+    try {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new StorageEvent("storage", {
+            key: CFD_STORAGE_KEY,
+            newValue: null,
+          })
+        );
+        assert.equal(observed, null);
+      }
+    } finally {
+      unsub();
     }
   });
 });

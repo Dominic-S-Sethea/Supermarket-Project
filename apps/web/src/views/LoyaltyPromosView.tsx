@@ -105,7 +105,13 @@ function rfmBadgeClass(seg: string): string {
   return "tag-neutral";
 }
 
-export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole }) {
+export function LoyaltyPromosView({
+  userRole = "owner",
+  onCatalogChanged,
+}: {
+  userRole?: UserRole;
+  onCatalogChanged?: () => void;
+}) {
   const canManage = userRole === "owner" || userRole === "manager";
   const [subTab, setSubTab] = useState<LoyaltySubTab>(() => resolveLoyaltySubTab());
 
@@ -147,6 +153,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
   const [promoMinBasketUsd, setPromoMinBasketUsd] = useState("30.00");
   const [promoFlatDiscountUsd, setPromoFlatDiscountUsd] = useState("3.00");
   const [promoDiscountPct, setPromoDiscountPct] = useState(15);
+  const [promoTierRequiredQty, setPromoTierRequiredQty] = useState(3);
   const [promoDaypart, setPromoDaypart] = useState<"all" | "morning" | "evening">("all");
 
   const selectSubTab = (next: LoyaltySubTab) => {
@@ -336,7 +343,12 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
             ? { buyQty: 2, getQty: 1, discountBp: 10000 }
             : promoType === "mix_and_match"
               ? { requiredQty: 3, bundlePriceCents: 500 }
-              : { discountBp: Math.min(8000, Math.max(500, promoDiscountPct * 100)) };
+              : promoType === "tier_price"
+                ? {
+                    requiredQty: Math.max(2, Math.trunc(promoTierRequiredQty) || 2),
+                    discountBp: Math.min(8000, Math.max(500, promoDiscountPct * 100)),
+                  }
+                : { discountBp: Math.min(8000, Math.max(500, promoDiscountPct * 100)) };
 
       const daypartStartHour =
         promoDaypart === "morning" ? 8 : promoDaypart === "evening" ? 17 : null;
@@ -355,6 +367,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       });
       setFeedback(`Created active promotion "${promoName.trim()}" and synced to POS catalog.`);
       setPromoName("");
+      onCatalogChanged?.();
       await Promise.all([loadPromos(), loadPromoRoi()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed creating promotion");
@@ -372,6 +385,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
       setFeedback(
         `${promo.active ? "Paused" : "Activated"} promotion "${promo.name}".`
       );
+      onCatalogChanged?.();
       await loadPromos();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed toggling promotion");
@@ -509,6 +523,7 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                   <Search size={14} className="search-icon" />
                   <input
                     id="loyalty-customer-search"
+                    aria-label="Search loyalty customers by phone or name"
                     className="input"
                     placeholder="Phone or name..."
                     value={custSearch}
@@ -1005,17 +1020,34 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
                   </div>
                 )}
                 {(promoType === "clearance" || promoType === "tier_price") && (
-                  <div className="field">
-                    <label htmlFor="promo-discount-pct">Discount Percentage (%)</label>
-                    <input
-                      id="promo-discount-pct"
-                      className="input mono"
-                      type="number"
-                      min={5}
-                      max={80}
-                      value={promoDiscountPct}
-                      onChange={(e) => setPromoDiscountPct(Number(e.target.value) || 15)}
-                    />
+                  <div className="form-grid">
+                    <div className="field">
+                      <label htmlFor="promo-discount-pct">Discount Percentage (%)</label>
+                      <input
+                        id="promo-discount-pct"
+                        className="input mono"
+                        type="number"
+                        min={5}
+                        max={80}
+                        value={promoDiscountPct}
+                        onChange={(e) => setPromoDiscountPct(Number(e.target.value) || 15)}
+                      />
+                    </div>
+                    {promoType === "tier_price" && (
+                      <div className="field">
+                        <label htmlFor="promo-tier-qty">Min Tier Qty (units)</label>
+                        <input
+                          id="promo-tier-qty"
+                          className="input mono"
+                          type="number"
+                          min={2}
+                          value={promoTierRequiredQty}
+                          onChange={(e) =>
+                            setPromoTierRequiredQty(Math.max(2, Math.trunc(Number(e.target.value) || 2)))
+                          }
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
                 <button

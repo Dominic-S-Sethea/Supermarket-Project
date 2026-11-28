@@ -15,22 +15,53 @@ export function QrCodeSvg({
   sizePx?: number;
   label?: string;
 }) {
-  const { pathD, viewBoxSize } = useMemo(() => {
-    const matrix = generateQrMatrix(payload);
-    const quiet = 4;
-    const parts: string[] = [];
-    for (let r = 0; r < matrix.size; r++) {
-      for (let c = 0; c < matrix.size; c++) {
-        if (matrix.modules[r][c]) {
-          parts.push(`M${c + quiet},${r + quiet}h1v1h-1z`);
+  const qrResult = useMemo<
+    { ok: true; pathD: string; viewBoxSize: number } | { ok: false; error: string }
+  >(() => {
+    try {
+      if (!payload || payload.trim().length === 0) {
+        return { ok: false, error: "Empty QR payload" };
+      }
+      const matrix = generateQrMatrix(payload);
+      const quiet = 4;
+      const parts: string[] = [];
+      for (let r = 0; r < matrix.size; r++) {
+        for (let c = 0; c < matrix.size; c++) {
+          if (matrix.modules[r][c]) {
+            parts.push(`M${c + quiet},${r + quiet}h1v1h-1z`);
+          }
         }
       }
+      return {
+        ok: true,
+        pathD: parts.join(""),
+        viewBoxSize: matrix.size + quiet * 2,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : "Failed encoding QR matrix",
+      };
     }
-    return {
-      pathD: parts.join(""),
-      viewBoxSize: matrix.size + quiet * 2,
-    };
   }, [payload]);
+
+  if (!qrResult.ok) {
+    return (
+      <div
+        role="alert"
+        className="banner banner-red"
+        style={{
+          width: sizePx,
+          minHeight: Math.min(sizePx, 120),
+          boxSizing: "border-box",
+          fontSize: 12,
+          margin: 0,
+        }}
+      >
+        <span>Unable to render QR matrix: {qrResult.error}</span>
+      </div>
+    );
+  }
 
   return (
     <svg
@@ -38,7 +69,7 @@ export function QrCodeSvg({
       aria-label={label}
       width={sizePx}
       height={sizePx}
-      viewBox={`0 0 ${viewBoxSize} ${viewBoxSize}`}
+      viewBox={`0 0 ${qrResult.viewBoxSize} ${qrResult.viewBoxSize}`}
       shapeRendering="crispEdges"
       style={{
         display: "block",
@@ -47,8 +78,8 @@ export function QrCodeSvg({
         background: "#ffffff",
       }}
     >
-      <rect width={viewBoxSize} height={viewBoxSize} fill="#ffffff" />
-      <path d={pathD} fill="#000000" />
+      <rect width={qrResult.viewBoxSize} height={qrResult.viewBoxSize} fill="#ffffff" />
+      <path d={qrResult.pathD} fill="#000000" />
     </svg>
   );
 }

@@ -16,6 +16,7 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { ConfirmActionButton } from "../components/ConfirmActionButton";
 import { PageHeading } from "../components/PageHeading";
 import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
@@ -310,7 +311,7 @@ export function AdminAuditView({
     setErrorMsg(null);
     setFeedback(null);
     if (!newUsername.trim() || !newFullName.trim() || newPin.trim().length < 4) {
-      setErrorMsg("Enter username, full name, and a 4–12 digit/character PIN.");
+      setErrorMsg("Enter username, full name, and a 4–64 character PIN.");
       return;
     }
     setBusy("create-user");
@@ -355,7 +356,7 @@ export function AdminAuditView({
 
   const handleResetPin = async (userId: string, username: string) => {
     if (busy || resetPinValue.trim().length < 4) {
-      setErrorMsg("Reset PIN must be 4–12 characters.");
+      setErrorMsg("Reset PIN must be 4–64 characters.");
       return;
     }
     setErrorMsg(null);
@@ -400,7 +401,7 @@ export function AdminAuditView({
     setErrorMsg(null);
     setFeedback(null);
     if (nextPin.trim().length < 4) {
-      setErrorMsg("New PIN must be 4–12 characters.");
+      setErrorMsg("New PIN must be 4–64 characters.");
       return;
     }
     if (nextPin !== confirmNextPin) {
@@ -602,6 +603,7 @@ export function AdminAuditView({
                                 type="password"
                                 placeholder="New PIN"
                                 aria-label={`New PIN for ${u.fullName}`}
+                                maxLength={64}
                                 style={{ width: 96, padding: "4px 8px" }}
                                 value={resetPinValue}
                                 onChange={(e) => setResetPinValue(e.target.value)}
@@ -639,24 +641,40 @@ export function AdminAuditView({
                                 <KeyRound size={12} /> Reset PIN
                               </button>
                               {u.activeSessions > 0 && (
+                                <ConfirmActionButton
+                                  label={
+                                    <>
+                                      <Lock size={12} /> Revoke ({u.activeSessions})
+                                    </>
+                                  }
+                                  confirmLabel="Confirm Revoke"
+                                  ariaLabel={`Revoke active sessions for ${u.username}`}
+                                  confirmAriaLabel={`Confirm revoke sessions for ${u.username}`}
+                                  disabled={busy !== null}
+                                  onConfirm={() => handleRevokeSessions(u)}
+                                />
+                              )}
+                              {u.active ? (
+                                <ConfirmActionButton
+                                  label="Deactivate"
+                                  confirmLabel="Confirm Deactivate"
+                                  ariaLabel={`Deactivate ${u.username}`}
+                                  confirmAriaLabel={`Confirm deactivate ${u.username}`}
+                                  style={{ color: "var(--accent-crimson)" }}
+                                  disabled={busy !== null}
+                                  onConfirm={() => handleToggleActive(u)}
+                                />
+                              ) : (
                                 <button
                                   type="button"
                                   className="btn btn-sm"
+                                  style={{ color: "var(--accent-primary-ink)" }}
                                   disabled={busy !== null}
-                                  onClick={() => void handleRevokeSessions(u)}
+                                  onClick={() => void handleToggleActive(u)}
                                 >
-                                  <Lock size={12} /> Revoke ({u.activeSessions})
+                                  Reactivate
                                 </button>
                               )}
-                              <button
-                                type="button"
-                                className="btn btn-sm"
-                                style={{ color: u.active ? "var(--accent-crimson)" : "var(--accent-primary-ink)" }}
-                                disabled={busy !== null}
-                                onClick={() => void handleToggleActive(u)}
-                              >
-                                {u.active ? "Deactivate" : "Reactivate"}
-                              </button>
                             </div>
                           )}
                         </td>
@@ -728,13 +746,13 @@ export function AdminAuditView({
                   </select>
                 </div>
                 <div className="field">
-                  <label htmlFor="new-staff-pin">Initial PIN (4–12 chars)</label>
+                  <label htmlFor="new-staff-pin">Initial PIN (4–64 chars)</label>
                   <input
                     id="new-staff-pin"
                     className="input mono"
                     type="password"
                     minLength={4}
-                    maxLength={12}
+                    maxLength={64}
                     value={newPin}
                     onChange={(e) => setNewPin(e.target.value)}
                     required
@@ -747,7 +765,7 @@ export function AdminAuditView({
                 className="btn btn-primary"
                 disabled={busy !== null}
               >
-                <UserPlus size={14} /> {busy === "create-user" ? "Creating..." : "Create Staff User"}
+                <UserPlus size={14} /> {busy === "create-staff" || busy === "create-user" ? "Creating..." : "Create Staff User"}
               </button>
             </form>
           </section>
@@ -776,6 +794,7 @@ export function AdminAuditView({
               <Search size={14} className="search-icon" />
               <input
                 id="audit-search-input"
+                aria-label="Search compliance audit trail"
                 className="input"
                 placeholder="Search actor, action, SKU, PO, or JSON payload..."
                 value={auditSearch}
@@ -1219,20 +1238,20 @@ export function AdminAuditView({
                 className="input mono"
                 type="password"
                 minLength={4}
-                maxLength={12}
+                maxLength={64}
                 value={currentPin}
                 onChange={(e) => setCurrentPin(e.target.value)}
                 required
               />
             </div>
             <div className="field">
-              <label htmlFor="self-new-pin">New PIN (4–12 characters)</label>
+              <label htmlFor="self-new-pin">New PIN (4–64 characters)</label>
               <input
                 id="self-new-pin"
                 className="input mono"
                 type="password"
                 minLength={4}
-                maxLength={12}
+                maxLength={64}
                 value={nextPin}
                 onChange={(e) => setNextPin(e.target.value)}
                 required
@@ -1245,7 +1264,7 @@ export function AdminAuditView({
                 className="input mono"
                 type="password"
                 minLength={4}
-                maxLength={12}
+                maxLength={64}
                 value={confirmNextPin}
                 onChange={(e) => setConfirmNextPin(e.target.value)}
                 required

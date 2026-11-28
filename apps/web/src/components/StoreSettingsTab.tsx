@@ -33,6 +33,9 @@ export function StoreSettingsTab({
   const [khqrCity, setKhqrCity] = useState("");
   const [promptpayProxy, setPromptpayProxy] = useState("");
   const [paynowUen, setPaynowUen] = useState("");
+  const [thbFxRate, setThbFxRate] = useState("");
+  const [sgdFxRate, setSgdFxRate] = useState("");
+  const [existingRailRates, setExistingRailRates] = useState<Record<string, number>>({});
   const [fiscalProvider, setFiscalProvider] = useState<"local_hash_chain" | "fiskaly_tse">(
     "local_hash_chain"
   );
@@ -61,6 +64,10 @@ export function StoreSettingsTab({
     setKhqrCity(s.khqrCity);
     setPromptpayProxy(s.promptpayProxy);
     setPaynowUen(s.paynowUen);
+    const rates = s.railFxRatesJson ?? {};
+    setExistingRailRates(rates);
+    setThbFxRate(typeof rates.THB === "number" ? String(rates.THB) : "");
+    setSgdFxRate(typeof rates.SGD === "number" ? String(rates.SGD) : "");
     setFiscalProvider(s.fiscalProvider);
   }, []);
 
@@ -112,6 +119,28 @@ export function StoreSettingsTab({
       return;
     }
 
+    const nextRailRates: Record<string, number> = { ...existingRailRates };
+    if (thbFxRate.trim()) {
+      const thbNum = Number(thbFxRate);
+      if (!Number.isFinite(thbNum) || thbNum <= 0) {
+        setError("PromptPay THB FX rate must be a positive number.");
+        return;
+      }
+      nextRailRates.THB = thbNum;
+    } else {
+      delete nextRailRates.THB;
+    }
+    if (sgdFxRate.trim()) {
+      const sgdNum = Number(sgdFxRate);
+      if (!Number.isFinite(sgdNum) || sgdNum <= 0) {
+        setError("PayNow SGD FX rate must be a positive number.");
+        return;
+      }
+      nextRailRates.SGD = sgdNum;
+    } else {
+      delete nextRailRates.SGD;
+    }
+
     setSaving(true);
     try {
       const res = await apiPatch<{ settings: StoreSettingsDto }>("/api/store-settings", {
@@ -123,6 +152,7 @@ export function StoreSettingsTab({
         secondaryCurrency: secondaryCurrency ? secondaryCurrency : null,
         secondaryFxRate: fxNum,
         secondaryRoundingStep: Math.round(stepNum),
+        railFxRatesJson: Object.keys(nextRailRates).length > 0 ? nextRailRates : null,
         cashSkimLimitCents: Math.round(skimUsd * 100),
         receiptHeader: receiptHeader.trim(),
         receiptFooter: receiptFooter.trim(),
@@ -441,6 +471,36 @@ export function StoreSettingsTab({
                   value={paynowUen}
                   onChange={(e) => setPaynowUen(e.target.value)}
                   required
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="settings-thb-fx">
+                  PromptPay Cross-Border FX (1 {primaryCurrency} = X THB, optional)
+                </label>
+                <input
+                  id="settings-thb-fx"
+                  type="number"
+                  step="any"
+                  min="0.01"
+                  placeholder="e.g. 35.0"
+                  className="input mono"
+                  value={thbFxRate}
+                  onChange={(e) => setThbFxRate(e.target.value)}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="settings-sgd-fx">
+                  PayNow Cross-Border FX (1 {primaryCurrency} = X SGD, optional)
+                </label>
+                <input
+                  id="settings-sgd-fx"
+                  type="number"
+                  step="any"
+                  min="0.01"
+                  placeholder="e.g. 1.35"
+                  className="input mono"
+                  value={sgdFxRate}
+                  onChange={(e) => setSgdFxRate(e.target.value)}
                 />
               </div>
             </div>

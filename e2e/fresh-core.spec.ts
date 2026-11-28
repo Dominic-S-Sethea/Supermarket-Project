@@ -1,18 +1,11 @@
-import { expect, test, type Page } from "@playwright/test";
-
-async function loginAsOwner(page: Page) {
-  await page.goto("/");
-  await expect(page.locator("#login-username")).toBeVisible();
-  await page.fill("#login-username", "owner");
-  await page.fill("#login-pin", "1111");
-  await page.click("#login-submit-btn");
-  await expect(page.locator("#logout-btn")).toBeVisible();
-}
+import { expect, test } from "@playwright/test";
+import { attachErrorGuards, E2E_ORIGIN, loginAsOwner } from "./helpers";
 
 test.describe("Flagship Milestone 1: Fresh Produce, Meat, Deli & Bakery Core E2E", () => {
   test("weighs fresh PLU produce, decodes simulated GS1 scale barcode, and completes weighted checkout", async ({
     page,
   }) => {
+    const guard = attachErrorGuards(page);
     await loginAsOwner(page);
     await page.click("#nav-pos");
     await expect(page.locator("#open-plu-grid-btn")).toBeEnabled();
@@ -46,11 +39,13 @@ test.describe("Flagship Milestone 1: Fresh Produce, Meat, Deli & Bakery Core E2E
     await page.click("#pos-pay-cash-btn");
     await expect(page.locator(".thermal-paper")).toContainText("[SYNCED]");
     await expect(page.locator(".thermal-paper")).toContainText("0.500 kg");
+    guard.assertClean();
   });
 
   test("enforces one-click Food-Safety Recall POS-Block from Catalog to POS and restores cleanly", async ({
     page,
   }) => {
+    const guard = attachErrorGuards(page);
     await loginAsOwner(page);
     await page.click("#nav-catalog");
     await expect(page.locator("#export-scale-plu-btn")).toBeVisible();
@@ -105,18 +100,20 @@ test.describe("Flagship Milestone 1: Fresh Produce, Meat, Deli & Bakery Core E2E
       await page.keyboard.press("Escape");
     } finally {
       if (recalledProductId) {
-        await page.request
-          .patch(`/api/products/${recalledProductId}/recall`, {
-            data: { recalled: false },
-          })
-          .catch(() => {});
+        const res = await page.request.patch(`/api/products/${recalledProductId}/recall`, {
+          headers: { Origin: E2E_ORIGIN },
+          data: { recalled: false },
+        });
+        expect(res.ok(), `Recall cleanup failed with HTTP ${res.status()}`).toBeTruthy();
       }
     }
+    guard.assertClean();
   });
 
   test("logs an in-store Bakery BOM production batch and renders it in the production ledger", async ({
     page,
   }) => {
+    const guard = attachErrorGuards(page);
     await loginAsOwner(page);
     await page.click("#nav-operations");
     await expect(page.locator("#ops-subtab-production")).toBeVisible();
@@ -133,5 +130,6 @@ test.describe("Flagship Milestone 1: Fresh Produce, Meat, Deli & Bakery Core E2E
 
     await expect(page.locator('.banner-green[role="status"]')).toContainText(customLot);
     await expect(page.locator("#ops-panel-production")).toContainText(customLot);
+    guard.assertClean();
   });
 });

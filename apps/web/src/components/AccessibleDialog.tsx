@@ -1,4 +1,4 @@
-import { useEffect, useRef, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useRef, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
 const FOCUSABLE_SELECTOR = [
@@ -10,9 +10,13 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(", ");
 
-let openDialogCount = 0;
+interface DialogEntry {
+  id: symbol;
+  overlay: HTMLElement | null;
+}
+
 let initialBodyOverflow = "";
-const dialogStack: symbol[] = [];
+const dialogEntries: DialogEntry[] = [];
 
 interface BackgroundRestoreEntry {
   el: HTMLElement & { inert?: boolean };
@@ -21,25 +25,6 @@ interface BackgroundRestoreEntry {
 }
 
 const lockedBackgrounds = new Map<HTMLElement, BackgroundRestoreEntry>();
-
-function lockBackgroundForDialog(overlayNode: HTMLElement | null) {
-  if (typeof document === "undefined") return;
-  for (const child of Array.from(document.body.children)) {
-    if (!(child instanceof HTMLElement)) continue;
-    if (child === overlayNode) continue;
-    if (child.dataset.supermarketDialogOverlay === "true") continue;
-    if (!lockedBackgrounds.has(child)) {
-      const target = child as HTMLElement & { inert?: boolean };
-      lockedBackgrounds.set(child, {
-        el: target,
-        prevInert: Boolean(target.inert),
-        prevAriaHidden: target.getAttribute("aria-hidden"),
-      });
-      target.inert = true;
-      target.setAttribute("aria-hidden", "true");
-    }
-  }
-}
 
 function unlockAllBackgrounds() {
   for (const entry of lockedBackgrounds.values()) {
@@ -53,11 +38,52 @@ function unlockAllBackgrounds() {
   lockedBackgrounds.clear();
 }
 
-function getFocusableElements(container: HTMLElement): HTMLElement[] {
-  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter((el) => {
-    if (el.getAttribute("aria-hidden") === "true") return false;
-    return true;
+function syncStackedDialogInert() {
+  if (typeof document === "undefined") return;
+  if (dialogEntries.length === 0) {
+    unlockAllBackgrounds();
+    return;
+  }
+  for (const child of Array.from(document.body.children)) {
+    if (!(child instanceof HTMLElement)) continue;
+    if (child.dataset.supermarketDialogOverlay === "true") continue;
+    if (!lockedBackgrounds.has(child)) {
+      const target = child as HTMLElement & { inert?: boolean };
+      lockedBackgrounds.set(child, {
+        el: target,
+        prevInert: Boolean(target.inert),
+        prevAriaHidden: target.getAttribute("aria-hidden"),
+      });
+      target.inert = true;
+      target.setAttribute("aria-hidden", "true");
+    }
+  }
+  const topIdx = dialogEntries.length - 1;
+  dialogEntries.forEach((entry, idx) => {
+    const overlay = entry.overlay as (HTMLElement & { inert?: boolean }) | null;
+    if (!overlay) return;
+    if (idx === topIdx) {
+      overlay.inert = false;
+      overlay.removeAttribute("aria-hidden");
+    } else {
+      overlay.inert = true;
+      overlay.setAttribute("aria-hidden", "true");
+    }
   });
+}
+
+function isElementVisible(el: HTMLElement): boolean {
+  if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
+  if (el.closest("[hidden], [aria-hidden='true'], [inert]")) return false;
+  if (typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+  }
+  return true;
+}
+
+function getFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(isElementVisible);
 }
 
 interface DialogBaseProps {
@@ -66,6 +92,7 @@ interface DialogBaseProps {
   labelledBy?: string;
   ariaLabel?: string;
   describedBy?: string;
+  initialFocusRef?: RefObject<HTMLElement | null>;
   className?: string;
   style?: CSSProperties;
   children: ReactNode;
@@ -77,38 +104,53 @@ function AccessibleDialogSurface({
   labelledBy,
   ariaLabel,
   describedBy,
+  initialFocusRef,
   overlayClassName,
   surfaceClassName,
   style,
   children,
 }: DialogBaseProps & { overlayClassName: string; surfaceClassName: string }) {
   const overlayRef = useRef<HTMLDivElement>(null);
+  const backdropRef = useRef<HTMLDivElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
+  const initialFocusRefLatest = useRef(initialFocusRef);
+  const backdropMouseDownRef = useRef(false);
   onCloseRef.current = onClose;
+  initialFocusRefLatest.current = initialFocusRef;
 
   useEffect(() => {
     if (!open) return;
 
     const dialogId = Symbol("accessible-dialog");
-    dialogStack.push(dialogId);
+    const overlayEl = overlayRef.current;
 
     const previouslyFocused =
       typeof document !== "undefined" && document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
 
-    openDialogCount += 1;
-    if (openDialogCount === 1) {
+    if (dialogEntries.length === 0) {
       initialBodyOverflow = document.body.style.overflow;
       document.body.style.overflow = "hidden";
-      lockBackgroundForDialog(overlayRef.current);
     }
+    dialogEntries.push({ id: dialogId, overlay: overlayEl });
+    syncStackedDialogInert();
 
     const focusTimer = window.setTimeout(() => {
       const container = surfaceRef.current;
       if (!container) return;
       if (container.contains(document.activeElement)) return;
+      const preferred = initialFocusRefLatest.current?.current;
+      if (
+        preferred &&
+        container.contains(preferred) &&
+        !preferred.hasAttribute("disabled") &&
+        isElementVisible(preferred)
+      ) {
+        preferred.focus();
+        return;
+      }
       const focusables = getFocusableElements(container);
       if (focusables.length > 0) {
         focusables[0].focus();
@@ -118,7 +160,7 @@ function AccessibleDialogSurface({
     }, 0);
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (dialogStack[dialogStack.length - 1] !== dialogId) return;
+      if (dialogEntries[dialogEntries.length - 1]?.id !== dialogId) return;
 
       if (e.key === "Escape") {
         e.stopPropagation();
@@ -151,19 +193,34 @@ function AccessibleDialogSurface({
       }
     };
 
+    const handleOverlayMouseDown = (e: MouseEvent) => {
+      backdropMouseDownRef.current = e.target === backdropRef.current;
+    };
+    const handleOverlayClick = (e: MouseEvent) => {
+      if (e.target === backdropRef.current && backdropMouseDownRef.current) {
+        backdropMouseDownRef.current = false;
+        onCloseRef.current();
+      } else {
+        backdropMouseDownRef.current = false;
+      }
+    };
+
+    overlayEl?.addEventListener("mousedown", handleOverlayMouseDown);
+    overlayEl?.addEventListener("click", handleOverlayClick);
     document.addEventListener("keydown", handleKeyDown);
 
     return () => {
       window.clearTimeout(focusTimer);
+      overlayEl?.removeEventListener("mousedown", handleOverlayMouseDown);
+      overlayEl?.removeEventListener("click", handleOverlayClick);
       document.removeEventListener("keydown", handleKeyDown);
-      const stackIdx = dialogStack.lastIndexOf(dialogId);
-      if (stackIdx >= 0) dialogStack.splice(stackIdx, 1);
+      const stackIdx = dialogEntries.findIndex((d) => d.id === dialogId);
+      if (stackIdx >= 0) dialogEntries.splice(stackIdx, 1);
 
-      openDialogCount = Math.max(0, openDialogCount - 1);
-      if (openDialogCount === 0) {
+      if (dialogEntries.length === 0) {
         document.body.style.overflow = initialBodyOverflow;
-        unlockAllBackgrounds();
       }
+      syncStackedDialogInert();
       if (previouslyFocused && typeof previouslyFocused.focus === "function" && previouslyFocused.isConnected) {
         previouslyFocused.focus();
       }
@@ -179,9 +236,9 @@ function AccessibleDialogSurface({
       className={overlayClassName}
     >
       <div
+        ref={backdropRef}
         className="overlay-backdrop"
         aria-hidden="true"
-        onMouseDown={onClose}
       />
       <div
         ref={surfaceRef}

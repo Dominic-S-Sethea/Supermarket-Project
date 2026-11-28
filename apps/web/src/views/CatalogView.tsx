@@ -163,6 +163,7 @@ export function CatalogView({
       setNewBc("");
       setDrawerNotice({ kind: "green", text: "Added new Multi-UOM barcode tier successfully." });
       await loadProducts(page);
+      onCatalogChanged?.();
     } catch (err) {
       setDrawerNotice({
         kind: "red",
@@ -181,6 +182,7 @@ export function CatalogView({
       await apiDelete(`/api/products/${selected.id}/barcodes/${barcodeId}`);
       setDrawerNotice({ kind: "green", text: "Removed barcode tier." });
       await loadProducts(page);
+      onCatalogChanged?.();
     } catch (err) {
       setDrawerNotice({
         kind: "red",
@@ -246,8 +248,8 @@ export function CatalogView({
   const handleToggleRecall = async (productId: string, recalled: boolean) => {
     if (drawerBusy) return;
     setDrawerNotice(null);
-    if (recalled && recallReasonInput.trim().length < 3) {
-      setDrawerNotice({ kind: "red", text: "Enter a recall reason (at least 3 characters)." });
+    if (recalled && recallReasonInput.trim().length < 4) {
+      setDrawerNotice({ kind: "red", text: "Enter a recall reason (at least 4 characters)." });
       return;
     }
     setDrawerBusy(true);
@@ -667,6 +669,7 @@ export function CatalogView({
         selected={selected}
         canEditCatalog={canEditCatalog}
         canCycleCount={canCycleCount}
+        canPrintZpl={canCycleCount}
         drawerNotice={drawerNotice}
         drawerBusy={drawerBusy}
         zplOutput={zplOutput}

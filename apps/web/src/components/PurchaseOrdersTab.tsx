@@ -10,6 +10,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { apiGet, apiPatch } from "../api";
+import { ConfirmActionButton } from "./ConfirmActionButton";
 
 interface PurchaseOrderRow {
   id: string;
@@ -372,15 +373,17 @@ export function PurchaseOrdersTab({
                   </button>
                 )}
                 {!["received", "cancelled"].includes(detail.order.status) && (
-                  <button
-                    type="button"
-                    className="btn btn-sm"
+                  <ConfirmActionButton
+                    label={
+                      <>
+                        <XCircle size={13} /> Cancel PO
+                      </>
+                    }
+                    confirmLabel="Confirm Cancel PO"
                     style={{ color: "var(--accent-crimson)" }}
                     disabled={busyId !== null}
-                    onClick={() => void handleStatusChange(detail.order, "cancelled")}
-                  >
-                    <XCircle size={13} /> Cancel PO
-                  </button>
+                    onConfirm={() => handleStatusChange(detail.order, "cancelled")}
+                  />
                 )}
               </div>
 
