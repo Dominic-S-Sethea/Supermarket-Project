@@ -5,36 +5,18 @@ import {
   computeWeightedPriceCents,
   convertToSecondaryCurrency,
   deriveWeightFromPriceGrams,
-  formatBp,
   formatCurrency,
   formatMeasure,
   formatMoney,
   generateUuidV7,
 } from "@supermarket/shared/money";
 import { evaluateCart, type CartInputLine, type PromotionRule } from "@supermarket/shared/pricing";
-import {
-  CheckCircle2,
-  CloudOff,
-  CreditCard,
-  DollarSign,
-  History,
-  KeyRound,
-  Monitor,
-  PauseCircle,
-  Play,
-  QrCode,
-  Receipt,
-  RefreshCw,
-  Scale,
-  ShieldCheck,
-  Sparkles,
-  Split,
-  Trash2,
-  Wifi,
-} from "lucide-react";
+import { CheckCircle2, RefreshCw } from "lucide-react";
 import { ApiError, apiDelete, apiGet, apiPost } from "../api";
+import { PosCartPanel } from "../components/PosCartPanel";
 import { PosCheckoutModal, type CheckoutTab } from "../components/PosCheckoutModal";
 import { PosFreshPluModal, type FreshPluItem } from "../components/PosFreshPluModal";
+import { PosHeaderBar } from "../components/PosHeaderBar";
 import {
   mapServerParkedBasket,
   PosParkedBasketsModal,
@@ -42,7 +24,7 @@ import {
   type LocalOrServerParkedBasket,
   type SupervisorOverrideResult,
 } from "../components/PosHoldAndOverrideModals";
-import { PosLoyaltyCard, type AppliedCoupon, type PosCustomer } from "../components/PosLoyaltyCard";
+import { type AppliedCoupon, type PosCustomer } from "../components/PosLoyaltyCard";
 import {
   AgeVerificationModal,
   DeadLetterModal,
@@ -120,8 +102,10 @@ export function PosTerminalView({
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [submittingSale, setSubmittingSale] = useState(false);
+  const [submittingMethod, setSubmittingMethod] = useState<"cash" | "card" | "modal" | null>(null);
   const [syncingQueue, setSyncingQueue] = useState(false);
   const [daypartPreview, setDaypartPreview] = useState<"live" | "morning" | "evening">("live");
+  const [removedUndoLine, setRemovedUndoLine] = useState<CartInputLine | null>(null);
 
   // Active Register Shift (hydrated from GET /api/pos/shifts/active — H-17)
   const [activeShift, setActiveShift] = useState<ActiveShiftInfo | null>(null);
@@ -182,11 +166,22 @@ export function PosTerminalView({
   const scanRef = useRef<HTMLInputElement>(null);
   const flushLockRef = useRef(false);
   const saleLockRef = useRef(false);
+  const undoTimerRef = useRef<number | null>(null);
+  const completeQuickSaleRef = useRef<(method: "cash" | "card") => Promise<void>>(async () => {});
+  const hasEvaluatedLinesRef = useRef(false);
   const offlineQueueRef = useRef(offlineQueue);
   const simulatedOfflineRef = useRef(simulatedOffline);
 
   offlineQueueRef.current = offlineQueue;
   simulatedOfflineRef.current = simulatedOffline;
+
+  useEffect(() => {
+    return () => {
+      if (undoTimerRef.current !== null) {
+        window.clearTimeout(undoTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleActiveQrChange = useCallback((qr: CfdActiveQr | null) => {
     setActiveCfdQr(qr);
@@ -245,15 +240,42 @@ export function PosTerminalView({
     }
   }, []);
 
-  // Global F6 shortcut to open Hold / Park & Recall Baskets modal
+  // Global POS function shortcuts: F6 Hold/Recall, F7 Split, F8 Cash, F9 Card, F10 KHQR/QR
   useEffect(() => {
     if (!isActive || anyModalOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+      const target =
+        (e.target instanceof HTMLElement ? e.target : document.activeElement) as HTMLElement | null;
+      if (
+        target &&
+        (target.matches("input, textarea, select") || target.isContentEditable) &&
+        target.id !== "pos-barcode-input"
+      ) {
+        return;
+      }
       if (e.key === "F6") {
         e.preventDefault();
         setParkedError(null);
         setShowParkedModal(true);
         void loadParkedBaskets();
+        return;
+      }
+      if (!hasEvaluatedLinesRef.current || saleLockRef.current) return;
+      if (e.key === "F7") {
+        e.preventDefault();
+        setCheckoutInitialTab("cash");
+        setShowCheckoutModal(true);
+      } else if (e.key === "F8") {
+        e.preventDefault();
+        void completeQuickSaleRef.current("cash");
+      } else if (e.key === "F9") {
+        e.preventDefault();
+        void completeQuickSaleRef.current("card");
+      } else if (e.key === "F10") {
+        e.preventDefault();
+        setCheckoutInitialTab("qr");
+        setShowCheckoutModal(true);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -493,6 +515,8 @@ export function PosTerminalView({
       }),
     [cart, promos, evalHour, couponEligibleNow, appliedCoupon]
   );
+
+  hasEvaluatedLinesRef.current = evaluated.lines.length > 0;
 
   // Live Customer-Facing Display (/customer-display) BroadcastChannel + localStorage mirror
   useEffect(() => {
@@ -995,10 +1019,14 @@ export function PosTerminalView({
     }
   };
 
-  const completeSaleWithPayments = async (payments: QueuedPosPayment[]) => {
+  const completeSaleWithPayments = async (
+    payments: QueuedPosPayment[],
+    method: "cash" | "card" | "modal" = "modal"
+  ) => {
     if (evaluated.lines.length === 0 || payments.length === 0 || saleLockRef.current) return;
     saleLockRef.current = true;
     setSubmittingSale(true);
+    setSubmittingMethod(method);
     setSyncError(null);
 
     try {
@@ -1076,6 +1104,7 @@ export function PosTerminalView({
       }
 
       setCart([]);
+      setRemovedUndoLine(null);
       setAgeVerified(false);
       setAttachedCustomer(null);
       setAppliedCoupon(null);
@@ -1088,20 +1117,96 @@ export function PosTerminalView({
     } finally {
       saleLockRef.current = false;
       setSubmittingSale(false);
+      setSubmittingMethod(null);
     }
   };
 
   const completeQuickSale = async (method: "cash" | "card") => {
-    await completeSaleWithPayments([
-      {
-        id: generateUuidV7(),
-        method,
-        amountCents: evaluated.grandTotalCents,
-        tenderedCents: evaluated.grandTotalCents,
-        changeCents: 0,
-        currencyCode: primaryCurrency,
-      },
-    ]);
+    await completeSaleWithPayments(
+      [
+        {
+          id: generateUuidV7(),
+          method,
+          amountCents: evaluated.grandTotalCents,
+          tenderedCents: evaluated.grandTotalCents,
+          changeCents: 0,
+          currencyCode: primaryCurrency,
+        },
+      ],
+      method
+    );
+  };
+  completeQuickSaleRef.current = completeQuickSale;
+
+  const scheduleUndoLine = (removed: CartInputLine) => {
+    if (undoTimerRef.current !== null) {
+      window.clearTimeout(undoTimerRef.current);
+    }
+    setRemovedUndoLine(removed);
+    undoTimerRef.current = window.setTimeout(() => {
+      setRemovedUndoLine(null);
+      undoTimerRef.current = null;
+    }, 8_000);
+  };
+
+  const handleClearCart = () => {
+    if (cart.length === 1) {
+      scheduleUndoLine(cart[0]);
+    }
+    setCart([]);
+    setAgeVerified(false);
+    setSupervisorOverrideBy(null);
+  };
+
+  const handleRemoveLine = (lineKey: string) => {
+    const target = cart.find((c) => c.lineKey === lineKey);
+    if (target) scheduleUndoLine(target);
+    setCart((prev) => prev.filter((c) => c.lineKey !== lineKey));
+  };
+
+  const handleDecrementLine = (lineKey: string) => {
+    const target = cart.find((c) => c.lineKey === lineKey);
+    if (target && target.qtyPacks <= 1) {
+      scheduleUndoLine(target);
+    }
+    setCart((prev) =>
+      prev
+        .map((c) => (c.lineKey === lineKey ? { ...c, qtyPacks: c.qtyPacks - 1 } : c))
+        .filter((c) => c.qtyPacks > 0)
+    );
+  };
+
+  const handleIncrementLine = (lineKey: string) => {
+    setCart((prev) =>
+      prev.map((c) => (c.lineKey === lineKey ? { ...c, qtyPacks: c.qtyPacks + 1 } : c))
+    );
+  };
+
+  const handleUndoRemovedLine = () => {
+    if (!removedUndoLine) return;
+    const restored = removedUndoLine;
+    if (undoTimerRef.current !== null) {
+      window.clearTimeout(undoTimerRef.current);
+      undoTimerRef.current = null;
+    }
+    setRemovedUndoLine(null);
+    setCart((prev) => {
+      const idx = prev.findIndex((c) => c.lineKey === restored.lineKey);
+      if (idx >= 0) {
+        return prev.map((c, i) =>
+          i === idx ? { ...c, qtyPacks: c.qtyPacks + restored.qtyPacks } : c
+        );
+      }
+      return [...prev, restored];
+    });
+  };
+
+  const handleDismissUndo = () => {
+    if (undoTimerRef.current !== null) {
+      window.clearTimeout(undoTimerRef.current);
+      undoTimerRef.current = null;
+    }
+    setRemovedUndoLine(null);
   };
 
   const handleParkCurrentBasket = async (customerLabel: string, note: string) => {
@@ -1378,152 +1483,55 @@ export function PosTerminalView({
 
   return (
     <div>
-      <header className="page-header">
-        <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <h1>Offline-First POS Checkout Terminal</h1>
-            {activeShift ? (
-              <span className="tag tag-green mono">
-                Shift Active · Float {formatMoney(activeShift.openingFloatCents)}
-              </span>
-            ) : (
-              <span className="tag tag-neutral mono">No Open Shift</span>
-            )}
-          </div>
-          <p className="page-subtitle">
-            Local cache (
-            {cacheSource === "indexeddb"
-              ? "IndexedDB offline snapshot"
-              : cacheSource === "live"
-                ? "live"
-                : bootstrapLoading
-                  ? "syncing..."
-                  : "unavailable"}
-            ): <strong className="mono">{productsMap.size.toLocaleString()}</strong> SKUs /{" "}
-            <strong className="mono">{barcodesMap.size.toLocaleString()}</strong> barcodes · Deterministic multi-UOM &amp; promo engine runs 100% locally.
-          </p>
-        </div>
-        <div className="header-actions">
-          <button
-            id="open-plu-grid-btn"
-            type="button"
-            className="btn btn-primary"
-            disabled={freshPluItems.length === 0}
-            onClick={() => {
-              setFreshPluInitialProductId(null);
-              setShowFreshPluModal(true);
-            }}
-          >
-            <Scale size={14} aria-hidden="true" /> Fresh PLU / Scale ({freshPluItems.length})
-          </button>
-          <button
-            id="open-parked-baskets-btn"
-            type="button"
-            className="btn"
-            onClick={() => {
-              setParkedError(null);
-              setShowParkedModal(true);
-              void loadParkedBaskets();
-            }}
-          >
-            <PauseCircle size={14} aria-hidden="true" /> Hold / Recall (F6)
-            {parkedBaskets.length > 0 ? ` (${parkedBaskets.length})` : ""}
-          </button>
-          <button
-            id="open-supervisor-override-btn"
-            type="button"
-            className="btn"
-            onClick={() => setShowSupervisorModal(true)}
-          >
-            <KeyRound size={14} aria-hidden="true" /> Supervisor PIN
-          </button>
-          <a
-            id="open-customer-display-btn"
-            href="/customer-display"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn"
-          >
-            <Monitor size={14} aria-hidden="true" /> Customer Display
-          </a>
-          <select
-            id="pos-daypart-select"
-            aria-label="POS promotion clock daypart preview"
-            className="select"
-            value={daypartPreview}
-            onChange={(e) => setDaypartPreview(e.target.value as "live" | "morning" | "evening")}
-            title="Switch clock to preview Morning 08-12 Daypart promos and morning basket upsells"
-          >
-            <option value="live">Clock: Live ({String(new Date().getHours()).padStart(2, "0")}:00)</option>
-            <option value="morning">Daypart: Morning (09:00)</option>
-            <option value="evening">Daypart: Evening (18:00)</option>
-          </select>
-          <button
-            id="toggle-offline-sim-btn"
-            type="button"
-            className={`btn ${simulatedOffline ? "btn-amber" : ""}`}
-            onClick={() => {
-              const nextOffline = !simulatedOffline;
-              setSimulatedOffline(nextOffline);
-              if (!nextOffline && offlineQueue.length > 0) {
-                void flushOfflineQueue(offlineQueue);
-              }
-            }}
-          >
-            {simulatedOffline ? <CloudOff size={14} aria-hidden="true" /> : <Wifi size={14} aria-hidden="true" />}
-            {simulatedOffline ? "Offline Mode Active (Click to Reconnect)" : "Simulate Internet Outage"}
-          </button>
-          {offlineQueue.length > 0 && !simulatedOffline && (
-            <button
-              id="flush-offline-queue-btn"
-              type="button"
-              className="btn btn-primary"
-              disabled={syncingQueue}
-              onClick={() => void flushOfflineQueue()}
-            >
-              <RefreshCw size={14} aria-hidden="true" />{" "}
-              {syncingQueue ? "Syncing..." : `Sync ${offlineQueue.length} Queued Sale(s)`}
-            </button>
-          )}
-          <button
-            id="open-shift-btn"
-            type="button"
-            className="btn"
-            onClick={() => {
-              setShowShiftOpen(true);
-              setShiftError(null);
-              setOpenShiftBanner(null);
-              void loadActiveShift();
-            }}
-          >
-            <Play size={14} aria-hidden="true" /> Open Shift
-          </button>
-          <button
-            id="recent-receipts-btn"
-            type="button"
-            className="btn"
-            onClick={() => {
-              setShowRecentReceipts(true);
-              void loadRecentSales();
-            }}
-          >
-            <History size={14} aria-hidden="true" /> Receipts
-          </button>
-          <button
-            id="open-shift-close-btn"
-            type="button"
-            className="btn"
-            onClick={() => {
-              setShowShiftClose(true);
-              setZReportResult(null);
-              setShiftError(null);
-              void loadActiveShift();
-            }}
-          >
-            <Receipt size={14} aria-hidden="true" /> Blind Close (Z-Report)
-          </button>
-        </div>
-      </header>
+      <PosHeaderBar
+        activeShift={activeShift}
+        cacheSource={cacheSource}
+        bootstrapLoading={bootstrapLoading}
+        productsCount={productsMap.size}
+        barcodesCount={barcodesMap.size}
+        freshPluCount={freshPluItems.length}
+        parkedCount={parkedBaskets.length}
+        simulatedOffline={simulatedOffline}
+        offlineQueueCount={offlineQueue.length}
+        syncingQueue={syncingQueue}
+        daypartPreview={daypartPreview}
+        liveHour={new Date().getHours()}
+        onOpenPluGrid={() => {
+          setFreshPluInitialProductId(null);
+          setShowFreshPluModal(true);
+        }}
+        onOpenParkedBaskets={() => {
+          setParkedError(null);
+          setShowParkedModal(true);
+          void loadParkedBaskets();
+        }}
+        onOpenSupervisorOverride={() => setShowSupervisorModal(true)}
+        onToggleOfflineSim={() => {
+          const nextOffline = !simulatedOffline;
+          setSimulatedOffline(nextOffline);
+          if (!nextOffline && offlineQueue.length > 0) {
+            void flushOfflineQueue(offlineQueue);
+          }
+        }}
+        onFlushOfflineQueue={() => void flushOfflineQueue()}
+        onOpenShift={() => {
+          setShowShiftOpen(true);
+          setShiftError(null);
+          setOpenShiftBanner(null);
+          void loadActiveShift();
+        }}
+        onOpenRecentReceipts={() => {
+          setShowRecentReceipts(true);
+          void loadRecentSales();
+        }}
+        onOpenShiftClose={() => {
+          setShowShiftClose(true);
+          setZReportResult(null);
+          setShiftError(null);
+          void loadActiveShift();
+        }}
+        onDaypartChange={setDaypartPreview}
+      />
 
       {bootstrapError && (
         <div className="banner banner-red" role="alert" style={{ marginBottom: 12 }}>
@@ -1631,7 +1639,7 @@ export function PosTerminalView({
                     className="quick-sku-btn"
                     onClick={() => handleScanSubmit(q.barcode)}
                   >
-                    <span className="tag tag-blue" style={{ width: "fit-content", fontSize: 10.5 }}>
+                    <span className="tag tag-blue" style={{ width: "fit-content", fontSize: 11.5 }}>
                       {q.badge}
                     </span>
                     <div className="quick-sku-name">{q.name}</div>
@@ -1658,297 +1666,56 @@ export function PosTerminalView({
           )}
         </div>
 
-        {/* Live Cart & Tender Panel */}
-        <aside className="pos-receipt-panel">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <h2 className="panel-title">Current Basket (Lane 01)</h2>
-            {cart.length > 0 && (
-              <button
-                type="button"
-                className="btn btn-sm"
-                disabled={submittingSale}
-                onClick={() => {
-                  setCart([]);
-                  setAgeVerified(false);
-                }}
-              >
-                <Trash2 size={13} aria-hidden="true" /> Clear
-              </button>
-            )}
-          </div>
-
-          {evaluated.requiresAgeCheck && ageVerified && (
-            <div className="banner banner-green" style={{ padding: "7px 10px", fontSize: 12 }}>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                <ShieldCheck size={14} aria-hidden="true" /> Alcohol Age Check Verified
-              </span>
-            </div>
-          )}
-
-          <div className="cart-lines">
-            {evaluated.lines.length === 0 ? (
-              <div style={{ color: "var(--ink-muted)", padding: "28px 0", textAlign: "center" }}>
-                Scan a barcode or tap a quick-test SKU to start ringing up a basket.
-              </div>
-            ) : (
-              evaluated.lines.map((line) => {
-                const isWeighted =
-                  (line.unitMode === "weight_g" || line.unitMode === "volume_ml") &&
-                  typeof line.weightGrams === "number" &&
-                  line.weightGrams > 0;
-                const prodMeta = productsMap.get(line.productId);
-                const allergens = prodMeta?.allergens ?? [];
-                return (
-                  <div key={line.lineKey} className="cart-line">
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 600, fontSize: 13 }}>{line.name}</div>
-                      <div style={{ fontSize: 11.5, color: "var(--ink-secondary)" }} className="mono">
-                        {isWeighted
-                          ? `${line.packLabel} · ${formatMoney(line.unitPriceCents)}/${
-                              line.unitMode === "volume_ml" ? "L" : "kg"
-                            } · -${formatMeasure(line.baseUnitsSold, line.unitMode)} stock`
-                          : `${line.packLabel} (${line.packQty}× base) · -${line.baseUnitsSold} stock`}
-                      </div>
-                      {allergens.length > 0 && (
-                        <div style={{ marginTop: 3, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                          {allergens.map((a) => (
-                            <span key={a} className="tag tag-amber mono" style={{ fontSize: 10 }}>
-                              {a.toUpperCase()}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {line.appliedPromotions.length > 0 && (
-                        <div style={{ marginTop: 3, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                          {line.appliedPromotions.map((pName, idx) => (
-                            <span key={`${pName}-${idx}`} className="tag tag-green" style={{ fontSize: 10.5 }}>
-                              {pName}
-                              {idx === 0 ? ` (-${formatMoney(line.discountCents)})` : ""}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                    <div style={{ textAlign: "right" }}>
-                      <div className="mono" style={{ fontWeight: 600 }}>
-                        {formatMoney(line.lineTotalCents)}
-                      </div>
-                      {isWeighted ? (
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          style={{ marginTop: 4 }}
-                          aria-label={`Remove weighted line ${line.name}`}
-                          disabled={submittingSale}
-                          onClick={() =>
-                            setCart((prev) => prev.filter((c) => c.lineKey !== line.lineKey))
-                          }
-                        >
-                          Remove
-                        </button>
-                      ) : (
-                        <div className="qty-stepper" style={{ marginTop: 4 }}>
-                          <button
-                            type="button"
-                            className="qty-btn"
-                            aria-label={`Decrease quantity for ${line.name}`}
-                            disabled={submittingSale}
-                            onClick={() =>
-                              setCart((prev) =>
-                                prev
-                                  .map((c) =>
-                                    c.lineKey === line.lineKey
-                                      ? { ...c, qtyPacks: c.qtyPacks - 1 }
-                                      : c
-                                  )
-                                  .filter((c) => c.qtyPacks > 0)
-                              )
-                            }
-                          >
-                            -
-                          </button>
-                          <span className="mono" style={{ minWidth: 18, textAlign: "center" }}>
-                            {line.qtyPacks}
-                          </span>
-                          <button
-                            type="button"
-                            className="qty-btn"
-                            aria-label={`Increase quantity for ${line.name}`}
-                            disabled={submittingSale}
-                            onClick={() =>
-                              setCart((prev) =>
-                                prev.map((c) =>
-                                  c.lineKey === line.lineKey
-                                    ? { ...c, qtyPacks: c.qtyPacks + 1 }
-                                    : c
-                                )
-                              )
-                            }
-                          >
-                            +
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          {upsellSuggestions.length > 0 && (
-            <div className="upsell-box">
-              <div style={{ fontSize: 11, fontWeight: 700, color: "var(--accent-primary-ink)", display: "flex", alignItems: "center", gap: 5 }}>
-                <Sparkles size={12} aria-hidden="true" /> OFFLINE-SAFE BASKET UPSELLS
-              </div>
-              {upsellSuggestions.map((u) => (
-                <div key={u.productId} className="upsell-row">
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {u.name}
-                    </div>
-                    <div className="mono" style={{ fontSize: 10.5, color: "var(--ink-muted)" }}>
-                      {u.lift.toFixed(1)}× lift · {formatMoney(u.priceCents)}{" "}
-                      {u.isMorningPair && <span className="tag tag-amber">Morning Pair</span>}
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    disabled={submittingSale}
-                    onClick={() => handleScanSubmit(u.barcode)}
-                  >
-                    + Add
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          <PosLoyaltyCard
-            attachedCustomer={attachedCustomer}
-            customerLookupInput={customerLookupInput}
-            customerResults={customerResults}
-            appliedCoupon={appliedCoupon}
-            couponEligibleNow={couponEligibleNow}
-            couponInput={couponInput}
-            couponFeedback={couponFeedback}
-            validatingCoupon={validatingCoupon}
-            simulatedOffline={simulatedOffline}
-            onCustomerLookupInputChange={setCustomerLookupInput}
-            onLookupCustomer={() => void handleLookupCustomer()}
-            onSelectCustomer={(c) => {
-              setAttachedCustomer(c);
-              setCustomerResults([]);
-              setCustomerLookupInput("");
-            }}
-            onDetachCustomer={() => setAttachedCustomer(null)}
-            onCouponInputChange={setCouponInput}
-            onApplyCoupon={() => void handleApplyCoupon()}
-            onRemoveCoupon={() => {
-              setAppliedCoupon(null);
-              setCouponFeedback(null);
-            }}
-          />
-
-          <div className="totals-box">
-            <div className="total-row">
-              <span>Subtotal</span>
-              <span className="mono">{formatMoney(evaluated.subtotalBeforeDiscountCents)}</span>
-            </div>
-            <div className="total-row" style={{ color: "var(--accent-primary-ink)", fontWeight: 600 }}>
-              <span>Auto Promotions &amp; Coupons</span>
-              <span className="mono">-{formatMoney(evaluated.totalDiscountCents)}</span>
-            </div>
-            {evaluated.couponDiscountCents > 0 && (
-              <div className="total-row" style={{ fontSize: 11.5, color: "var(--accent-primary-ink)" }}>
-                <span>↳ Loyalty Coupon ({appliedCoupon?.code})</span>
-                <span className="mono">-{formatMoney(evaluated.couponDiscountCents)}</span>
-              </div>
-            )}
-            <div className="total-row">
-              <span>VAT / Excise Tax</span>
-              <span className="mono">{formatMoney(evaluated.totalTaxCents)}</span>
-            </div>
-            {canVoidOrRefund && (
-              <div className="total-row" style={{ fontSize: 11.5 }}>
-                <span>Live Basket Margin (Cost Snapshot)</span>
-                <span className="mono">{formatBp(evaluated.estimatedMarginBp)}</span>
-              </div>
-            )}
-            <div className="total-row grand">
-              <span>Total Due</span>
-              <span className="mono">{formatCurrency(evaluated.grandTotalCents, primaryCurrency)}</span>
-            </div>
-            {secondaryCurrency && (
-              <div
-                id="pos-secondary-total"
-                className="total-row"
-                style={{ fontSize: 12, color: "var(--accent-primary-ink)", fontWeight: 600 }}
-              >
-                <span>
-                  Dual Currency ({secondaryCurrency} @ {secondaryFxRate.toLocaleString()})
-                </span>
-                <span className="mono">
-                  ≈{" "}
-                  {formatCurrency(
-                    convertToSecondaryCurrency(
-                      evaluated.grandTotalCents,
-                      secondaryFxRate,
-                      secondaryRoundingStep
-                    ),
-                    secondaryCurrency
-                  )}
-                </span>
-              </div>
-            )}
-          </div>
-
-          <div className="tender-grid">
-            <button
-              id="pos-pay-cash-btn"
-              type="button"
-              className="btn btn-primary"
-              disabled={evaluated.lines.length === 0 || submittingSale}
-              onClick={() => void completeQuickSale("cash")}
-            >
-              <DollarSign size={14} aria-hidden="true" /> {submittingSale ? "Saving..." : "Cash"}
-            </button>
-            <button
-              id="pos-pay-card-btn"
-              type="button"
-              className="btn btn-primary"
-              disabled={evaluated.lines.length === 0 || submittingSale}
-              onClick={() => void completeQuickSale("card")}
-            >
-              <CreditCard size={14} aria-hidden="true" /> Card
-            </button>
-            <button
-              id="pos-pay-qr-btn"
-              type="button"
-              className="btn"
-              disabled={evaluated.lines.length === 0 || submittingSale}
-              onClick={() => {
-                setCheckoutInitialTab("qr");
-                setShowCheckoutModal(true);
-              }}
-            >
-              <QrCode size={14} aria-hidden="true" /> KHQR / QR
-            </button>
-            <button
-              id="open-split-tender-btn"
-              type="button"
-              className="btn"
-              disabled={evaluated.lines.length === 0 || submittingSale}
-              onClick={() => {
-                setCheckoutInitialTab("cash");
-                setShowCheckoutModal(true);
-              }}
-            >
-              <Split size={14} aria-hidden="true" /> Split / {secondaryCurrency || "Multi"}
-            </button>
-          </div>
-        </aside>
+        <PosCartPanel
+          cartLength={cart.length}
+          evaluated={evaluated}
+          ageVerified={ageVerified}
+          productsMap={productsMap}
+          upsellSuggestions={upsellSuggestions}
+          attachedCustomer={attachedCustomer}
+          customerLookupInput={customerLookupInput}
+          customerResults={customerResults}
+          appliedCoupon={appliedCoupon}
+          couponEligibleNow={couponEligibleNow}
+          couponInput={couponInput}
+          couponFeedback={couponFeedback}
+          validatingCoupon={validatingCoupon}
+          simulatedOffline={simulatedOffline}
+          submittingSale={submittingSale}
+          submittingMethod={submittingMethod}
+          canVoidOrRefund={canVoidOrRefund}
+          primaryCurrency={primaryCurrency}
+          secondaryCurrency={secondaryCurrency}
+          secondaryFxRate={secondaryFxRate}
+          secondaryRoundingStep={secondaryRoundingStep}
+          removedUndoLine={removedUndoLine}
+          onClearCart={handleClearCart}
+          onRemoveLine={handleRemoveLine}
+          onDecrementLine={handleDecrementLine}
+          onIncrementLine={handleIncrementLine}
+          onUndoRemovedLine={handleUndoRemovedLine}
+          onDismissUndo={handleDismissUndo}
+          onQuickAddBarcode={(barcode) => handleScanSubmit(barcode)}
+          onCustomerLookupInputChange={setCustomerLookupInput}
+          onLookupCustomer={() => void handleLookupCustomer()}
+          onSelectCustomer={(c) => {
+            setAttachedCustomer(c);
+            setCustomerResults([]);
+            setCustomerLookupInput("");
+          }}
+          onDetachCustomer={() => setAttachedCustomer(null)}
+          onCouponInputChange={setCouponInput}
+          onApplyCoupon={() => void handleApplyCoupon()}
+          onRemoveCoupon={() => {
+            setAppliedCoupon(null);
+            setCouponFeedback(null);
+          }}
+          onQuickPay={(method) => void completeQuickSale(method)}
+          onOpenCheckoutTab={(tab) => {
+            setCheckoutInitialTab(tab);
+            setShowCheckoutModal(true);
+          }}
+        />
       </div>
 
       <AgeVerificationModal

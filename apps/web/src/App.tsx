@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import {
   BarChart3,
@@ -6,6 +6,7 @@ import {
   Gift,
   Grid3X3,
   LogOut,
+  type LucideIcon,
   Menu,
   PackageCheck,
   ScanBarcode,
@@ -19,6 +20,7 @@ import { apiGet, apiPost, setUnauthorizedHandler } from "./api";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { LoginScreen, type SessionUser } from "./components/LoginScreen";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
+import { useSpatial3DPanels } from "./lib/spatial3d";
 import { useTheme } from "./lib/theme";
 import { readQueryParam, syncQueryParam } from "./lib/urlSync";
 
@@ -98,6 +100,7 @@ function resolveInitialTab(allowed: TabId[]): TabId {
 }
 
 export function App() {
+  useSpatial3DPanels();
   const { theme, setTheme } = useTheme();
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -332,8 +335,28 @@ export function App() {
   const canUseAi = user.role === "owner" || user.role === "manager";
   const totalOpsAlerts = alertCounts.margin + alertCounts.expiry;
 
+  const renderNavBtn = (tab: TabId, Icon: LucideIcon, tone: string, badge?: ReactNode) => {
+    if (!allowedTabs.includes(tab)) return null;
+    const isActive = activeTab === tab;
+    return (
+      <button
+        id={`nav-${tab}`}
+        type="button"
+        className={`nav-btn ${isActive ? "active" : ""}`}
+        aria-current={isActive ? "page" : undefined}
+        onClick={() => navigateToTab(tab)}
+      >
+        <span className={`nav-icon-tile tone-${tone}${isActive ? "" : "-soft"}`} aria-hidden="true">
+          <Icon size={15} />
+        </span>
+        <span>{TAB_LABELS[tab]}</span>
+        {badge}
+      </button>
+    );
+  };
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${canUseAi && copilotOpen ? "copilot-docked" : ""}`}>
       {/* Compact mobile top navigation bar (<= 820px) */}
       <header className="mobile-topbar">
         <button
@@ -355,22 +378,37 @@ export function App() {
           </span>
           <span>{TAB_LABELS[activeTab]}</span>
         </div>
-        {canUseAi ? (
-          <button
-            type="button"
-            className="btn btn-primary btn-sm"
-            aria-label="Open AI Store Copilot"
-            onClick={() => setCopilotOpen(true)}
-          >
-            <Sparkles size={14} aria-hidden="true" />
-          </button>
-        ) : (
-          <span
-            role="status"
-            className={`status-dot ${apiHealthy ? "" : "offline"}`}
-            aria-label={apiHealthy ? "API live" : "API unreachable"}
-          />
-        )}
+        <div className="mobile-topbar-actions">
+          {totalOpsAlerts > 0 && allowedTabs.includes("operations") && (
+            <button
+              id="mobile-ops-alerts-btn"
+              type="button"
+              className="btn btn-danger btn-sm mobile-icon-btn"
+              aria-label={`${totalOpsAlerts} open margin and expiry alerts — open Receiving & FEFO`}
+              onClick={() => navigateToTab("operations")}
+            >
+              <span>{totalOpsAlerts}</span>
+              <span className="sr-only"> alerts</span>
+            </button>
+          )}
+          {canUseAi ? (
+            <button
+              id="mobile-ai-copilot-btn"
+              type="button"
+              className="btn btn-primary btn-sm mobile-icon-btn"
+              aria-label="Open AI Store Copilot"
+              onClick={() => setCopilotOpen(true)}
+            >
+              <Sparkles size={16} aria-hidden="true" />
+            </button>
+          ) : (
+            <span
+              role="status"
+              className={`status-dot ${apiHealthy ? "" : "offline"}`}
+              aria-label={apiHealthy ? "API live" : "API unreachable"}
+            />
+          )}
+        </div>
       </header>
 
       {mobileNavOpen && (
@@ -422,70 +460,16 @@ export function App() {
 
         <div className="nav-section-label">Store Operations</div>
         <nav className="nav-list" aria-label="Store operations">
-          {allowedTabs.includes("overview") && (
-            <button
-              id="nav-overview"
-              type="button"
-              className={`nav-btn ${activeTab === "overview" ? "active" : ""}`}
-              aria-current={activeTab === "overview" ? "page" : undefined}
-              onClick={() => navigateToTab("overview")}
-            >
-              <BarChart3 size={16} aria-hidden="true" />
-              <span>Executive Overview</span>
-            </button>
+          {renderNavBtn("overview", BarChart3, "violet")}
+          {renderNavBtn("pos", ScanBarcode, "teal", <span className="nav-badge">Lane 01</span>)}
+          {renderNavBtn("catalog", Boxes, "indigo")}
+          {renderNavBtn(
+            "operations",
+            PackageCheck,
+            "amber",
+            totalOpsAlerts > 0 ? <span className="nav-badge alert">{totalOpsAlerts}</span> : undefined
           )}
-          {allowedTabs.includes("pos") && (
-            <button
-              id="nav-pos"
-              type="button"
-              className={`nav-btn ${activeTab === "pos" ? "active" : ""}`}
-              aria-current={activeTab === "pos" ? "page" : undefined}
-              onClick={() => navigateToTab("pos")}
-            >
-              <ScanBarcode size={16} aria-hidden="true" />
-              <span>Offline-First POS</span>
-              <span className="nav-badge">Lane 01</span>
-            </button>
-          )}
-          {allowedTabs.includes("catalog") && (
-            <button
-              id="nav-catalog"
-              type="button"
-              className={`nav-btn ${activeTab === "catalog" ? "active" : ""}`}
-              aria-current={activeTab === "catalog" ? "page" : undefined}
-              onClick={() => navigateToTab("catalog")}
-            >
-              <Boxes size={16} aria-hidden="true" />
-              <span>Catalog &amp; Multi-UOM</span>
-            </button>
-          )}
-          {allowedTabs.includes("operations") && (
-            <button
-              id="nav-operations"
-              type="button"
-              className={`nav-btn ${activeTab === "operations" ? "active" : ""}`}
-              aria-current={activeTab === "operations" ? "page" : undefined}
-              onClick={() => navigateToTab("operations")}
-            >
-              <PackageCheck size={16} aria-hidden="true" />
-              <span>Receiving &amp; FEFO</span>
-              {totalOpsAlerts > 0 && (
-                <span className="nav-badge alert">{totalOpsAlerts}</span>
-              )}
-            </button>
-          )}
-          {allowedTabs.includes("loyalty") && (
-            <button
-              id="nav-loyalty"
-              type="button"
-              className={`nav-btn ${activeTab === "loyalty" ? "active" : ""}`}
-              aria-current={activeTab === "loyalty" ? "page" : undefined}
-              onClick={() => navigateToTab("loyalty")}
-            >
-              <Gift size={16} aria-hidden="true" />
-              <span>Loyalty &amp; Promos</span>
-            </button>
-          )}
+          {renderNavBtn("loyalty", Gift, "rose")}
         </nav>
 
         {(allowedTabs.includes("abc-lp") ||
@@ -495,54 +479,10 @@ export function App() {
           <>
             <div className="nav-section-label">Retail Intelligence</div>
             <nav className="nav-list" aria-label="Retail intelligence">
-              {allowedTabs.includes("shift-diagnostics") && (
-                <button
-                  id="nav-shift-diagnostics"
-                  type="button"
-                  className={`nav-btn ${activeTab === "shift-diagnostics" ? "active" : ""}`}
-                  aria-current={activeTab === "shift-diagnostics" ? "page" : undefined}
-                  onClick={() => navigateToTab("shift-diagnostics")}
-                >
-                  <Sun size={16} aria-hidden="true" />
-                  <span>Shift Diagnostics</span>
-                </button>
-              )}
-              {allowedTabs.includes("abc-lp") && (
-                <button
-                  id="nav-abc-lp"
-                  type="button"
-                  className={`nav-btn ${activeTab === "abc-lp" ? "active" : ""}`}
-                  aria-current={activeTab === "abc-lp" ? "page" : undefined}
-                  onClick={() => navigateToTab("abc-lp")}
-                >
-                  <Grid3X3 size={16} aria-hidden="true" />
-                  <span>ABC-XYZ &amp; Loss Prev.</span>
-                </button>
-              )}
-              {allowedTabs.includes("forecasting") && (
-                <button
-                  id="nav-forecasting"
-                  type="button"
-                  className={`nav-btn ${activeTab === "forecasting" ? "active" : ""}`}
-                  aria-current={activeTab === "forecasting" ? "page" : undefined}
-                  onClick={() => navigateToTab("forecasting")}
-                >
-                  <TrendingUp size={16} aria-hidden="true" />
-                  <span>Forecasts &amp; Basket AI</span>
-                </button>
-              )}
-              {allowedTabs.includes("admin") && (
-                <button
-                  id="nav-admin"
-                  type="button"
-                  className={`nav-btn ${activeTab === "admin" ? "active" : ""}`}
-                  aria-current={activeTab === "admin" ? "page" : undefined}
-                  onClick={() => navigateToTab("admin")}
-                >
-                  <ShieldCheck size={16} aria-hidden="true" />
-                  <span>Governance &amp; Audit</span>
-                </button>
-              )}
+              {renderNavBtn("shift-diagnostics", Sun, "orange")}
+              {renderNavBtn("abc-lp", Grid3X3, "rose")}
+              {renderNavBtn("forecasting", TrendingUp, "emerald")}
+              {renderNavBtn("admin", ShieldCheck, "indigo")}
             </nav>
           </>
         )}
@@ -551,23 +491,22 @@ export function App() {
           <ThemeSwitcher theme={theme} onChange={setTheme} variant="sidebar" />
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
             <div>
-              <div style={{ color: "var(--ink-inverse)", fontWeight: 600, fontSize: 12.5 }}>
+              <div className="sidebar-user-name">
                 {user.fullName}
               </div>
-              <div className="mono" style={{ fontSize: 10.5, textTransform: "uppercase" }}>
+              <div className="mono" style={{ fontSize: 11.5, textTransform: "uppercase" }}>
                 {user.role}
               </div>
             </div>
             <button
               id="logout-btn"
               type="button"
-              className="btn btn-sm"
-              style={{ padding: "4px 8px" }}
+              className="btn btn-sm sidebar-logout-btn"
               title="Sign Out"
               aria-label="Sign Out"
               onClick={() => void handleLogout()}
             >
-              <LogOut size={13} aria-hidden="true" />
+              <LogOut size={14} aria-hidden="true" />
             </button>
           </div>
           <div className="status-row">
@@ -581,21 +520,60 @@ export function App() {
       <main className="main-content">
         <ErrorBoundary key={activeTab} scope={TAB_LABELS[activeTab]}>
           <Suspense fallback={<div className="panel">Loading SupermarketOS module...</div>}>
-            {activeTab === "overview" && (
-              <OverviewView
-                key={`ov-${refreshTick}`}
-                userRole={user.role}
-                allowedTabs={allowedTabs}
-                onNavigate={(tab) => navigateToTab(tab)}
-              />
-            )}
-            {activeTab === "catalog" && (
-              <CatalogView
-                key={`cat-${refreshTick}`}
-                departments={meta.departments}
-                userRole={user.role}
-                onCatalogChanged={() => setPosCatalogTick((t) => t + 1)}
-              />
+            {activeTab !== "pos" && (
+              <div key={activeTab} className="view-stage">
+                {activeTab === "overview" && (
+                  <OverviewView
+                    key={`ov-${refreshTick}`}
+                    userRole={user.role}
+                    allowedTabs={allowedTabs}
+                    onNavigate={(tab) => navigateToTab(tab)}
+                  />
+                )}
+                {activeTab === "catalog" && (
+                  <CatalogView
+                    key={`cat-${refreshTick}`}
+                    departments={meta.departments}
+                    userRole={user.role}
+                    onCatalogChanged={() => setPosCatalogTick((t) => t + 1)}
+                  />
+                )}
+                {activeTab === "operations" && (
+                  <OperationsView
+                    key={`ops-${refreshTick}`}
+                    suppliers={meta.suppliers}
+                    userRole={user.role}
+                    onCountsChanged={() => void loadMetaAndAlerts(user)}
+                  />
+                )}
+                {activeTab === "loyalty" && (
+                  <LoyaltyPromosView key={`loy-${refreshTick}`} userRole={user.role} />
+                )}
+                {activeTab === "abc-lp" && (
+                  <AbcLossView key={`abc-${refreshTick}`} userRole={user.role} />
+                )}
+                {activeTab === "forecasting" && (
+                  <ForecastingBasketView key={`fc-${refreshTick}`} userRole={user.role} />
+                )}
+                {activeTab === "shift-diagnostics" && (
+                  <ShiftDiagnosticsView
+                    key={`sd-${refreshTick}`}
+                    userRole={user.role}
+                    onAskCopilot={(prompt) => {
+                      setCopilotInitialPrompt(prompt);
+                      setCopilotOpen(true);
+                    }}
+                  />
+                )}
+                {activeTab === "admin" && (
+                  <AdminAuditView
+                    key={`adm-${refreshTick}`}
+                    userRole={user.role}
+                    currentUsername={user.username}
+                    onSettingsSaved={() => setPosCatalogTick((t) => t + 1)}
+                  />
+                )}
+              </div>
             )}
             {/* Keep PosTerminalView mounted across tab switches so active basket & offline state persist;
                 refreshTick reloads catalog/promos in place without losing the active cart (H-17) */}
@@ -608,41 +586,6 @@ export function App() {
                   catalogRefreshTick={refreshTick + posCatalogTick}
                 />
               </div>
-            )}
-            {activeTab === "operations" && (
-              <OperationsView
-                key={`ops-${refreshTick}`}
-                suppliers={meta.suppliers}
-                userRole={user.role}
-                onCountsChanged={() => void loadMetaAndAlerts(user)}
-              />
-            )}
-            {activeTab === "loyalty" && (
-              <LoyaltyPromosView key={`loy-${refreshTick}`} userRole={user.role} />
-            )}
-            {activeTab === "abc-lp" && (
-              <AbcLossView key={`abc-${refreshTick}`} userRole={user.role} />
-            )}
-            {activeTab === "forecasting" && (
-              <ForecastingBasketView key={`fc-${refreshTick}`} userRole={user.role} />
-            )}
-            {activeTab === "shift-diagnostics" && (
-              <ShiftDiagnosticsView
-                key={`sd-${refreshTick}`}
-                userRole={user.role}
-                onAskCopilot={(prompt) => {
-                  setCopilotInitialPrompt(prompt);
-                  setCopilotOpen(true);
-                }}
-              />
-            )}
-            {activeTab === "admin" && (
-              <AdminAuditView
-                key={`adm-${refreshTick}`}
-                userRole={user.role}
-                currentUsername={user.username}
-                onSettingsSaved={() => setPosCatalogTick((t) => t + 1)}
-              />
             )}
           </Suspense>
         </ErrorBoundary>

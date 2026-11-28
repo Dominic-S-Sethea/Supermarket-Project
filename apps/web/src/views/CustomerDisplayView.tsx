@@ -12,6 +12,7 @@ import {
   subscribeCfdState,
   type CfdStatePayload,
 } from "../lib/cfdChannel";
+import { useSpatial3DPanels } from "../lib/spatial3d";
 import { useTheme } from "../lib/theme";
 
 const DEFAULT_IDLE_STATE: CfdStatePayload = {
@@ -36,6 +37,7 @@ const DEFAULT_IDLE_STATE: CfdStatePayload = {
 };
 
 export function CustomerDisplayView() {
+  useSpatial3DPanels();
   const { theme, setTheme } = useTheme();
   const [state, setState] = useState<CfdStatePayload>(
     () => readCfdState() ?? DEFAULT_IDLE_STATE
@@ -70,9 +72,10 @@ export function CustomerDisplayView() {
             S
           </div>
           <div>
-            <h1 style={{ margin: 0, fontSize: 20, letterSpacing: "-0.02em" }}>
+            <h1 style={{ margin: 0, fontSize: 22, fontFamily: "var(--font-display)", fontWeight: 800, letterSpacing: "-0.025em" }}>
               {state.storeName}
             </h1>
+            <div className="heading-rule" aria-hidden="true" />
             <div style={{ fontSize: 12.5, color: "var(--ink-secondary)" }}>
               {state.receiptHeader}
             </div>

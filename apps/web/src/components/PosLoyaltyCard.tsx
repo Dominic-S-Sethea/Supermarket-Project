@@ -69,7 +69,7 @@ export function PosLoyaltyCard({
           <span style={{ fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
             <UserCheck size={14} aria-hidden="true" style={{ color: "var(--accent-primary-ink)" }} />
             <strong>{attachedCustomer.fullName}</strong>
-            <span className="tag tag-blue mono" style={{ fontSize: 10 }}>
+            <span className="tag tag-blue mono" style={{ fontSize: 11.5 }}>
               {attachedCustomer.pointsBalance} pts
             </span>
           </span>
@@ -139,7 +139,7 @@ export function PosLoyaltyCard({
               style={{ color: couponEligibleNow ? "var(--accent-primary-ink)" : "var(--accent-amber)" }}
             />
             <strong className="mono">{appliedCoupon.code}</strong>
-            <span className={`tag ${couponEligibleNow ? "tag-green" : "tag-amber"} mono`} style={{ fontSize: 10 }}>
+            <span className={`tag ${couponEligibleNow ? "tag-green" : "tag-amber"} mono`} style={{ fontSize: 11.5 }}>
               {couponEligibleNow
                 ? `-${formatMoney(appliedCoupon.discountCents)}`
                 : `Min ${formatMoney(appliedCoupon.minBasketCents)}`}

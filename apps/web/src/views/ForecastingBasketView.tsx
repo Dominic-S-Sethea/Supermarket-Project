@@ -3,6 +3,7 @@ import type { UserRole } from "@supermarket/shared/dtos";
 import { formatMoney } from "@supermarket/shared/money";
 import { ArrowRight, ClipboardList, Sparkles, Truck } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { PageHeading } from "../components/PageHeading";
 
 interface DraftPo {
   supplierName: string;
@@ -193,12 +194,15 @@ export function ForecastingBasketView({ userRole = "owner" }: { userRole?: UserR
   return (
     <div>
       <header className="page-header">
-        <div>
-          <h1>Predictive Demand Forecasting, Auto-POs &amp; Market Basket AI</h1>
-          <p className="page-subtitle">
-            Leak-free portfolio forecasting engine (<strong>WeekendETS</strong> for smooth beverages/snacks + <strong>CrostonSBA</strong> for intermittent long-tail SKUs) &amp; receipt association mining.
-          </p>
-        </div>
+        <PageHeading
+          lead="Demand Forecasting &"
+          accent="Basket AI"
+          subtitle={
+            <>
+              Leak-free portfolio forecasting engine (<strong>WeekendETS</strong> for smooth beverages/snacks + <strong>CrostonSBA</strong> for intermittent long-tail SKUs) &amp; receipt association mining.
+            </>
+          }
+        />
       </header>
 
       {errorMsg && (

@@ -32,7 +32,9 @@ async function scanAxe(page: Page, label: string, bucket: Array<{ label: string;
 
 async function settleView(page: Page) {
   await page.waitForLoadState("networkidle").catch(() => {});
-  await page.waitForTimeout(180);
+  await page.evaluate(
+    () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+  );
 }
 
 const ALL_NAV_TABS = [
@@ -89,12 +91,13 @@ test.describe("SupermarketOS Automated WCAG 2.0/2.1/2.2 A/AA Gate (axe-core)", (
     await page.keyboard.press("Escape");
     await expect(page.locator('[role="dialog"]')).toHaveCount(0);
 
-    // AI Store Copilot slide drawer
+    // AI Store Copilot non-modal docked side panel on desktop
     await page.click("#open-ai-copilot-btn");
-    await expect(page.locator('[role="dialog"][aria-modal="true"]')).toBeVisible();
-    await scanAxe(page, "AI Store Copilot Drawer (navy)", findings);
+    await expect(page.locator("#ai-copilot-drawer")).toBeVisible();
+    await expect(page.locator("#ai-copilot-input")).toBeFocused();
+    await scanAxe(page, "AI Store Copilot Docked Panel (navy)", findings);
     await page.keyboard.press("Escape");
-    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+    await expect(page.locator("#ai-copilot-drawer")).toHaveCount(0);
 
     // POS Fresh PLU / Scale modal (portaled dialog + background inert)
     await page.click("#nav-pos");
@@ -204,6 +207,13 @@ test.describe("SupermarketOS Automated WCAG 2.0/2.1/2.2 A/AA Gate (axe-core)", (
     await page.keyboard.press("Escape");
     await expect(toggleBtn).toHaveAttribute("aria-expanded", "false");
     await expect(toggleBtn).toBeFocused();
+
+    // Mobile 390px AI Store Copilot opens as accessible modal SlideDrawer
+    await page.click("#mobile-ai-copilot-btn");
+    await expect(page.locator('[role="dialog"][aria-modal="true"]')).toBeVisible();
+    await scanAxe(page, "AI Store Copilot Mobile Modal (navy)", findings);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
 
     expect(findings, JSON.stringify(findings, null, 2)).toEqual([]);
   });

@@ -3,6 +3,7 @@ import type { UserRole } from "@supermarket/shared/dtos";
 import { computeEffectiveUnitCostCents, formatBp, formatMoney } from "@supermarket/shared/money";
 import { AlertTriangle, Award, Check, ChefHat, ClipboardList, FileText, FileUp, Ghost, PackageCheck, Percent, Search, Sparkles, Trash2 } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { PageHeading } from "../components/PageHeading";
 import type { ReceiveAgainstPoDraft } from "../components/PurchaseOrdersTab";
 import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
@@ -458,14 +459,15 @@ export function OperationsView({
   return (
     <div>
       <header className="page-header">
-        <div>
-          <h1>Receiving (GRN), FEFO Expiry &amp; Operations</h1>
-          <p className="page-subtitle">
-            {canManage
+        <PageHeading
+          lead="Receiving (GRN),"
+          accent="FEFO & Operations"
+          subtitle={
+            canManage
               ? "Protect your 1–3% supermarket net profit across receiving, purchase orders, vendor OTIF scorecards, 3-way dock variance matching, and FEFO expiry control."
-              : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."}
-          </p>
-        </div>
+              : "Monitor FEFO Best-Before batches across aisles and flag near-expiry stock for Store Manager clearance or write-off."
+          }
+        />
         <SubTabBar
           ariaLabel="Operations sections"
           activeId={subTab}

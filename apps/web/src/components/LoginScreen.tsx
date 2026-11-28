@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
-import { KeyRound, ShieldCheck } from "lucide-react";
+import { KeyRound, ShieldCheck, Database } from "lucide-react";
 import { apiPost } from "../api";
 import type { ThemeId } from "../lib/theme";
 import { ThemeSwitcher } from "./ThemeSwitcher";
@@ -31,7 +31,7 @@ export function LoginScreen({
   sessionNotice,
   apiHealthy = true,
   onRetryConnection,
-  theme = "navy",
+  theme = "light",
   onThemeChange,
 }: {
   onLoggedIn: (user: SessionUser) => void;
@@ -75,25 +75,28 @@ export function LoginScreen({
   return (
     <div className="login-shell">
       <main className="login-card">
-        <div className="brand-lockup" style={{ borderBottomColor: "var(--border-hairline)", paddingLeft: 0 }}>
+        <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true">S</div>
           <div>
-            <div className="brand-title" style={{ color: "var(--ink-primary)", fontSize: 18 }}>
-              SupermarketOS
-            </div>
-            <div className="brand-sub" style={{ color: "var(--ink-secondary)" }}>
+            <div className="brand-title">SupermarketOS</div>
+            <div className="brand-sub">
               3,120+ SKU Retail Operations, Offline POS &amp; Gemini AI Copilot
             </div>
           </div>
         </div>
 
         {onThemeChange && (
-          <div style={{ marginBottom: 14 }}>
+          <div style={{ marginBottom: 16 }}>
             <ThemeSwitcher theme={theme} onChange={onThemeChange} variant="surface" />
           </div>
         )}
 
-        <h1 style={{ fontSize: 20, margin: "0 0 6px" }}>Staff Sign-In</h1>
+        <div className="editorial-heading-block compact">
+          <h1 className="editorial-heading">
+            Staff <span className="heading-accent">Sign-In</span>
+          </h1>
+          <div className="heading-rule" aria-hidden="true" />
+        </div>
         <p className="panel-desc" style={{ marginBottom: 16 }}>
           {SHOW_DEMO_PERSONAS
             ? "Enter your staff username and PIN, or pick a local dev role below."
@@ -196,6 +199,14 @@ export function LoginScreen({
             </div>
           </div>
         )}
+        <div className="login-foundation">
+          <div className="foundation-bar foundation-sky">
+            <span className="foundation-bar-icon" aria-hidden="true">
+              <Database size={14} />
+            </span>
+            <span className="foundation-bar-label">POSTGRESQL LEDGER · OFFLINE POS CACHE · RBAC</span>
+          </div>
+        </div>
       </main>
     </div>
   );

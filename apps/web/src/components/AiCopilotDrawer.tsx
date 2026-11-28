@@ -80,7 +80,16 @@ export function AiCopilotDrawer({
   const [streamingText, setStreamingText] = useState("");
   const [liveTools, setLiveTools] = useState<ToolTrace[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [isDesktopDocked, setIsDesktopDocked] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(min-width: 1024px)").matches
+      : false
+  );
 
+  const inputRef = useRef<HTMLInputElement>(null);
+  const dockedAsideRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const streamAbortRef = useRef<AbortController | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -117,6 +126,45 @@ export function AiCopilotDrawer({
   };
 
   useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const sync = () => setIsDesktopDocked(mq.matches);
+    sync();
+    if (typeof mq.addEventListener === "function") {
+      mq.addEventListener("change", sync);
+      return () => mq.removeEventListener("change", sync);
+    }
+    return undefined;
+  }, []);
+
+  useEffect(() => {
+    if (!open || !isDesktopDocked) return;
+    const previouslyFocused =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const focusTimer = window.setTimeout(() => {
+      const asideEl = dockedAsideRef.current;
+      if (asideEl && !asideEl.contains(document.activeElement)) {
+        inputRef.current?.focus();
+      }
+    }, 0);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (document.querySelector('[data-supermarket-dialog-overlay="true"]')) return;
+      onCloseRef.current();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      document.removeEventListener("keydown", onKeyDown);
+      if (previouslyFocused && typeof previouslyFocused.focus === "function" && previouslyFocused.isConnected) {
+        previouslyFocused.focus();
+      }
+    };
+  }, [open, isDesktopDocked]);
+
+  useEffect(() => {
     if (!open) {
       abortActiveStream();
       return;
@@ -145,20 +193,28 @@ export function AiCopilotDrawer({
     }
     const runScroll = () => {
       scrollRafRef.current = null;
+      const target = messagesEndRef.current;
+      if (!target || typeof target.scrollIntoView !== "function") return;
       const prefersReducedMotion =
         typeof window !== "undefined" &&
         typeof window.matchMedia === "function" &&
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      messagesEndRef.current?.scrollIntoView({
+      target.scrollIntoView({
         behavior: prefersReducedMotion || streamingText.length > 0 ? "auto" : "smooth",
         block: "end",
       });
     };
     if (typeof requestAnimationFrame === "function") {
       scrollRafRef.current = requestAnimationFrame(runScroll);
-    } else {
-      runScroll();
+      return () => {
+        if (scrollRafRef.current !== null && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(scrollRafRef.current);
+          scrollRafRef.current = null;
+        }
+      };
     }
+    runScroll();
+    return undefined;
   }, [messages.length, streamingText, liveTools.length]);
 
   const loadConversation = async (id: string) => {
@@ -347,22 +403,22 @@ export function AiCopilotDrawer({
     }
   };
 
-  return (
-    <SlideDrawer
-      open={open}
-      onClose={onClose}
-      labelledBy="ai-copilot-drawer-title"
-      className="ai-drawer"
-    >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+  if (!open) return null;
+
+  const panelBody = (
+    <>
+      <div className="ai-header-row">
         <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Sparkles size={17} color="var(--accent-primary-ink)" aria-hidden="true" />
-            <h2 id="ai-copilot-drawer-title" style={{ margin: 0, fontSize: 18 }}>
-              Store Manager AI Copilot
-            </h2>
+          <div className="ai-header-title">
+            <span className="icon-tile-md tone-violet" aria-hidden="true">
+              <Sparkles size={17} />
+            </span>
+            <div>
+              <h2 id="ai-copilot-drawer-title">Store Manager AI Copilot</h2>
+              <div className="heading-rule" aria-hidden="true" />
+            </div>
           </div>
-          <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
             <span className={`tag mono ${geminiConfigured ? "tag-green" : "tag-blue"}`}>
               {geminiConfigured ? `Gemini SSE: ${modelName}` : "Local Tool SSE Mode"}
             </span>
@@ -437,10 +493,13 @@ export function AiCopilotDrawer({
               <button
                 key={prompt}
                 type="button"
-                className="quick-sku-btn"
+                className="ai-starter-btn"
                 onClick={() => void sendMessage(prompt)}
               >
-                <span style={{ fontWeight: 600, fontSize: 12.5 }}>{prompt}</span>
+                <span className="icon-tile-sm tone-violet-soft" aria-hidden="true">
+                  <Sparkles size={13} />
+                </span>
+                <span>{prompt}</span>
               </button>
             ))}
           </div>
@@ -454,7 +513,7 @@ export function AiCopilotDrawer({
               {m.toolCallsJson && m.toolCallsJson.length > 0 && (
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 8 }}>
                   {m.toolCallsJson.map((t, idx) => (
-                    <span key={`${t.tool}-${idx}`} className="tag tag-neutral mono" style={{ fontSize: 10.5 }}>
+                    <span key={`${t.tool}-${idx}`} className="tag tag-neutral mono" style={{ fontSize: 11.5 }}>
                       <Terminal size={10} aria-hidden="true" /> {t.tool}: {t.summary}
                     </span>
                   ))}
@@ -471,7 +530,7 @@ export function AiCopilotDrawer({
             {liveTools.length > 0 && (
               <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
                 {liveTools.map((t, idx) => (
-                  <span key={`live-${t.tool}-${idx}`} className="tag tag-blue mono" style={{ fontSize: 10.5 }}>
+                  <span key={`live-${t.tool}-${idx}`} className="tag tag-blue mono" style={{ fontSize: 11.5 }}>
                     <Terminal size={10} aria-hidden="true" /> {t.tool}: {t.summary}
                   </span>
                 ))}
@@ -535,18 +594,18 @@ export function AiCopilotDrawer({
       )}
 
       <form
-        className="pos-scan-bar"
-        style={{ marginBottom: 0, marginTop: "auto" }}
+        className="ai-composer"
         onSubmit={(e) => {
           e.preventDefault();
           void sendMessage();
         }}
       >
         <input
+          ref={inputRef}
           id="ai-copilot-input"
           aria-label="Ask AI Store Copilot"
           className="input"
-          style={{ fontSize: 13, minWidth: 0 }}
+          style={{ fontSize: 13 }}
           placeholder="Ask about margins, POs, expiry, or promos..."
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -562,6 +621,30 @@ export function AiCopilotDrawer({
           <Send size={14} aria-hidden="true" />
         </button>
       </form>
+    </>
+  );
+
+  if (isDesktopDocked) {
+    return (
+      <aside
+        ref={dockedAsideRef}
+        id="ai-copilot-drawer"
+        aria-labelledby="ai-copilot-drawer-title"
+        className="ai-drawer ai-docked-panel"
+      >
+        {panelBody}
+      </aside>
+    );
+  }
+
+  return (
+    <SlideDrawer
+      open={open}
+      onClose={onClose}
+      labelledBy="ai-copilot-drawer-title"
+      className="ai-drawer"
+    >
+      {panelBody}
     </SlideDrawer>
   );
 }

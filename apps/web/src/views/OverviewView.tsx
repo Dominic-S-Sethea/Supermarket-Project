@@ -1,8 +1,26 @@
 import { type CSSProperties, useEffect, useState } from "react";
 import type { UserRole } from "@supermarket/shared/dtos";
 import { formatBp, formatMoney } from "@supermarket/shared/money";
-import { ArrowRight, Download, RefreshCw, Sparkles } from "lucide-react";
+import {
+  Activity,
+  AlertTriangle,
+  ArrowRight,
+  Boxes,
+  Database,
+  DollarSign,
+  Download,
+  Layers,
+  Package,
+  PackageCheck,
+  Percent,
+  RefreshCw,
+  ScanBarcode,
+  ShieldCheck,
+  ShoppingBag,
+  Sparkles,
+} from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { PageHeading } from "../components/PageHeading";
 import { SalesTrendChart, type DailyTrendPoint } from "../components/SalesTrendChart";
 
 interface BriefingBullet {
@@ -75,7 +93,7 @@ export function OverviewView({
 }: {
   userRole?: UserRole;
   allowedTabs?: string[];
-  onNavigate?: (tab: "operations" | "forecasting" | "abc-lp" | "catalog") => void;
+  onNavigate?: (tab: "pos" | "catalog" | "operations" | "forecasting" | "abc-lp" | "admin") => void;
 }) {
   const [days, setDays] = useState(30);
   const [overview, setOverview] = useState<OverviewData | null>(null);
@@ -180,14 +198,17 @@ export function OverviewView({
   return (
     <div>
       <header className="page-header">
-        <div>
-          <h1>Store Executive Overview</h1>
-          <p className="page-subtitle">
-            Real-time P&amp;L, gross margin mix, traffic heatmap, and department GMROII across{" "}
-            <strong className="mono">{kpis.totalSkus.toLocaleString()}</strong> packaged SKUs &amp;{" "}
-            <strong className="mono">{kpis.totalBarcodes.toLocaleString()}</strong> multi-UOM barcodes.
-          </p>
-        </div>
+        <PageHeading
+          lead="Store Executive"
+          accent="Overview"
+          subtitle={
+            <>
+              Real-time P&amp;L, gross margin mix, traffic heatmap, and department GMROII across{" "}
+              <strong className="mono">{kpis.totalSkus.toLocaleString()}</strong> packaged SKUs &amp;{" "}
+              <strong className="mono">{kpis.totalBarcodes.toLocaleString()}</strong> multi-UOM barcodes.
+            </>
+          }
+        />
         <div className="header-actions">
           <select
             id="overview-window-select"
@@ -245,10 +266,12 @@ export function OverviewView({
         <section className="panel briefing-card" style={{ marginBottom: 20 }}>
           <div className="panel-header" style={{ marginBottom: 10 }}>
             <div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <Sparkles size={15} color="var(--accent-primary-ink)" aria-hidden="true" />
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <span className="icon-tile-md tone-violet" aria-hidden="true">
+                  <Sparkles size={16} />
+                </span>
                 <h2 className="panel-title">AI Morning Executive Briefing ({briefing.briefingDate})</h2>
-                <span className="tag tag-green mono">{briefing.model}</span>
+                <span className="tag tag-violet mono">{briefing.model}</span>
               </div>
               <p className="panel-desc" style={{ marginTop: 4, fontWeight: 500, color: "var(--ink-primary)" }}>
                 {briefing.headline}
@@ -308,9 +331,14 @@ export function OverviewView({
         </section>
       )}
 
-      <section className="kpi-strip" aria-label="Core store KPIs">
+      <section className="kpi-strip vector-stagger" aria-label="Core store KPIs">
         <div className="kpi-tile">
-          <div className="kpi-label">Net Sales ({days}d)</div>
+          <div className="kpi-label-row">
+            <span className="icon-tile-sm tone-emerald-soft" aria-hidden="true">
+              <DollarSign size={14} />
+            </span>
+            <div className="kpi-label">Net Sales ({days}d)</div>
+          </div>
           <div className="kpi-value">{formatMoney(kpis.netSalesCents)}</div>
           <div className="kpi-meta">
             Gross: <span className="mono">{formatMoney(kpis.grossSalesCents)}</span> · VAT:{" "}
@@ -318,31 +346,173 @@ export function OverviewView({
           </div>
         </div>
         <div className="kpi-tile">
-          <div className="kpi-label">Gross Profit &amp; Margin</div>
+          <div className="kpi-label-row">
+            <span className="icon-tile-sm tone-violet-soft" aria-hidden="true">
+              <Percent size={14} />
+            </span>
+            <div className="kpi-label">Gross Profit &amp; Margin</div>
+          </div>
           <div className="kpi-value">{formatBp(kpis.grossMarginBp)}</div>
           <div className="kpi-meta">
             Profit: <strong className="mono">{formatMoney(kpis.grossProfitCents)}</strong> (cost-at-sale)
           </div>
         </div>
         <div className="kpi-tile">
-          <div className="kpi-label">Avg Basket (ATV)</div>
+          <div className="kpi-label-row">
+            <span className="icon-tile-sm tone-teal-soft" aria-hidden="true">
+              <ShoppingBag size={14} />
+            </span>
+            <div className="kpi-label">Avg Basket (ATV)</div>
+          </div>
           <div className="kpi-value">{formatMoney(kpis.avgTransactionValueCents)}</div>
           <div className="kpi-meta">
             <span className="mono">{kpis.receiptCount.toLocaleString()}</span> completed receipts
           </div>
         </div>
         <div className="kpi-tile">
-          <div className="kpi-label">Stock Capital On Hand</div>
+          <div className="kpi-label-row">
+            <span className="icon-tile-sm tone-indigo-soft" aria-hidden="true">
+              <Package size={14} />
+            </span>
+            <div className="kpi-label">Stock Capital On Hand</div>
+          </div>
           <div className="kpi-value">{formatMoney(kpis.inventoryCostValueCents)}</div>
           <div className="kpi-meta">
             At MWAC across <span className="mono">{kpis.totalSkus.toLocaleString()}</span> SKUs
           </div>
         </div>
         <div className="kpi-tile">
-          <div className="kpi-label">Recorded Shrinkage ({days}d)</div>
+          <div className="kpi-label-row">
+            <span className="icon-tile-sm tone-rose-soft" aria-hidden="true">
+              <AlertTriangle size={14} />
+            </span>
+            <div className="kpi-label">Recorded Shrinkage ({days}d)</div>
+          </div>
           <div className="kpi-value">{formatBp(kpis.shrinkageRateBp)}</div>
           <div className="kpi-meta">
             Write-off cost: <span className="mono">{formatMoney(kpis.shrinkageCostCents)}</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="overview-ops-pipeline" className="panel ops-pipeline-card" aria-label="Live store request and ledger flow">
+        <div className="panel-header" style={{ marginBottom: 10 }}>
+          <div>
+            <h2 className="panel-title">Live Store Request &amp; Ledger Architecture</h2>
+            <p className="panel-desc">
+              Semantic layer flow from cashier scan through catalog pricing, RBAC governance, PostgreSQL settlement, and FEFO stock telemetry.
+            </p>
+          </div>
+          <span className="tag tag-violet mono">
+            {kpis.receiptCount.toLocaleString()} tx · {days}d window
+          </span>
+        </div>
+
+        <div className="ops-pipeline-flow">
+          <div className="pipeline-packet" aria-hidden="true" />
+          {[
+            {
+              key: "pos" as const,
+              label: "POS LANES",
+              metric: `${kpis.receiptCount.toLocaleString()} receipts`,
+              tone: "teal",
+              Icon: ScanBarcode,
+              targetTab: "pos" as const,
+            },
+            {
+              key: "catalog" as const,
+              label: "CATALOG",
+              metric: `${kpis.totalSkus.toLocaleString()} SKUs`,
+              tone: "indigo",
+              Icon: Boxes,
+              targetTab: "catalog" as const,
+            },
+            {
+              key: "admin" as const,
+              label: "RBAC & AUDIT",
+              metric: `${userRole.toUpperCase()} active`,
+              tone: "rose",
+              Icon: ShieldCheck,
+              targetTab: "admin" as const,
+            },
+            {
+              key: "pg" as const,
+              label: "POSTGRESQL",
+              metric: "Integer cents",
+              tone: "emerald",
+              Icon: Database,
+              targetTab: null,
+            },
+            {
+              key: "operations" as const,
+              label: "FEFO & ALERTS",
+              metric: `${depts.length} departments`,
+              tone: "amber",
+              Icon: PackageCheck,
+              targetTab: "operations" as const,
+            },
+          ].map((node) => {
+            const canNav = Boolean(
+              node.targetTab && onNavigate && (!allowedTabs || allowedTabs.includes(node.targetTab))
+            );
+            const content = (
+              <>
+                <span className={`icon-tile-lg tone-${node.tone}`} aria-hidden="true">
+                  <node.Icon size={20} />
+                </span>
+                <div>
+                  <div className="ops-pipeline-label">{node.label}</div>
+                  <div className="ops-pipeline-metric">{node.metric}</div>
+                </div>
+              </>
+            );
+            if (canNav && node.targetTab) {
+              return (
+                <button
+                  key={node.key}
+                  type="button"
+                  className="ops-pipeline-node"
+                  onClick={() => onNavigate?.(node.targetTab!)}
+                >
+                  {content}
+                </button>
+              );
+            }
+            return (
+              <div key={node.key} className="ops-pipeline-node">
+                {content}
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="foundation-stack">
+          <div className="foundation-bar foundation-sky">
+            <span className="foundation-bar-icon" aria-hidden="true">
+              <Layers size={14} />
+            </span>
+            <span className="foundation-bar-label">POSTGRESQL LEDGER</span>
+            <span className="foundation-bar-metric">
+              INTEGER CENTS · {kpis.receiptCount.toLocaleString()} RECEIPTS
+            </span>
+          </div>
+          <div className="foundation-bar foundation-blue">
+            <span className="foundation-bar-icon" aria-hidden="true">
+              <Boxes size={14} />
+            </span>
+            <span className="foundation-bar-label">MULTI-UOM CATALOG</span>
+            <span className="foundation-bar-metric">
+              {kpis.totalSkus.toLocaleString()} SKUS / {kpis.totalBarcodes.toLocaleString()} BARCODES
+            </span>
+          </div>
+          <div className="foundation-bar foundation-cyan">
+            <span className="foundation-bar-icon" aria-hidden="true">
+              <Activity size={14} />
+            </span>
+            <span className="foundation-bar-label">ANALYTICS TELEMETRY</span>
+            <span className="foundation-bar-metric">
+              {days}D WINDOW · {formatBp(kpis.grossMarginBp)} MARGIN
+            </span>
           </div>
         </div>
       </section>

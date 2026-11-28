@@ -13,6 +13,7 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { PageHeading } from "../components/PageHeading";
 import { SubTabBar } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
@@ -385,12 +386,11 @@ export function LoyaltyPromosView({ userRole = "owner" }: { userRole?: UserRole 
   return (
     <div>
       <header className="page-header">
-        <div>
-          <h1>Loyalty CRM, Targeted Coupons &amp; Promotions</h1>
-          <p className="page-subtitle">
-            Manage RFM shopper segments, issue single-use POS coupons with atomic double-redeem locking, and configure daypart promotions.
-          </p>
-        </div>
+        <PageHeading
+          lead="Loyalty CRM,"
+          accent="Coupons & Promos"
+          subtitle="Manage RFM shopper segments, issue single-use POS coupons with atomic double-redeem locking, and configure daypart promotions."
+        />
         <SubTabBar
           ariaLabel="Loyalty and promotion sections"
           activeId={subTab}

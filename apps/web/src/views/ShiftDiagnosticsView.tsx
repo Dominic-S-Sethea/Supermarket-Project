@@ -14,6 +14,7 @@ import {
 import { apiGet, apiPost } from "../api";
 import { ModalDialog } from "../components/AccessibleDialog";
 import { HourlyFootfallChart } from "../components/HourlyFootfallChart";
+import { PageHeading } from "../components/PageHeading";
 import { StaffingRosterTab } from "../components/StaffingRosterTab";
 import { SubTabBar } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
@@ -400,17 +401,20 @@ export function ShiftDiagnosticsView({
   return (
     <div>
       <header className="page-header">
-        <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <Sun size={22} color="var(--accent-amber)" />
-            <h1 style={{ margin: 0 }}>Morning Shift Diagnostics &amp; Footfall Intelligence</h1>
-          </div>
-          <p className="page-subtitle">
-            {diag
+        <PageHeading
+          icon={
+            <span className="icon-tile-md tone-orange" aria-hidden="true">
+              <Sun size={18} />
+            </span>
+          }
+          lead="Morning Shift"
+          accent="Diagnostics"
+          subtitle={
+            diag
               ? `Diagnosed Root Cause: ${diag.primaryBottleneck}`
-              : "Run Python analytics worker to materialize shift funnel, OOS losses, and ML attribution."}
-          </p>
-        </div>
+              : "Run Python analytics worker to materialize shift funnel, OOS losses, and ML attribution."
+          }
+        />
         <div className="header-actions">
           {canOperate && (
             <>

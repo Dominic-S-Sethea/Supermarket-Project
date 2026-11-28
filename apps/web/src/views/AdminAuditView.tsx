@@ -16,6 +16,7 @@ import {
   Users,
 } from "lucide-react";
 import { apiGet, apiPatch, apiPost } from "../api";
+import { PageHeading } from "../components/PageHeading";
 import { SubTabBar, type SubTabItem } from "../components/SubTabBar";
 import { readQueryParam, syncQueryParam } from "../lib/urlSync";
 
@@ -432,14 +433,15 @@ export function AdminAuditView({
   return (
     <div>
       <header className="page-header">
-        <div>
-          <h1>Governance, Audit Trail &amp; Financial Exports</h1>
-          <p className="page-subtitle">
-            {isOwner
+        <PageHeading
+          lead="Governance,"
+          accent="Audit & Exports"
+          subtitle={
+            isOwner
               ? "Manage staff RBAC accounts, revoke compromised sessions, explore the immutable compliance ledger, and export formula-safe ERP registers."
-              : "Inspect the immutable store audit trail, reconcile cashier Z-Reports, rotate your PIN, and export formula-safe ERP registers."}
-          </p>
-        </div>
+              : "Inspect the immutable store audit trail, reconcile cashier Z-Reports, rotate your PIN, and export formula-safe ERP registers."
+          }
+        />
         <SubTabBar
           ariaLabel="Governance and audit sections"
           activeId={subTab}

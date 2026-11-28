@@ -3,6 +3,7 @@ import type { UserRole } from "@supermarket/shared/dtos";
 import { formatMoney } from "@supermarket/shared/money";
 import { RefreshCw, ShieldAlert, Sparkles } from "lucide-react";
 import { apiGet, apiPost } from "../api";
+import { PageHeading } from "../components/PageHeading";
 
 interface MatrixCell {
   segment: string;
@@ -171,12 +172,11 @@ export function AbcLossView({ userRole = "owner" }: { userRole?: UserRole }) {
   return (
     <div>
       <header className="page-header">
-        <div>
-          <h1>ABC-XYZ Inventory Segmentation &amp; Loss Prevention</h1>
-          <p className="page-subtitle">
-            Computed by the Python Analytics Worker across all 3,120 SKUs — triage high-profit staples vs. dead-stock cash traps and flag cashier anomalies.
-          </p>
-        </div>
+        <PageHeading
+          lead="ABC-XYZ &"
+          accent="Loss Prevention"
+          subtitle="Computed by the Python Analytics Worker across all 3,120 SKUs — triage high-profit staples vs. dead-stock cash traps and flag cashier anomalies."
+        />
         <div className="header-actions">
           {selectedSegment && (
             <button type="button" className="btn" onClick={() => setSelectedSegment("")}>

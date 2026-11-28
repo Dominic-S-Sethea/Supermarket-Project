@@ -11,6 +11,7 @@ import {
   type CsvPreviewResponse,
   type StatusNotice,
 } from "../components/CatalogModals";
+import { PageHeading } from "../components/PageHeading";
 
 interface DepartmentOption {
   id: string;
@@ -331,12 +332,15 @@ export function CatalogView({
   return (
     <div>
       <header className="page-header">
-        <div>
-          <h1>Catalog &amp; Multi-UOM Barcodes</h1>
-          <p className="page-subtitle">
-            Search <strong className="mono">{data.total.toLocaleString()}</strong> packaged &amp; fresh SKUs by name, SKU, brand, PLU, or any Single / Multi-Pack / Case barcode.
-          </p>
-        </div>
+        <PageHeading
+          lead="Catalog &"
+          accent="Multi-UOM Barcodes"
+          subtitle={
+            <>
+              Search <strong className="mono">{data.total.toLocaleString()}</strong> packaged &amp; fresh SKUs by name, SKU, brand, PLU, or any Single / Multi-Pack / Case barcode.
+            </>
+          }
+        />
         {(canEditCatalog || canCycleCount) && (
           <div className="header-actions">
             {canCycleCount && (

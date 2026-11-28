@@ -48,6 +48,13 @@ async function tabUntilSelector(
   maxTabs = 80
 ): Promise<FocusCheckResult[]> {
   const visited: FocusCheckResult[] = [];
+  const alreadyMatched = await page.evaluate((sel) => {
+    const el = document.activeElement;
+    return Boolean(el && el.matches(sel));
+  }, selector);
+  if (alreadyMatched) {
+    return [await inspectActiveFocus(page)];
+  }
   for (let i = 0; i < maxTabs; i++) {
     await page.keyboard.press("Tab");
     const info = await inspectActiveFocus(page);
@@ -411,52 +418,58 @@ test.describe("Manual-Equivalent Verification: Keyboard-Only, Chromium AX Tree &
       });
 
       // 1. POS rapid barcode keystrokes + quick-scan add
-      await page.locator("#nav-pos").click({ force: true });
+      await page.locator("#nav-pos").click();
       await expect(page.locator("#pos-barcode-input")).toBeVisible();
       await page.locator("#pos-barcode-input").focus();
       await page.keyboard.type("8850000000014", { delay: 15 });
       await page.keyboard.press("Enter");
       if (await page.locator('[role="dialog"]').isVisible().catch(() => false)) {
         await page.keyboard.press("Escape");
+        await expect(page.locator('[role="dialog"]')).toHaveCount(0);
       }
       const noodleBtn = page.locator(".quick-sku-btn", { hasText: "5 for $3.95" }).first();
       if (await noodleBtn.isVisible().catch(() => false)) {
-        await noodleBtn.click({ force: true });
+        await noodleBtn.click();
+        await expect(page.locator("aside.pos-receipt-panel")).toBeVisible();
       }
-      await page.waitForTimeout(150);
 
       // 2. Operations lazy sub-tab switches
-      await page.locator("#nav-operations").click({ force: true });
+      await page.locator("#nav-operations").click();
       await expect(page.locator("#ops-subtab-orders")).toBeVisible();
-      await page.locator("#ops-subtab-orders").click({ force: true });
-      await page.waitForTimeout(200);
-      await page.locator("#ops-subtab-tasks").click({ force: true });
-      await page.waitForTimeout(200);
-      await page.locator("#ops-subtab-shelf").click({ force: true });
-      await page.waitForTimeout(200);
+      await page.locator("#ops-subtab-orders").click();
+      await expect(page.locator("#ops-panel-orders")).toBeVisible();
+      await page.locator("#ops-subtab-tasks").click();
+      await expect(page.locator("#ops-panel-tasks")).toBeVisible();
+      await page.locator("#ops-subtab-shelf").click();
+      await expect(page.locator("#ops-panel-shelf")).toBeVisible();
 
       // 3. Shift Diagnostics chart keyboard focus stepping
-      await page.locator("#nav-shift-diagnostics").click({ force: true });
+      await page.locator("#nav-shift-diagnostics").click();
       const bars = page.locator('svg[aria-label="Hourly footfall funnel"] g[role="button"]');
       await expect(bars.first()).toBeVisible();
       await bars.nth(0).focus();
       await bars.nth(2).focus();
       await bars.nth(4).focus();
-      await page.waitForTimeout(150);
+      await expect(bars.nth(4)).toBeFocused();
 
       // 4. Catalog drawer open + Escape close
-      await page.locator("#nav-catalog").click({ force: true });
+      await page.locator("#nav-catalog").click();
       await expect(page.locator("button.table-row-btn").first()).toBeVisible();
-      await page.locator("button.table-row-btn").first().click({ force: true });
+      await page.locator("button.table-row-btn").first().click();
       await expect(page.locator('[role="dialog"]')).toBeVisible();
       await page.keyboard.press("Escape");
       await expect(page.locator('[role="dialog"]')).toHaveCount(0);
 
       // 5. Theme switching (Navy -> Dark -> Light -> Navy)
-      await page.locator("#theme-btn-sidebar-dark").click({ force: true });
-      await page.locator("#theme-btn-sidebar-light").click({ force: true });
-      await page.locator("#theme-btn-sidebar-navy").click({ force: true });
-      await page.waitForTimeout(200);
+      await page.locator("#theme-btn-sidebar-dark").click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+      await page.locator("#theme-btn-sidebar-light").click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+      await page.locator("#theme-btn-sidebar-navy").click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "navy");
+      await page.evaluate(
+        () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+      );
 
       // Aggregate by interactionId (matching INP spec: max entry duration per interactionId)
       const summary = await page.evaluate(() => {
