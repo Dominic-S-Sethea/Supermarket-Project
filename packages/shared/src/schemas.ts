@@ -79,7 +79,7 @@ export const CreateProductSchema = z.object({
 export const PosSaleUploadSchema = z.object({
   id: z.string().uuid(),
   registerCode: z.string().min(1).max(32).default("REG-01"),
-  shiftId: z.string().uuid().optional(),
+  shiftId: z.string().uuid().nullable().optional(),
   receiptNo: z.string().min(3).max(64),
   kind: z.enum(["sale", "refund", "void"]).default("sale"),
   originalSaleId: z.string().uuid().nullable().optional(),
@@ -89,6 +89,7 @@ export const PosSaleUploadSchema = z.object({
   customerId: z.string().uuid().nullable().optional(),
   couponCode: z.string().min(3).max(40).nullable().optional(),
   priceOverrideReason: z.string().min(3).max(160).nullable().optional(),
+  supervisorOverrideId: z.string().uuid().nullable().optional(),
   supervisorOverrideBy: z.string().trim().min(2).max(120).nullable().optional(),
   lines: z
     .array(
@@ -190,6 +191,22 @@ export const UpdatePoStatusSchema = z.object({
   status: z.enum(["draft", "approved", "sent", "partially_received", "received", "cancelled"]),
 });
 
+export const PromotionRulesSchema = z
+  .object({
+    productIds: z.array(z.string().uuid()).max(200).optional(),
+    categoryIds: z.array(z.string().uuid()).max(50).optional(),
+    eligiblePackQty: z.number().int().min(1).max(1000).optional(),
+    discountBp: z.number().int().min(1).max(10000).optional(),
+    requiredQty: z.number().int().min(1).max(1000).optional(),
+    bundlePriceCents: z.number().int().min(0).max(100_000_000).optional(),
+    buyQty: z.number().int().min(1).max(100).optional(),
+    getQty: z.number().int().min(1).max(100).optional(),
+    minBasketCents: z.number().int().min(1).max(100_000_000).optional(),
+    flatDiscountCents: z.number().int().min(1).max(100_000_000).optional(),
+    batchId: z.string().uuid().optional(),
+  })
+  .strict();
+
 export const CreatePromotionSchema = z
   .object({
     name: z.string().min(2).max(160),
@@ -201,7 +218,7 @@ export const CreatePromotionSchema = z
     endsAt: z.string().datetime().optional(),
     daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
     daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
-    rulesJson: z.record(z.string(), z.unknown()),
+    rulesJson: PromotionRulesSchema,
   })
   .refine(
     (d) =>
@@ -212,11 +229,78 @@ export const CreatePromotionSchema = z
     }
   )
   .refine(
+    (d) =>
+      d.daypartStartHour == null ||
+      d.daypartEndHour == null ||
+      d.daypartStartHour !== d.daypartEndHour,
+    {
+      message: "daypartStartHour and daypartEndHour must differ",
+    }
+  )
+  .refine(
     (d) => !d.startsAt || !d.endsAt || Date.parse(d.startsAt) <= Date.parse(d.endsAt),
     {
       message: "Promotion startsAt must be earlier than or equal to endsAt",
     }
-  );
+  )
+  .superRefine((d, ctx) => {
+    const r = d.rulesJson;
+    if (d.promoType === "clearance") {
+      if (!r.discountBp || r.discountBp < 1 || r.discountBp > 9500) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["rulesJson", "discountBp"],
+          message: "Clearance promotion requires discountBp between 1 and 9500.",
+        });
+      }
+    } else if (d.promoType === "tier_price") {
+      if (!r.requiredQty || r.requiredQty < 2) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["rulesJson", "requiredQty"],
+          message: "Tier price promotion requires requiredQty >= 2.",
+        });
+      }
+      if (!r.discountBp || r.discountBp < 1 || r.discountBp > 9500) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["rulesJson", "discountBp"],
+          message: "Tier price promotion requires discountBp between 1 and 9500.",
+        });
+      }
+    } else if (d.promoType === "mix_and_match") {
+      if (!r.requiredQty || r.requiredQty < 2) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["rulesJson", "requiredQty"],
+          message: "Mix-and-match promotion requires requiredQty >= 2.",
+        });
+      }
+      if (r.bundlePriceCents === undefined || r.bundlePriceCents < 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["rulesJson", "bundlePriceCents"],
+          message: "Mix-and-match promotion requires non-negative bundlePriceCents.",
+        });
+      }
+    } else if (d.promoType === "bogo") {
+      if (!r.buyQty || r.buyQty < 1 || !r.getQty || r.getQty < 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["rulesJson", "buyQty"],
+          message: "BOGO promotion requires positive buyQty and getQty.",
+        });
+      }
+    } else if (d.promoType === "basket_threshold") {
+      if (!r.minBasketCents || r.minBasketCents < 1 || !r.flatDiscountCents || r.flatDiscountCents < 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["rulesJson", "minBasketCents"],
+          message: "Basket threshold promotion requires positive minBasketCents and flatDiscountCents.",
+        });
+      }
+    }
+  });
 
 export const IngestFootfallSchema = z.object({
   buckets: z
@@ -286,8 +370,15 @@ export const ParseInvoiceSchema = z
 
 export const AiTriageRequestSchema = z.object({
   targetType: z.enum(["cashier_anomaly", "invoice_discrepancy", "expiry_batch"]),
-  subjectId: z.string().optional(),
-  metrics: z.record(z.string(), z.unknown()),
+  subjectId: z.string().max(120).optional(),
+  metrics: z
+    .record(
+      z.string().min(1).max(64),
+      z.union([z.string().max(160), z.number().finite(), z.boolean(), z.null()])
+    )
+    .refine((m) => Object.keys(m).length <= 24, {
+      message: "Triage metrics cannot exceed 24 fields.",
+    }),
 });
 
 export const ApplyDynamicMarkdownSchema = z.object({
@@ -492,6 +583,19 @@ export const UpdateStoreSettingsSchema = z.object({
   promptpayProxy: z.string().trim().min(8).max(32).optional(),
   paynowUen: z.string().trim().min(5).max(32).optional(),
   fiscalProvider: z.enum(["local_hash_chain", "fiskaly_tse"]).optional(),
+  storeTimezone: z.string().trim().min(3).max(64).optional(),
+  railFxRatesJson: z
+    .object({
+      USD: z.number().positive().max(1_000_000),
+      KHR: z.number().positive().max(1_000_000),
+      THB: z.number().positive().max(1_000_000),
+      SGD: z.number().positive().max(1_000_000),
+      EUR: z.number().positive().max(1_000_000),
+    })
+    .partial()
+    .strict()
+    .nullable()
+    .optional(),
 });
 
 export const CreatePaymentIntentSchema = z.object({
@@ -507,7 +611,7 @@ export const PaymentWebhookSchema = z.object({
   billReference: z.string().trim().min(3).max(64),
   externalRef: z.string().trim().min(3).max(120),
   status: z.enum(["paid", "failed", "expired"]),
-  amountCents: z.number().int().min(1).optional(),
+  amountCents: z.number().int().min(1),
 });
 
 export const ParkBasketSchema = z.object({

@@ -180,6 +180,8 @@ export interface StoreSettingsDto {
   promptpayProxy: string;
   paynowUen: string;
   fiscalProvider: "local_hash_chain" | "fiskaly_tse";
+  storeTimezone?: string;
+  railFxRatesJson?: Record<string, number> | null;
   updatedAt: string;
 }
 

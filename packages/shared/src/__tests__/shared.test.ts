@@ -3,6 +3,7 @@ import {
   buildScaleBarcode,
   buildValidEan13,
   computeEffectiveUnitCostCents,
+  computeInventoryValueCents,
   computeLegalUnitPrice,
   computeMarginBp,
   computeMovingWeightedAvgCostCents,
@@ -20,6 +21,7 @@ import {
   generateUuidV7,
   parseScaleBarcode,
   RecallProductSchema,
+  UpdateStoreSettingsSchema,
   validateBarcode,
   type CartInputLine,
   type PromotionRule,
@@ -33,9 +35,25 @@ describe("money and cost accounting math", () => {
     expect(formatMoney(-450)).toBe("-$4.50");
   });
 
-  it("computes effective unit cost accurately with free bonus cases (Buy 10 Get 1 Free)", () => {
+  it("computes effective unit cost accurately with free bonus cases (Buy 10 Get 1 Free) and measured units", () => {
     const effective = computeEffectiveUnitCostCents(24000, 240, 24);
     expect(effective).toBe(91);
+
+    // 20 kg (20,000g) bananas @ $22.00 (2,200c) -> 110c/kg ($1.10/kg)
+    expect(computeEffectiveUnitCostCents(2200, 20000, 0, "weight_g")).toBe(110);
+    // 20 kg paid + 2 kg free bonus @ $22.00 -> 100c/kg
+    expect(computeEffectiveUnitCostCents(2200, 20000, 2000, "weight_g")).toBe(100);
+    // 50L (50,000ml) oil @ $150.00 -> 300c/L
+    expect(computeEffectiveUnitCostCents(15000, 50000, 0, "volume_ml")).toBe(300);
+  });
+
+  it("normalizes inventory valuation cents by unitMode without 1000x inflation", () => {
+    expect(computeInventoryValueCents(65000, 110, "weight_g")).toBe(7150);
+    expect(computeInventoryValueCents(500, 110, "weight_g")).toBe(55);
+    expect(computeInventoryValueCents(-500, 110, "weight_g")).toBe(-55);
+    expect(computeInventoryValueCents(2500, 400, "volume_ml")).toBe(1000);
+    expect(computeInventoryValueCents(10, 110, "each")).toBe(1100);
+    expect(computeInventoryValueCents(0, 110, "weight_g")).toBe(0);
   });
 
   it("computes Moving Weighted Average Cost (MWAC)", () => {
@@ -308,14 +326,14 @@ describe("deterministic promotion and multi-UOM pricing engine", () => {
         name: "$5 Off Over $50",
         promoType: "basket_threshold",
         priority: 20,
-        combinable: false,
+        combinable: true,
         minMarginGuardBp: 1500,
         minBasketCents: 5000,
         flatDiscountCents: 500,
       },
       {
         id: "after-lock",
-        name: "Should Be Blocked After Non-Combinable Basket",
+        name: "Should Be Blocked After Non-Combinable After Prior Promo",
         promoType: "clearance",
         priority: 30,
         combinable: false,
@@ -524,7 +542,7 @@ describe("deterministic promotion and multi-UOM pricing engine", () => {
         name: "2 for $1.50",
         promoType: "mix_and_match",
         priority: 2,
-        combinable: false,
+        combinable: true,
         minMarginGuardBp: null,
         categoryIds: ["cat-noodles"],
         requiredQty: 2,
@@ -621,24 +639,150 @@ describe("money and Zod schema edge cases", () => {
       name: "Broken Daypart",
       promoType: "clearance",
       daypartStartHour: 8,
-      rulesJson: {},
+      rulesJson: { discountBp: 1500 },
     });
     expect(partialDaypart.success).toBe(false);
     if (!partialDaypart.success) {
       expect(partialDaypart.error.issues.some((i) => i.message.includes("provided together"))).toBe(true);
     }
 
+    const equalDaypart = CreatePromotionSchema.safeParse({
+      name: "Zero Hour Window",
+      promoType: "clearance",
+      daypartStartHour: 8,
+      daypartEndHour: 8,
+      rulesJson: { discountBp: 1500 },
+    });
+    expect(equalDaypart.success).toBe(false);
+
     const reversedDates = CreatePromotionSchema.safeParse({
       name: "Reversed Dates",
       promoType: "clearance",
       startsAt: "2026-12-31T00:00:00Z",
       endsAt: "2026-01-01T00:00:00Z",
-      rulesJson: {},
+      rulesJson: { discountBp: 1500 },
     });
     expect(reversedDates.success).toBe(false);
     if (!reversedDates.success) {
       expect(reversedDates.error.issues.some((i) => i.message.includes("earlier than or equal to endsAt"))).toBe(true);
     }
+
+    expect(
+      CreatePromotionSchema.safeParse({
+        name: "Bad Array Obj",
+        promoType: "clearance",
+        rulesJson: { productIds: { length: 1 }, discountBp: 1000 },
+      }).success
+    ).toBe(false);
+    expect(
+      CreatePromotionSchema.safeParse({
+        name: "Dead Tier Promo",
+        promoType: "tier_price",
+        rulesJson: { discountBp: 1000 },
+      }).success
+    ).toBe(false);
+    expect(
+      CreatePromotionSchema.safeParse({
+        name: "Missing Clearance Discount",
+        promoType: "clearance",
+        rulesJson: {},
+      }).success
+    ).toBe(false);
+  });
+
+  it("enforces strict non-combinable exclusivity, empty daypart rejection, and measured-unit exclusion from slot promos", () => {
+    const noodleLine: CartInputLine = {
+      lineKey: "l1",
+      productId: "p-noodle-a",
+      categoryId: "cat-noodles",
+      sku: "NDL-001",
+      name: "Indomie Mi Goreng 85g",
+      scannedBarcode: "89686010947",
+      packLabel: "Single Pack",
+      packQty: 1,
+      qtyPacks: 3,
+      unitPriceCents: 100,
+      unitCostCents: 60,
+      taxRateBp: 0,
+      taxInclusive: true,
+      requiresAgeCheck: false,
+    };
+    const p1Comb: PromotionRule = {
+      id: "p1-comb",
+      name: "10% Combinable",
+      promoType: "clearance",
+      priority: 1,
+      combinable: true,
+      minMarginGuardBp: null,
+      productIds: ["p-noodle-a"],
+      discountBp: 1000,
+    };
+    const p2Exclusive: PromotionRule = {
+      id: "p2-excl",
+      name: "20% Non-Combinable",
+      promoType: "clearance",
+      priority: 2,
+      combinable: false,
+      minMarginGuardBp: null,
+      productIds: ["p-noodle-a"],
+      discountBp: 2000,
+    };
+    const resExcl = evaluateCart([noodleLine], [p1Comb, p2Exclusive]);
+    expect(resExcl.appliedPromos.map((p) => p.promotionId)).toEqual(["p1-comb"]);
+    expect(resExcl.totalDiscountCents).toBe(30);
+
+    // Equal daypart hours (8..8) never match
+    expect(
+      evaluateCart([noodleLine], [{ ...p1Comb, daypartStartHour: 8, daypartEndHour: 8 }], {
+        evalHour: 8,
+      }).totalDiscountCents
+    ).toBe(0);
+
+    // Measured weight_g lines are excluded from mix_and_match / bogo unit-slot promos
+    const weightedProduce: CartInputLine = {
+      lineKey: "w-1",
+      productId: "p-mango",
+      categoryId: "cat-noodles",
+      sku: "PRD-MANGO",
+      name: "Fresh Mango",
+      scannedBarcode: "201234005001",
+      packLabel: "0.500 kg",
+      packQty: 1,
+      qtyPacks: 1,
+      unitMode: "weight_g",
+      weightGrams: 500,
+      unitPriceCents: 600,
+      unitCostCents: 300,
+      taxRateBp: 0,
+      taxInclusive: true,
+      requiresAgeCheck: false,
+    };
+    const bogoPromo: PromotionRule = {
+      id: "bogo-1",
+      name: "Buy 1 Get 1",
+      promoType: "bogo",
+      priority: 1,
+      combinable: false,
+      minMarginGuardBp: null,
+      categoryIds: ["cat-noodles"],
+      buyQty: 1,
+      getQty: 1,
+      discountBp: 10000,
+    };
+    const mixPromo: PromotionRule = {
+      id: "mix-1",
+      name: "Any 1 for $1",
+      promoType: "mix_and_match",
+      priority: 2,
+      combinable: false,
+      minMarginGuardBp: null,
+      categoryIds: ["cat-noodles"],
+      requiredQty: 1,
+      bundlePriceCents: 100,
+    };
+    const resMeasured = evaluateCart([weightedProduce, noodleLine], [bogoPromo, mixPromo]);
+    // weightedProduce (weight_g) must not count toward bogo or mix_and_match slots
+    expect(resMeasured.lines[0].discountCents).toBe(0);
   });
 });
 
@@ -854,6 +998,39 @@ describe("Milestone 2: SE Asia EMVCo QR (KHQR / PromptPay / PayNow), QR Matrix &
         reason: "Change coins for customer",
       }).success
     ).toBe(true);
+    expect(
+      UpdateStoreSettingsSchema.safeParse({
+        railFxRatesJson: { THB: 35.5, SGD: 1.35 },
+      }).success
+    ).toBe(true);
+    expect(UpdateStoreSettingsSchema.safeParse({ railFxRatesJson: null }).success).toBe(true);
+    expect(UpdateStoreSettingsSchema.safeParse({ railFxRatesJson: { THB: 0 } }).success).toBe(false);
+    expect(
+      UpdateStoreSettingsSchema.safeParse({ railFxRatesJson: { XYZ: 1.5 } }).success
+    ).toBe(false);
+
+    // 8. ISO/IEC 18004 bottom-left 7-bit format strip, terminal Tag 63, and UTF-8 CRC-16 (AUD-035)
+    for (const payload of [khqrUsd.payload, pp.payload, pn.payload]) {
+      const mat = generateQrMatrix(payload);
+      const topLeftHighBits = [
+        mat.modules[8][0],
+        mat.modules[8][1],
+        mat.modules[8][2],
+        mat.modules[8][3],
+        mat.modules[8][4],
+        mat.modules[8][5],
+        mat.modules[8][7],
+      ];
+      const bottomLeftStrip = Array.from({ length: 7 }, (_, i) => mat.modules[mat.size - 1 - i][8]);
+      expect(bottomLeftStrip).toEqual(topLeftHighBits);
+    }
+
+    const nonTerminalTag63 = `${khqrUsd.payload}9102OK`;
+    expect(parseEmvQrTlv(nonTerminalTag63).valid).toBe(false);
+
+    // UTF-8 bytes for "é" are [0xC3, 0xA9] -> CRC-16/CCITT-FALSE = 0x7ACB (vs 1-byte Latin-1)
+    expect(crc16CcittFalse("123456789")).toBe("29B1");
+    expect(crc16CcittFalse("é")).toBe("7ACB");
   });
 });
 

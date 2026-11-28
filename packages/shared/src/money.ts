@@ -1,8 +1,32 @@
+import type { UnitMode } from "./dtos.js";
+
 /**
  * Integer minor-unit currency & basis-point math utilities.
  * Zero floating-point operations for monetary ledger integrity.
  * 1 basis point (bp) = 0.01% (so 1000 bp = 10.00%, 10000 bp = 100.00%).
  */
+
+export function isMeasuredUnitMode(unitMode?: UnitMode | string | null): boolean {
+  return unitMode === "weight_g" || unitMode === "volume_ml";
+}
+
+export function unitCostDivisor(unitMode?: UnitMode | string | null): number {
+  return isMeasuredUnitMode(unitMode) ? 1000 : 1;
+}
+
+/**
+ * Compute monetary cost/value in integer cents from a base-unit quantity and unit cost,
+ * normalizing per-kg / per-L (per 1,000 base units) pricing when unitMode is weight_g or volume_ml.
+ */
+export function computeInventoryValueCents(
+  qtyBaseUnits: number,
+  unitCostCents: number,
+  unitMode: UnitMode | string | null = "each"
+): number {
+  if (!Number.isFinite(qtyBaseUnits) || !Number.isFinite(unitCostCents)) return 0;
+  const val = Math.round((qtyBaseUnits * unitCostCents) / unitCostDivisor(unitMode));
+  return val === 0 ? 0 : val;
+}
 
 export function formatMoney(cents: number, currencySymbol = "$"): string {
   const safe = Number.isFinite(cents) ? Math.round(cents) : 0;
@@ -68,18 +92,20 @@ export function computeSuggestedSellPriceCents(
 
 /**
  * Compute effective unit cost when a supplier gives free bonus stock (e.g. buy 10 cases get 1 free).
+ * For measured SKUs (weight_g / volume_ml), normalizes invoice total to cents per 1,000 base units (kg / L).
  */
 export function computeEffectiveUnitCostCents(
   invoiceLineTotalCents: number,
   paidBaseUnits: number,
-  freeBonusBaseUnits: number
+  freeBonusBaseUnits: number,
+  unitMode: UnitMode | string | null = "each"
 ): number {
   const safePaid = Number.isFinite(paidBaseUnits) ? Math.max(0, paidBaseUnits) : 0;
   const safeFree = Number.isFinite(freeBonusBaseUnits) ? Math.max(0, freeBonusBaseUnits) : 0;
   const totalUnits = safePaid + safeFree;
   if (totalUnits <= 0) return 0;
   const safeInvoice = Number.isFinite(invoiceLineTotalCents) ? Math.max(0, invoiceLineTotalCents) : 0;
-  return Math.round(safeInvoice / totalUnits);
+  return Math.round((safeInvoice * unitCostDivisor(unitMode)) / totalUnits);
 }
 
 /**

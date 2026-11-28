@@ -86,11 +86,13 @@ export interface EvaluatedCart {
 }
 
 function lineMatchesPromo(line: CartInputLine, promo: PromotionRule): boolean {
-  const hasProductScope = promo.productIds && promo.productIds.length > 0;
-  const hasCategoryScope = promo.categoryIds && promo.categoryIds.length > 0;
+  const productIds = Array.isArray(promo.productIds) ? promo.productIds : [];
+  const categoryIds = Array.isArray(promo.categoryIds) ? promo.categoryIds : [];
+  const hasProductScope = productIds.length > 0;
+  const hasCategoryScope = categoryIds.length > 0;
   if (!hasProductScope && !hasCategoryScope) return true; // storewide
-  if (hasProductScope && promo.productIds!.includes(line.productId)) return true;
-  if (hasCategoryScope && promo.categoryIds!.includes(line.categoryId)) return true;
+  if (hasProductScope && productIds.includes(line.productId)) return true;
+  if (hasCategoryScope && categoryIds.includes(line.categoryId)) return true;
   return false;
 }
 
@@ -173,6 +175,9 @@ export function isPromoActiveAtHour(promo: PromotionRule, evalHour?: number): bo
   }
   const start = promo.daypartStartHour;
   const end = promo.daypartEndHour;
+  if (start === end) {
+    return false;
+  }
   if (start < end) {
     return evalHour >= start && evalHour < end;
   }
@@ -282,13 +287,17 @@ export function evaluateCart(
   };
 
   for (const promo of sortedPromos) {
-    const eligible = working.filter(
-      (line) =>
-        line.qtyPacks > 0 &&
-        line.grossBeforeDiscountCents > line.discountCents &&
-        lineMatchesPromo(line, promo) &&
-        (!line.lockedNonCombinable || (promo.combinable && promo.promoType === "basket_threshold"))
-    );
+    const eligible = working.filter((line) => {
+      if (
+        line.qtyPacks <= 0 ||
+        line.grossBeforeDiscountCents <= line.discountCents ||
+        !lineMatchesPromo(line, promo)
+      ) {
+        return false;
+      }
+      if (line.appliedPromotions.length === 0) return true;
+      return promo.combinable && (!line.lockedNonCombinable || promo.promoType === "basket_threshold");
+    });
     if (eligible.length === 0) continue;
 
     if (
@@ -360,7 +369,12 @@ export function evaluateCart(
       // Restrict mix-and-match to matching UOM packQty (defaults to 1 = single) so multi-packs/cases cannot exploit single bundles
       const targetPackQty = promo.eligiblePackQty ?? 1;
       const requiredQty = Math.trunc(promo.requiredQty);
-      const packEligible = eligible.filter((line) => line.packQty === targetPackQty);
+      const packEligible = eligible.filter(
+        (line) =>
+          line.unitMode !== "weight_g" &&
+          line.unitMode !== "volume_ml" &&
+          line.packQty === targetPackQty
+      );
       type UnitSlot = { lineIdx: number; effectivePriceCents: number };
       const slots: UnitSlot[] = [];
       packEligible.forEach((line) => {
@@ -434,7 +448,12 @@ export function evaluateCart(
       const targetPackQty = promo.eligiblePackQty ?? 1;
       const buyQty = Math.trunc(promo.buyQty);
       const getQty = Math.trunc(promo.getQty);
-      const packEligible = eligible.filter((line) => line.packQty === targetPackQty);
+      const packEligible = eligible.filter(
+        (line) =>
+          line.unitMode !== "weight_g" &&
+          line.unitMode !== "volume_ml" &&
+          line.packQty === targetPackQty
+      );
       const groupSize = buyQty + getQty;
       const rawDiscountBp = promo.discountBp ?? 10000;
       const discountBp = Number.isFinite(rawDiscountBp)

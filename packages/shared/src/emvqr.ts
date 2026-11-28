@@ -41,14 +41,26 @@ export const ISO_CURRENCY_NUMERIC: Record<string, string> = {
   EUR: "978",
 };
 
+function toUtf8Bytes(text: string): number[] {
+  if (typeof TextEncoder !== "undefined") {
+    return Array.from(new TextEncoder().encode(text));
+  }
+  const out: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    out.push(text.charCodeAt(i) & 0xff);
+  }
+  return out;
+}
+
 /**
  * CRC-16/CCITT-FALSE (polynomial 0x1021, initial value 0xFFFF, no reflection, no final XOR)
  * per EMVCo QR Code Specification for Payment Systems (EMV QRCPS) Section 4.7.14.
  */
 export function crc16CcittFalse(input: string): string {
+  const bytes = toUtf8Bytes(input);
   let crc = 0xffff;
-  for (let i = 0; i < input.length; i++) {
-    crc ^= (input.charCodeAt(i) & 0xff) << 8;
+  for (const byte of bytes) {
+    crc ^= (byte & 0xff) << 8;
     for (let bit = 0; bit < 8; bit++) {
       if ((crc & 0x8000) !== 0) {
         crc = ((crc << 1) ^ 0x1021) & 0xffff;
@@ -315,7 +327,14 @@ export function buildPayNowPayload(input: PayNowInput): EmvQrBuildResult {
 export function parseEmvQrTlv(payload: string): ParsedEmvQr {
   const trimmed = payload.trim();
   const tags = decodeTlvMap(trimmed);
-  if (!tags || !tags["00"] || !tags["63"] || tags["63"].length !== 4) {
+  if (
+    !tags ||
+    !tags["00"] ||
+    !tags["63"] ||
+    tags["63"].length !== 4 ||
+    trimmed.length < 8 ||
+    trimmed.slice(-8, -4) !== "6304"
+  ) {
     return {
       valid: false,
       crcValid: false,
@@ -458,17 +477,6 @@ function rsRemainder(data: number[], ecLen: number): number[] {
     }
   }
   return rem;
-}
-
-function toUtf8Bytes(text: string): number[] {
-  if (typeof TextEncoder !== "undefined") {
-    return Array.from(new TextEncoder().encode(text));
-  }
-  const out: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    out.push(text.charCodeAt(i) & 0xff);
-  }
-  return out;
 }
 
 function selectMaskBit(mask: number, r: number, c: number): boolean {
@@ -677,7 +685,7 @@ export function generateQrMatrix(text: string): QrMatrixResult {
     for (let i = 9; i < 15; i++) grid[14 - i][8] = ((fmt >>> (14 - i)) & 1) === 1;
 
     for (let i = 0; i < 8; i++) grid[8][size - 1 - i] = ((fmt >>> i) & 1) === 1;
-    for (let i = 0; i < 7; i++) grid[size - 1 - i][8] = ((fmt >>> (8 + i)) & 1) === 1;
+    for (let i = 0; i < 7; i++) grid[size - 1 - i][8] = ((fmt >>> (14 - i)) & 1) === 1;
   };
 
   let bestMask = 0;
