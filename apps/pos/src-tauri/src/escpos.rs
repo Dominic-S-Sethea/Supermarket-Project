@@ -6,8 +6,10 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-/// ESC/POS init + bold + line feed + cut + RJ-11 drawer kick constants
+/// ESC/POS init + codepage + bold + cut + RJ-11 drawer kick constants
 const ESC_INIT: &[u8] = &[0x1B, 0x40];
+/// ESC t 19 -> PC858 (Multilingual Latin I + Euro sign) for thermal receipt printers
+pub const SELECT_CODEPAGE_PC858: &[u8] = &[0x1B, 0x74, 0x13];
 const ALIGN_CENTER: &[u8] = &[0x1B, 0x61, 0x01];
 const ALIGN_LEFT: &[u8] = &[0x1B, 0x61, 0x00];
 const BOLD_ON: &[u8] = &[0x1B, 0x45, 0x01];
@@ -52,6 +54,94 @@ pub fn sanitize_escpos_text(input: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// Sanitize C0/C1 control sequences and transliterate unsupported SE Asia / currency symbols
+/// (such as Cambodian Riel `៛` -> `KHR `, Thai Baht `฿` -> `THB `) for 80mm thermal codepages.
+pub fn normalize_escpos_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if c.is_control() {
+            out.push(' ');
+            continue;
+        }
+        match c {
+            '៛' => out.push_str("KHR "),
+            '฿' => out.push_str("THB "),
+            '€' => out.push_str("EUR "),
+            '£' => out.push_str("GBP "),
+            '¥' => out.push_str("JPY "),
+            '—' | '–' => out.push('-'),
+            '‘' | '’' => out.push('\''),
+            '“' | '”' => out.push('"'),
+            _ => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+fn is_combining_mark(c: char) -> bool {
+    let u = c as u32;
+    matches!(
+        u,
+        0x0300..=0x036F
+            | 0x0E31
+            | 0x0E34..=0x0E3A
+            | 0x0E47..=0x0E4E
+            | 0x17B4..=0x17D3
+            | 0x17DD
+            | 0xFE00..=0xFE0F
+    )
+}
+
+fn is_wide_char(c: char) -> bool {
+    let u = c as u32;
+    matches!(
+        u,
+        0x1100..=0x115F
+            | 0x2E80..=0x9FFF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+    )
+}
+
+/// Terminal / thermal-font column width estimate for a Unicode scalar value.
+pub fn char_display_width(c: char) -> usize {
+    if is_combining_mark(c) || c.is_control() {
+        0
+    } else if is_wide_char(c) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Truncate text to fit within `max_cols` terminal/thermal monospace columns without splitting wide glyphs.
+pub fn truncate_display_width(input: &str, max_cols: usize) -> String {
+    let mut width = 0usize;
+    let mut out = String::new();
+    for c in input.chars() {
+        let w = char_display_width(c);
+        if width + w > max_cols {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
+    out
+}
+
+fn format_receipt_row(left: &str, right: &str, total_cols: usize) -> String {
+    let clean_right = normalize_escpos_text(right);
+    let right_cols: usize = clean_right.chars().map(char_display_width).sum();
+    let max_left_cols = total_cols.saturating_sub(right_cols + 1);
+    let trimmed_left = truncate_display_width(&normalize_escpos_text(left), max_left_cols);
+    let left_cols: usize = trimmed_left.chars().map(char_display_width).sum();
+    let pad = total_cols.saturating_sub(left_cols + right_cols).max(1);
+    format!("{trimmed_left}{}{clean_right}\n", " ".repeat(pad))
 }
 
 /// Standard raw/LPD/IPP thermal receipt printer TCP ports (Epson, Star, Xprinter, Bixolon).
@@ -110,18 +200,19 @@ pub fn validate_lan_printer_addr(addr: &str) -> Result<SocketAddr, String> {
 pub fn build_escpos_receipt(receipt: &ReceiptPayload) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     buf.extend_from_slice(ESC_INIT);
+    buf.extend_from_slice(SELECT_CODEPAGE_PC858);
     buf.extend_from_slice(ALIGN_CENTER);
     buf.extend_from_slice(BOLD_ON);
-    buf.extend_from_slice(format!("{}\n", sanitize_escpos_text(&receipt.store_name)).as_bytes());
+    buf.extend_from_slice(format!("{}\n", normalize_escpos_text(&receipt.store_name)).as_bytes());
     buf.extend_from_slice(BOLD_OFF);
     buf.extend_from_slice(
-        format!("Receipt: {}\n", sanitize_escpos_text(&receipt.receipt_no)).as_bytes(),
+        format!("Receipt: {}\n", normalize_escpos_text(&receipt.receipt_no)).as_bytes(),
     );
     buf.extend_from_slice(
         format!(
             "{} | {}\n",
-            sanitize_escpos_text(&receipt.timestamp),
-            sanitize_escpos_text(&receipt.cashier)
+            normalize_escpos_text(&receipt.timestamp),
+            normalize_escpos_text(&receipt.cashier)
         )
         .as_bytes(),
     );
@@ -132,52 +223,27 @@ pub fn build_escpos_receipt(receipt: &ReceiptPayload) -> Vec<u8> {
         let label = format!(
             "{}x {} ({})",
             line.qty,
-            sanitize_escpos_text(&line.name),
-            sanitize_escpos_text(&line.pack_label)
+            normalize_escpos_text(&line.name),
+            normalize_escpos_text(&line.pack_label)
         );
-        let trimmed: String = label.chars().take(36).collect();
-        let row = format!(
-            "{:<36}{:>12}\n",
-            trimmed,
-            sanitize_escpos_text(&line.total_formatted)
-        );
+        let row = format_receipt_row(&label, &line.total_formatted, 48);
         buf.extend_from_slice(row.as_bytes());
     }
 
     buf.extend_from_slice(b"------------------------------------------------\n");
     buf.extend_from_slice(
-        format!(
-            "{:<36}{:>12}\n",
-            "Promotions / Discount:",
-            sanitize_escpos_text(&receipt.discount_formatted)
-        )
-        .as_bytes(),
+        format_receipt_row("Promotions / Discount:", &receipt.discount_formatted, 48).as_bytes(),
     );
     buf.extend_from_slice(
-        format!(
-            "{:<36}{:>12}\n",
-            "Included Tax:",
-            sanitize_escpos_text(&receipt.tax_formatted)
-        )
-        .as_bytes(),
+        format_receipt_row("Included Tax:", &receipt.tax_formatted, 48).as_bytes(),
     );
     buf.extend_from_slice(BOLD_ON);
     buf.extend_from_slice(
-        format!(
-            "{:<36}{:>12}\n",
-            "TOTAL:",
-            sanitize_escpos_text(&receipt.total_formatted)
-        )
-        .as_bytes(),
+        format_receipt_row("TOTAL:", &receipt.total_formatted, 48).as_bytes(),
     );
     buf.extend_from_slice(BOLD_OFF);
     buf.extend_from_slice(
-        format!(
-            "{:<36}{:>12}\n",
-            "Tender:",
-            sanitize_escpos_text(&receipt.payment_method)
-        )
-        .as_bytes(),
+        format_receipt_row("Tender:", &receipt.payment_method, 48).as_bytes(),
     );
     buf.extend_from_slice(b"\n");
     buf.extend_from_slice(ALIGN_CENTER);
@@ -301,5 +367,14 @@ mod tests {
         assert!(reencoded.contains("REG-01-9999"));
         let bytes = build_escpos_receipt(&parsed);
         assert!(bytes.len() < MAX_RECEIPT_BYTES);
+    }
+
+    #[test]
+    fn normalizes_sea_currency_and_handles_display_width_truncation() {
+        assert_eq!(normalize_escpos_text("Total ៛40,000 / ฿120"), "Total KHR 40,000 / THB 120");
+        assert_eq!(truncate_display_width("ABC中DEF", 5), "ABC中");
+        let row = format_receipt_row("1x 中文字母测试商品", "$12.50", 48);
+        assert!(row.ends_with("$12.50\n"));
+        assert!(row.contains("1x"));
     }
 }

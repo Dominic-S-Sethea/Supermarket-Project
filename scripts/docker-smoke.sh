@@ -81,13 +81,18 @@ for i in $(seq 1 30); do
 done
 echo "  ✓ GET /api/health via Nginx -> 200 connected"
 
-echo "[docker-smoke] Verifying Nginx SPA root & security headers (CSP, HSTS, X-Frame-Options)..."
+echo "[docker-smoke] Verifying Nginx SPA root & security headers (CSP, conditional HSTS, X-Frame-Options)..."
 SPA_HTML=$(curl -sfD - "http://127.0.0.1:${HOST_PORT}/")
 echo "$SPA_HTML" | grep -qi "X-Frame-Options: DENY"
 echo "$SPA_HTML" | grep -qi "Content-Security-Policy:"
-echo "$SPA_HTML" | grep -qi "Strict-Transport-Security:"
+if echo "$SPA_HTML" | grep -qi "Strict-Transport-Security:"; then
+  echo "[docker-smoke] ERROR: Plain HTTP response unexpectedly emitted Strict-Transport-Security" >&2
+  exit 1
+fi
 echo "$SPA_HTML" | grep -q "SupermarketOS"
-echo "  ✓ GET / served built SPA with CSP, HSTS & X-Frame-Options: DENY"
+HTTPS_HEADERS=$(curl -sfD - -o /dev/null -H "X-Forwarded-Proto: https" "http://127.0.0.1:${HOST_PORT}/")
+echo "$HTTPS_HEADERS" | grep -qi "Strict-Transport-Security:"
+echo "  ✓ GET / served built SPA with CSP, X-Frame-Options: DENY & TLS-conditional HSTS"
 
 echo "[docker-smoke] Verifying /api/openapi.json blocks unauthenticated requests (401)..."
 OPENAPI_UNAUTH=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${HOST_PORT}/api/openapi.json")

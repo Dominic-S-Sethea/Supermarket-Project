@@ -1,13 +1,16 @@
 import type { FastifyInstance } from "fastify";
 import { CreateUserSchema, UpdateStoreSettingsSchema, UpdateUserSchema } from "@supermarket/shared";
-import { and, desc, eq, gt, ilike, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, ilike, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getPgErrorCode } from "../app.js";
 import { env } from "../config/env.js";
 import {
+  aiMessages,
   analyticsPipelineRuns,
   auditLogs,
+  customers,
   db,
+  parkedBaskets,
   posShifts,
   storeSettings,
   userSessions,
@@ -556,4 +559,133 @@ export async function adminRoutes(app: FastifyInstance) {
       return { settings: updated };
     }
   );
+
+  // =========================================================================
+  // PRIVACY & DATA GOVERNANCE (OWNER-ONLY ERASURE & RETENTION PURGE)
+  // =========================================================================
+  app.post(
+    "/api/admin/customers/:id/anonymize",
+    { preHandler: [requireRole(["owner"]), adminMutationLimiter] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      if (!UuidSchema.safeParse(id).success) {
+        return reply.status(400).send({ error: "Invalid customer ID format." });
+      }
+      const bodySchema = z.object({ reason: z.string().trim().max(300).optional() });
+      const parsedBody = bodySchema.safeParse(req.body ?? {});
+      if (!parsedBody.success) {
+        return reply.status(400).send({ error: parsedBody.error.flatten() });
+      }
+
+      const outcome = await db.transaction(async (tx) => {
+        const [existing] = await tx
+          .select({ id: customers.id })
+          .from(customers)
+          .where(eq(customers.id, id))
+          .for("update");
+        if (!existing) return null;
+
+        const [updated] = await tx
+          .update(customers)
+          .set({
+            fullName: "Anonymized Customer",
+            phone: `ANON-${id}`,
+            email: null,
+          })
+          .where(eq(customers.id, id))
+          .returning({
+            id: customers.id,
+            fullName: customers.fullName,
+            phone: customers.phone,
+            email: customers.email,
+            pointsBalance: customers.pointsBalance,
+            rfmSegment: customers.rfmSegment,
+          });
+
+        await tx
+          .update(parkedBaskets)
+          .set({ customerLabel: null })
+          .where(eq(parkedBaskets.customerId, id));
+
+        await tx.insert(auditLogs).values({
+          actor: req.authUser!.fullName,
+          actorUserId: req.authUser!.id,
+          action: "customer_anonymize",
+          entityType: "customer",
+          entityId: id,
+          detailsJson: {
+            reason: parsedBody.data.reason || "Customer privacy anonymization request",
+          },
+        });
+        return updated;
+      });
+
+      if (!outcome) return reply.status(404).send({ error: "Customer not found." });
+      return { customer: outcome };
+    }
+  );
+
+  app.post(
+    "/api/admin/retention/purge",
+    { preHandler: [requireRole(["owner"]), adminMutationLimiter] },
+    async (req, reply) => {
+      const schema = z.object({
+        sessionRetentionDays: z.coerce.number().int().min(1).max(365).default(30),
+        aiMessageRetentionDays: z.coerce.number().int().min(7).max(730).default(90),
+      });
+      const parsed = schema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.flatten() });
+      }
+
+      const { sessionRetentionDays, aiMessageRetentionDays } = parsed.data;
+      const now = new Date();
+      const sessionCutoff = new Date(now.getTime() - sessionRetentionDays * 86400_000);
+      const aiMsgCutoff = new Date(now.getTime() - aiMessageRetentionDays * 86400_000);
+
+      const result = await db.transaction(async (tx) => {
+        const deletedSess = await tx
+          .delete(userSessions)
+          .where(
+            and(
+              lt(userSessions.createdAt, sessionCutoff),
+              or(lt(userSessions.expiresAt, now), isNotNull(userSessions.revokedAt))
+            )
+          )
+          .returning({ jti: userSessions.jti });
+
+        const deletedMsgs = await tx
+          .delete(aiMessages)
+          .where(
+            and(
+              lt(aiMessages.createdAt, aiMsgCutoff),
+              sql`NOT EXISTS (SELECT 1 FROM ai_proposed_actions a WHERE a.message_id = ${aiMessages.id})`
+            )
+          )
+          .returning({ id: aiMessages.id });
+
+        await tx.insert(auditLogs).values({
+          actor: req.authUser!.fullName,
+          actorUserId: req.authUser!.id,
+          action: "retention_purge",
+          entityType: "system",
+          entityId: "retention",
+          detailsJson: {
+            sessionRetentionDays,
+            aiMessageRetentionDays,
+            deletedSessions: deletedSess.length,
+            deletedAiMessages: deletedMsgs.length,
+          },
+        });
+
+        return {
+          deletedSessions: deletedSess.length,
+          deletedAiMessages: deletedMsgs.length,
+        };
+      });
+
+      return result;
+    }
+  );
 }
+

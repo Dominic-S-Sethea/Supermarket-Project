@@ -2,9 +2,9 @@ name: SupermarketOS CI
 
 on:
   push:
-    branches: [main, "overnight/**", "audit/**"]
+    branches: [main, master, "feat/**", "overnight/**", "audit/**"]
   pull_request:
-    branches: [main]
+    branches: [main, master]
   schedule:
     - cron: "0 3 * * 0"
   workflow_dispatch:
@@ -22,11 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 12.21.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -43,11 +43,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 12.21.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -65,12 +65,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
       - name: Run Python analytics pytest suite
-        run: uv --directory services/analytics run pytest -v
+        run: uv --directory services/analytics run --frozen pytest -v
       - name: Run Rust Clippy (-D warnings) & ESC/POS unit tests
         run: |
           cargo clippy --manifest-path apps/pos/src-tauri/Cargo.toml --all-targets -- -D warnings
@@ -82,7 +82,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
         env:
           POSTGRES_USER: supermarket
           POSTGRES_PASSWORD: supermarket_dev_password
@@ -96,13 +96,14 @@ jobs:
           --health-retries=15
     env:
       DATABASE_URL: postgres://supermarket:supermarket_dev_password@localhost:5433/supermarket_os_api_ci
+      DATABASE_URL_TEST: postgres://supermarket:supermarket_dev_password@localhost:5433/supermarket_os_api_ci
       AUTH_SECRET: ci-test-auth-secret-minimum-thirty-two-characters-long
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 12.21.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -122,7 +123,7 @@ jobs:
     needs: [lint-typecheck-build]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
         env:
           POSTGRES_USER: supermarket
           POSTGRES_PASSWORD: supermarket_dev_password
@@ -139,15 +140,15 @@ jobs:
       AUTH_SECRET: ci-test-auth-secret-minimum-thirty-two-characters-long
       E2E_NODE_ENV: production
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 12.21.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
       - run: pnpm install --frozen-lockfile
@@ -165,7 +166,7 @@ jobs:
           pnpm test:e2e
       - name: Upload Playwright report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: playwright-report
           path: playwright-report/
@@ -178,11 +179,11 @@ jobs:
     timeout-minutes: 25
     needs: [lint-typecheck-build, api-integration-and-security]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 12.21.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -194,7 +195,7 @@ jobs:
             -e POSTGRES_USER=supermarket \
             -e POSTGRES_PASSWORD=supermarket_dev_password \
             -e POSTGRES_DB=supermarket_os \
-            -p 5433:5432 postgres:16-alpine
+            -p 5433:5432 postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
           for i in $(seq 1 20); do
             docker exec supermarket-os-postgres pg_isready -U supermarket -d supermarket_os && break
             sleep 1

@@ -2,7 +2,7 @@
 name = "supermarket-pos-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "Tauri 2 Offline-First POS Desktop Shell with ESC/POS LAN Printer & RJ-11 Cash Drawer Bridge"
+description = "Rust ESC/POS thermal receipt encoder & RJ-11 cash-drawer LAN library crate for SupermarketOS (Tauri desktop shell pending)"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

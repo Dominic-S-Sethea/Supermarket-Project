@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # SupermarketOS Disaster-Recovery Backup & Restore Verification Script (M-23)
 # Proves a consistent pg_dump custom archive restores cleanly into an isolated database
-# and validates EVERY table in the `public` schema plus SQL views.
+# and validates EVERY table in the `public` schema plus SQL views dynamically.
 #
 # Modes:
 #   STRICT_PARITY=1 (default): requires exact row-count parity for every public table
 #                              (ideal for CI / quiescent maintenance windows).
 #   STRICT_PARITY=0          : tolerates live concurrent writes after snapshot start
 #                              while still verifying every table restores with 0 errors
-#                              and core transactional/catalog tables are non-empty.
+#                              and dynamic parity for views/core tables.
 
 PG_CONTAINER="${PG_CONTAINER:-supermarket-os-postgres}"
 PG_USER="${POSTGRES_USER:-supermarket}"
 SRC_DB="${POSTGRES_DB:-supermarket_os}"
 VERIFY_DB="supermarket_os_restore_verify_$$"
-DUMP_PATH="/tmp/smos_dr_backup_$$.dump"
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/smos_dr_verify.XXXXXX")
+chmod 700 "$TMP_DIR"
+DUMP_PATH="${TMP_DIR}/backup.dump"
 STRICT_PARITY="${STRICT_PARITY:-1}"
 
 cleanup() {
   docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -v ON_ERROR_STOP=1 \
     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${VERIFY_DB}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
   docker exec "$PG_CONTAINER" dropdb -U "$PG_USER" --if-exists "$VERIFY_DB" >/dev/null 2>&1 || true
-  rm -f "$DUMP_PATH"
+  rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
@@ -99,17 +102,29 @@ for tbl in "${SRC_TABLES[@]}"; do
   printf "  ✓ %-34s %8s rows (source=%s)\n" "$tbl" "$dst_cnt" "$src_cnt"
 done
 
-# Always assert core catalog & auth tables are populated in the restored DB
-for core_tbl in products product_barcodes users sales sale_lines; do
-  if [[ "${DST_COUNTS[$core_tbl]:-0}" -le 0 ]]; then
-    echo "[dr-backup] ERROR: Core table ${core_tbl} restored with 0 rows" >&2
+# Assert critical non-empty source tables restored with >0 rows
+if [[ "${DST_COUNTS[users]:-0}" -le 0 ]]; then
+  echo "[dr-backup] ERROR: Core table users restored with 0 rows" >&2
+  exit 1
+fi
+for core_tbl in products product_barcodes sales sale_lines; do
+  if [[ "${SRC_COUNTS[$core_tbl]:-0}" -gt 0 && "${DST_COUNTS[$core_tbl]:-0}" -le 0 ]]; then
+    echo "[dr-backup] ERROR: Non-empty source table ${core_tbl} restored with 0 rows" >&2
     exit 1
   fi
 done
 
-echo "[dr-backup] Verifying restored v_product_live_stock view..."
+echo "[dr-backup] Verifying restored v_product_live_stock view dynamically..."
+src_view_cnt=$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$SRC_DB" -tAc "SELECT COUNT(*) FROM v_product_live_stock;")
 view_cnt=$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$VERIFY_DB" -tAc "SELECT COUNT(*) FROM v_product_live_stock;")
-echo "  ✓ v_product_live_stock returned ${view_cnt} SKU live stock rows"
-test "$view_cnt" -ge 3000
+echo "  ✓ v_product_live_stock returned ${view_cnt} rows (source=${src_view_cnt})"
+if [[ "$STRICT_PARITY" == "1" && "$view_cnt" != "$src_view_cnt" ]]; then
+  echo "[dr-backup] ERROR: v_product_live_stock row mismatch (source=${src_view_cnt} restored=${view_cnt})" >&2
+  exit 1
+fi
+if [[ "$src_view_cnt" -gt 0 && "$view_cnt" -le 0 ]]; then
+  echo "[dr-backup] ERROR: v_product_live_stock restored empty unexpectedly" >&2
+  exit 1
+fi
 
 echo "[dr-backup] SUCCESS: All ${#SRC_TABLES[@]} public tables & SQL views verified cleanly."

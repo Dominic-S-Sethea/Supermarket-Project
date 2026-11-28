@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -34,6 +34,9 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.analytics
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
     security_opt:
@@ -42,10 +45,16 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-supermarket}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-supermarket_os}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-supermarket}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DB:-supermarket_os}
       ANALYTICS_WORKER_HOST: 0.0.0.0
       ANALYTICS_WORKER_PORT: 8090
-      ANALYTICS_WORKER_TOKEN: ${ANALYTICS_WORKER_TOKEN:-}
+      ANALYTICS_WORKER_TOKEN: ${ANALYTICS_WORKER_TOKEN:?Set ANALYTICS_WORKER_TOKEN in .env}
+      ANALYTICS_STATEMENT_TIMEOUT_MS: ${ANALYTICS_STATEMENT_TIMEOUT_MS:-60000}
+      ANALYTICS_LOCK_TIMEOUT_MS: ${ANALYTICS_LOCK_TIMEOUT_MS:-5000}
     deploy:
       resources:
         limits:
@@ -57,6 +66,9 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.api
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
     security_opt:
@@ -71,7 +83,11 @@ services:
       HOST: 0.0.0.0
       PORT: 4000
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      DATABASE_URL: postgres://${POSTGRES_USER:-supermarket}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-supermarket_os}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-supermarket}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DB:-supermarket_os}
       AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET (>= 32 chars) in .env}
       AUTH_SECRET_PREVIOUS: ${AUTH_SECRET_PREVIOUS:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
@@ -80,8 +96,13 @@ services:
       METRICS_TOKEN: ${METRICS_TOKEN:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_STORE_INTERACTIONS: ${GEMINI_STORE_INTERACTIONS:-false}
+      GEMINI_TIMEOUT_MS: ${GEMINI_TIMEOUT_MS:-25000}
+      AI_REDACT_STAFF_PII: ${AI_REDACT_STAFF_PII:-true}
+      AI_MAX_PROMO_DISCOUNT_BP: ${AI_MAX_PROMO_DISCOUNT_BP:-5000}
+      AI_ACTION_TTL_HOURS: ${AI_ACTION_TTL_HOURS:-24}
       ANALYTICS_WORKER_URL: http://analytics:8090
-      ANALYTICS_WORKER_TOKEN: ${ANALYTICS_WORKER_TOKEN:-}
+      ANALYTICS_WORKER_TOKEN: ${ANALYTICS_WORKER_TOKEN:?Set ANALYTICS_WORKER_TOKEN in .env}
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-}
       ENABLE_OPENAPI_DOCS: ${ENABLE_OPENAPI_DOCS:-true}
       PG_POOL_MAX: ${PG_POOL_MAX:-20}
       PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-15000}
@@ -101,6 +122,11 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.web
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
     cap_drop:
       - ALL
     security_opt:
