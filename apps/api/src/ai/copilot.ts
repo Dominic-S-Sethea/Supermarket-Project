@@ -36,7 +36,7 @@ export function isGeminiConfigured(): boolean {
   return Boolean(process.env.GEMINI_API_KEY?.trim());
 }
 
-function sanitizeGeminiError(err: unknown): string {
+export function sanitizeGeminiError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
   const redacted = raw
     .replace(/AIza[0-9A-Za-z_-]{10,}/g, "[REDACTED_KEY]")
@@ -46,16 +46,73 @@ function sanitizeGeminiError(err: unknown): string {
   return redacted.length > 140 ? `${redacted.slice(0, 137)}...` : redacted || "upstream error";
 }
 
+function createAbortError(message = "Aborted"): Error {
+  const err = new Error(message);
+  err.name = "AbortError";
+  return err;
+}
+
+export function raceWithTimeoutAndAbort<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  externalSignal?: AbortSignal
+): Promise<T> {
+  if (externalSignal?.aborted) {
+    return Promise.reject(createAbortError("Request aborted by client"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(createAbortError("Request aborted by client"));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error(`Gemini request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    externalSignal?.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (val) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(val);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      }
+    );
+  });
+}
+
 export async function runCopilotTurn(
   userMessage: string,
   previousInteractionId: string | null,
-  ctx: CopilotToolContext
+  ctx: CopilotToolContext,
+  signal?: AbortSignal
 ): Promise<CopilotRunResult> {
+  if (signal?.aborted) {
+    throw createAbortError("Copilot request aborted");
+  }
   if (isGeminiConfigured()) {
     try {
-      return await runGeminiInteractionsTurn(userMessage, previousInteractionId, ctx);
+      return await runGeminiInteractionsTurn(userMessage, previousInteractionId, ctx, signal);
     } catch (err) {
-      const fallback = await runLocalFallbackTurn(userMessage, ctx);
+      if (signal?.aborted || (err as Error).name === "AbortError") {
+        throw err;
+      }
+      const fallback = await runLocalFallbackTurn(userMessage, ctx, undefined, signal);
       const errMsg = sanitizeGeminiError(err);
       return {
         ...fallback,
@@ -63,74 +120,111 @@ export async function runCopilotTurn(
       };
     }
   }
-  return runLocalFallbackTurn(userMessage, ctx);
+  return runLocalFallbackTurn(userMessage, ctx, undefined, signal);
 }
 
 export async function runCopilotTurnStream(
   userMessage: string,
   previousInteractionId: string | null,
   ctx: CopilotToolContext,
-  emit: (event: CopilotStreamEvent) => void
+  emit: (event: CopilotStreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<CopilotRunResult> {
+  if (signal?.aborted) {
+    throw createAbortError("Copilot stream aborted");
+  }
   if (isGeminiConfigured()) {
     try {
-      return await runGeminiInteractionsTurnStream(userMessage, previousInteractionId, ctx, emit);
+      return await runGeminiInteractionsTurnStream(
+        userMessage,
+        previousInteractionId,
+        ctx,
+        emit,
+        signal
+      );
     } catch (err) {
+      if (signal?.aborted || (err as Error).name === "AbortError") {
+        throw err;
+      }
       const errMsg = sanitizeGeminiError(err);
-      emit({ type: "delta", text: `> Gemini API unavailable (${errMsg}). Switched to Local Tool Mode.\n\n` });
-      const fallback = await runLocalFallbackTurn(userMessage, ctx, emit);
-      await streamTextChunks(fallback.replyText, emit);
+      emit({
+        type: "delta",
+        text: `> Gemini API unavailable (${errMsg}). Switched to Local Tool Mode.\n\n`,
+      });
+      const fallback = await runLocalFallbackTurn(userMessage, ctx, emit, signal);
+      await streamTextChunks(fallback.replyText, emit, signal);
       return {
         ...fallback,
         replyText: `> Gemini API unavailable (${errMsg}). Switched to Local Tool Mode.\n\n${fallback.replyText}`,
       };
     }
   }
-  const fallback = await runLocalFallbackTurn(userMessage, ctx, emit);
-  await streamTextChunks(fallback.replyText, emit);
+  const fallback = await runLocalFallbackTurn(userMessage, ctx, emit, signal);
+  await streamTextChunks(fallback.replyText, emit, signal);
   return fallback;
 }
 
 async function streamTextChunks(
   text: string,
-  emit: (event: CopilotStreamEvent) => void
+  emit: (event: CopilotStreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const words = text.split(/(\s+)/);
   const chunkSize = 6;
   for (let i = 0; i < words.length; i += chunkSize) {
+    if (signal?.aborted) {
+      throw createAbortError("Stream cancelled");
+    }
     emit({ type: "delta", text: words.slice(i, i + chunkSize).join("") });
     await new Promise((r) => setTimeout(r, 8));
   }
 }
 
+type InteractionInput = Parameters<GoogleGenAI["interactions"]["create"]>[0]["input"];
+
 async function runGeminiInteractionsTurn(
   userMessage: string,
   previousInteractionId: string | null,
-  ctx: CopilotToolContext
+  ctx: CopilotToolContext,
+  signal?: AbortSignal
 ): Promise<CopilotRunResult> {
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY!.trim() });
-  const model = "gemini-4-hydrogen";
+  const model = env.geminiCopilotModel;
   const toolTraces: ToolTraceItem[] = [];
   const storeInteractions = env.geminiStoreInteractions;
+  const statelessHistory: Record<string, unknown>[] = [{ type: "text", text: userMessage }];
 
-  let interaction = await ai.interactions.create({
-    model,
-    input: userMessage,
-    system_instruction: SYSTEM_INSTRUCTION,
-    tools: COPILOT_TOOLS as unknown as Parameters<typeof ai.interactions.create>[0]["tools"],
-    previous_interaction_id: storeInteractions ? (previousInteractionId ?? undefined) : undefined,
-    store: storeInteractions,
-  });
+  let currentInput: InteractionInput = storeInteractions
+    ? userMessage
+    : (statelessHistory as unknown as InteractionInput);
+
+  let interaction = await raceWithTimeoutAndAbort(
+    ai.interactions.create(
+      {
+        model,
+        input: currentInput,
+        system_instruction: SYSTEM_INSTRUCTION,
+        tools: COPILOT_TOOLS as unknown as Parameters<typeof ai.interactions.create>[0]["tools"],
+        previous_interaction_id: storeInteractions ? (previousInteractionId ?? undefined) : undefined,
+        store: storeInteractions,
+      },
+      { signal, timeout: env.geminiTimeoutMs }
+    ),
+    env.geminiTimeoutMs,
+    signal
+  );
 
   for (let round = 0; round < 6; round++) {
+    if (signal?.aborted) throw createAbortError("Copilot turn aborted");
     const fnCalls = (interaction.steps ?? []).filter(
       (s): s is Extract<NonNullable<typeof interaction.steps>[number], { type: "function_call" }> =>
         s.type === "function_call"
     );
     if (fnCalls.length === 0) break;
 
-    const resultsInput = [];
+    const resultsInput: Record<string, unknown>[] = [];
     for (const fc of fnCalls) {
+      if (signal?.aborted) throw createAbortError("Copilot turn aborted");
       const args = (fc.arguments ?? {}) as Record<string, unknown>;
       const result = await executeCopilotTool(fc.name, args, ctx);
       toolTraces.push({
@@ -138,22 +232,41 @@ async function runGeminiInteractionsTurn(
         args,
         summary: summarizeToolResult(fc.name, result),
       });
-      resultsInput.push({
-        type: "function_result" as const,
+      const callBlock = {
+        type: "function_call",
+        id: fc.id,
+        name: fc.name,
+        arguments: args,
+      };
+      const resultBlock = {
+        type: "function_result",
         call_id: fc.id,
         name: fc.name,
         result: JSON.stringify(result),
-      });
+      };
+      resultsInput.push(resultBlock);
+      statelessHistory.push(callBlock, resultBlock);
     }
 
-    interaction = await ai.interactions.create({
-      model,
-      input: resultsInput,
-      system_instruction: SYSTEM_INSTRUCTION,
-      tools: COPILOT_TOOLS as unknown as Parameters<typeof ai.interactions.create>[0]["tools"],
-      previous_interaction_id: storeInteractions ? interaction.id : undefined,
-      store: storeInteractions,
-    });
+    currentInput = (storeInteractions
+      ? resultsInput
+      : statelessHistory) as unknown as InteractionInput;
+
+    interaction = await raceWithTimeoutAndAbort(
+      ai.interactions.create(
+        {
+          model,
+          input: currentInput,
+          system_instruction: SYSTEM_INSTRUCTION,
+          tools: COPILOT_TOOLS as unknown as Parameters<typeof ai.interactions.create>[0]["tools"],
+          previous_interaction_id: storeInteractions ? interaction.id : undefined,
+          store: storeInteractions,
+        },
+        { signal, timeout: env.geminiTimeoutMs }
+      ),
+      env.geminiTimeoutMs,
+      signal
+    );
   }
 
   return {
@@ -171,31 +284,44 @@ async function runGeminiInteractionsTurnStream(
   userMessage: string,
   previousInteractionId: string | null,
   ctx: CopilotToolContext,
-  emit: (event: CopilotStreamEvent) => void
+  emit: (event: CopilotStreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<CopilotRunResult> {
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY!.trim() });
-  const model = "gemini-4-hydrogen";
+  const model = env.geminiCopilotModel;
   const toolTraces: ToolTraceItem[] = [];
   const storeInteractions = env.geminiStoreInteractions;
+  const statelessHistory: Record<string, unknown>[] = [{ type: "text", text: userMessage }];
   let currentPrevId = storeInteractions ? (previousInteractionId ?? undefined) : undefined;
-  let currentInput: Parameters<typeof ai.interactions.create>[0]["input"] = userMessage;
+  let currentInput: InteractionInput = storeInteractions
+    ? userMessage
+    : (statelessHistory as unknown as InteractionInput);
   let fullText = "";
 
   for (let round = 0; round < 6; round++) {
+    if (signal?.aborted) throw createAbortError("Copilot stream aborted");
     let roundInteractionId: string | null = null;
     let roundFnCalls: { id: string; name: string; arguments: Record<string, unknown> }[] = [];
 
-    const stream = await ai.interactions.create({
-      model,
-      input: currentInput,
-      system_instruction: SYSTEM_INSTRUCTION,
-      tools: COPILOT_TOOLS as unknown as Parameters<typeof ai.interactions.create>[0]["tools"],
-      previous_interaction_id: currentPrevId,
-      store: storeInteractions,
-      stream: true,
-    });
+    const stream = await raceWithTimeoutAndAbort(
+      ai.interactions.create(
+        {
+          model,
+          input: currentInput,
+          system_instruction: SYSTEM_INSTRUCTION,
+          tools: COPILOT_TOOLS as unknown as Parameters<typeof ai.interactions.create>[0]["tools"],
+          previous_interaction_id: storeInteractions ? currentPrevId : undefined,
+          store: storeInteractions,
+          stream: true,
+        },
+        { signal, timeout: env.geminiTimeoutMs }
+      ),
+      env.geminiTimeoutMs,
+      signal
+    );
 
     for await (const event of stream) {
+      if (signal?.aborted) throw createAbortError("Copilot stream aborted");
       if (event.event_type === "step.delta" && event.delta.type === "text" && event.delta.text) {
         fullText += event.delta.text;
         emit({ type: "delta", text: event.delta.text });
@@ -215,24 +341,35 @@ async function runGeminiInteractionsTurnStream(
       }
     }
 
-    if (roundInteractionId) currentPrevId = roundInteractionId;
+    if (storeInteractions && roundInteractionId) currentPrevId = roundInteractionId;
     if (roundFnCalls.length === 0) break;
 
-    const resultsInput = [];
+    const resultsInput: Record<string, unknown>[] = [];
     for (const fc of roundFnCalls) {
+      if (signal?.aborted) throw createAbortError("Copilot stream aborted");
       emit({ type: "tool_call", tool: fc.name, args: fc.arguments });
       const result = await executeCopilotTool(fc.name, fc.arguments, ctx);
       const summary = summarizeToolResult(fc.name, result);
       toolTraces.push({ tool: fc.name, args: fc.arguments, summary });
       emit({ type: "tool_result", tool: fc.name, summary });
-      resultsInput.push({
-        type: "function_result" as const,
+      const callBlock = {
+        type: "function_call",
+        id: fc.id,
+        name: fc.name,
+        arguments: fc.arguments,
+      };
+      const resultBlock = {
+        type: "function_result",
         call_id: fc.id,
         name: fc.name,
         result: JSON.stringify(result),
-      });
+      };
+      resultsInput.push(resultBlock);
+      statelessHistory.push(callBlock, resultBlock);
     }
-    currentInput = resultsInput;
+    currentInput = (storeInteractions
+      ? resultsInput
+      : statelessHistory) as unknown as InteractionInput;
   }
 
   return {
@@ -241,7 +378,7 @@ async function runGeminiInteractionsTurnStream(
       "I checked the live store ledger and prepared the requested items.",
     mode: "gemini",
     model,
-    interactionId: currentPrevId ?? null,
+    interactionId: storeInteractions ? (currentPrevId ?? null) : null,
     toolTraces,
   };
 }
@@ -249,15 +386,18 @@ async function runGeminiInteractionsTurnStream(
 async function runLocalFallbackTurn(
   userMessage: string,
   ctx: CopilotToolContext,
-  emit?: (event: CopilotStreamEvent) => void
+  emit?: (event: CopilotStreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<CopilotRunResult> {
   const q = userMessage.toLowerCase();
   const toolTraces: ToolTraceItem[] = [];
   const sections: string[] = [];
 
   const callAndTrace = async (name: string, args: Record<string, unknown> = {}) => {
+    if (signal?.aborted) throw createAbortError("Copilot turn aborted");
     emit?.({ type: "tool_call", tool: name, args });
     const res = await executeCopilotTool(name, args, ctx);
+    if (signal?.aborted) throw createAbortError("Copilot turn aborted");
     const summary = summarizeToolResult(name, res);
     toolTraces.push({ tool: name, args, summary });
     emit?.({ type: "tool_result", tool: name, summary });
@@ -628,7 +768,7 @@ async function runLocalFallbackTurn(
   }
 
   const footer =
-    `\n\n---\n*Running in Local Tool Mode against live PostgreSQL — set \`GEMINI_API_KEY\` to enable Gemini 4 Hydrogen conversational reasoning.*`;
+    `\n\n---\n*Running in Local Tool Mode against live PostgreSQL — set \`GEMINI_API_KEY\` to enable Gemini conversational reasoning.*`;
 
   return {
     replyText: sections.join("\n\n") + footer,

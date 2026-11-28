@@ -576,3 +576,201 @@ def test_analytics_http_worker_auth_and_recompute_lock():
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_lp_risk_levels_match_dq_contract():
+    import inspect
+    from run_all import score_cashiers_robust, validate_pipeline_data_quality
+
+    rows = [
+        ("Alice", 200, 1, 0, 0),
+        ("Bob", 200, 1, 0, 0),
+        ("Carol", 200, 5, 0, 0),
+        ("Dave", 200, 18, 2, 1),
+    ]
+    scored = score_cashiers_robust(rows)
+    emitted_levels = {entry[7] for entry in scored}
+    assert emitted_levels.issubset({"normal", "elevated", "high"})
+    assert "elevated" in emitted_levels or "high" in emitted_levels
+
+    dq_source = inspect.getsource(validate_pipeline_data_quality)
+    assert "('normal','elevated','high')" in dq_source
+    assert "'watch'" not in dq_source
+
+
+def test_analytics_http_worker_fails_closed_without_token_and_binds_loopback(monkeypatch):
+    import threading
+    import urllib.error
+    import urllib.request
+    from run_all import create_worker_server
+
+    monkeypatch.delenv("ANALYTICS_WORKER_TOKEN", raising=False)
+    monkeypatch.delenv("ANALYTICS_ALLOW_UNAUTHENTICATED_DEV", raising=False)
+    monkeypatch.delenv("ANALYTICS_WORKER_HOST", raising=False)
+
+    calls = []
+
+    def fake_pipeline():
+        calls.append(1)
+        return {"ok": True}
+
+    server, auth_required = create_worker_server(
+        host=None,
+        port=0,
+        worker_token="",
+        pipeline_fn=fake_pipeline,
+    )
+    assert auth_required is True
+    assert server.server_address[0] == "127.0.0.1"
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/recompute", method="POST", data=b"")
+        try:
+            urllib.request.urlopen(req)
+            assert False, "Expected 401 when worker token is missing"
+        except urllib.error.HTTPError as err:
+            assert err.code == 401
+        assert calls == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_measured_unit_valuation_and_markdown_scaling():
+    import inspect
+    from run_all import (
+        compute_inventory_value_cents,
+        run_loyalty_staffing_and_tasks,
+        solve_optimal_markdown,
+        unit_cost_divisor,
+    )
+
+    assert unit_cost_divisor("each") == 1.0
+    assert unit_cost_divisor("weight_g") == 1000.0
+    assert unit_cost_divisor("volume_ml") == 1000.0
+
+    # 65,000g @ 110c/kg ($1.10/kg) = $71.50 (7150c), NOT $71,500
+    assert compute_inventory_value_cents(65000, 110, "weight_g") == 7150
+    assert compute_inventory_value_cents(500, 400, "volume_ml") == 200
+    assert compute_inventory_value_cents(10, 110, "each") == 1100
+
+    # Weighted batch 20,000g (20 kg) at $4.00/kg sell, $2.20/kg cost, 5,000g/day velocity over 3 days
+    sol = solve_optimal_markdown(
+        qty_remaining=20000,
+        days_left=3,
+        avg_daily_units=5000.0,
+        sell_price_cents=400,
+        unit_cost_cents=220,
+        unit_mode="weight_g",
+    )
+    assert sol["baseline_no_promo_recovery_cents"] == 6000
+    assert 6000 <= sol["expected_recovery_cents"] <= 8000
+
+    loyalty_src = inspect.getsource(run_loyalty_staffing_and_tasks)
+    assert "CASE WHEN s.kind = 'sale' THEN s.total_cents ELSE -s.total_cents END" in loyalty_src
+
+
+def test_welch_ttest_exact_student_t_and_zero_variance():
+    from run_all import welch_ttest_pvalue
+
+    # Tiny n=2 vs n=2 must use finite-df Student-t (less aggressive than normal approx erfc)
+    p_tiny = welch_ttest_pvalue(np.array([10.0, 12.0]), np.array([15.0, 17.0]))
+    assert 0.04 < p_tiny < 0.12
+
+    assert welch_ttest_pvalue(np.array([5.0, 5.0, 5.0]), np.array([5.0, 5.0, 5.0])) == 1.0
+    assert welch_ttest_pvalue(np.array([5.0, 5.0, 5.0]), np.array([9.0, 9.0, 9.0])) == 0.0
+
+
+def test_compute_did_paired_bootstrap_cancels_common_shocks():
+    from run_all import compute_did_evaluation
+
+    # Large shared weekday/weekend oscillation affecting target & control proportionally:
+    # Target and control move together cleanly -> true DiD lift is 0.0 and must NOT flag false positive
+    pre_c = np.array([1000.0, 2000.0] * 7)
+    post_c = np.array([1100.0, 2200.0] * 7)
+    pre_t = np.array([500.0, 1000.0] * 7)
+    post_t = np.array([550.0, 1100.0] * 7)
+
+    res = compute_did_evaluation(pre_t, post_t, pre_c, post_c)
+    assert abs(res["didLiftUsdPerDay"]) < 1e-6
+    assert res["verdict"] == "inconclusive"
+    assert res["ciLowUsd"] <= 0.0 <= res["ciHighUsd"]
+
+
+def test_daypart_sql_clause_and_uuid_filter():
+    from run_all import build_daypart_sql_clause, filter_valid_uuids
+
+    assert build_daypart_sql_clause(None, None) == ("", [])
+    assert build_daypart_sql_clause(8, 8) == ("", [])
+
+    clause_std, params_std = build_daypart_sql_clause(8, 12)
+    assert ">=" in clause_std and "AND EXTRACT(HOUR" in clause_std
+    assert params_std == [8, 12]
+
+    clause_wrap, params_wrap = build_daypart_sql_clause(22, 6)
+    assert " OR EXTRACT(HOUR" in clause_wrap
+    assert params_wrap == [22, 6]
+
+    uuids = filter_valid_uuids(["01950000-0000-7000-8000-000000000001", "not-a-uuid", None])
+    assert uuids == ["01950000-0000-7000-8000-000000000001"]
+
+
+def test_analytics_pipeline_decoupled_tx_and_timeouts():
+    import inspect
+    import run_all
+
+    pipeline_src = inspect.getsource(run_all.run_pipeline)
+    assert "statement_timeout" in pipeline_src
+    assert "lock_timeout" in pipeline_src
+    assert 'run_status = "ok" if dq_passed else "dq_failed"' in pipeline_src
+    assert "pipeline_error" in pipeline_src
+    # Stages must NOT run inside a single monolithic transaction block
+    assert "with conn.transaction():\n            supplier_std_map" not in pipeline_src
+
+    basket_src = inspect.getsource(run_all._run_market_basket_impl)
+    assert "fetchmany(5000)" in basket_src
+
+    lp_src = inspect.getsource(run_all.run_loss_prevention_anomalies)
+    assert "orig.cashier_name" in lp_src
+    assert "details_json->>'cashierName'" in lp_src
+
+    sup_src = inspect.getsource(run_all.run_supplier_scorecards)
+    assert "GROUP BY gr.supplier_id, gr.po_id" in sup_src
+
+    shift_src = inspect.getsource(run_all._run_shift_diagnostics_impl)
+    assert "WHERE status = 'active'" in shift_src
+    assert "generate_series" in shift_src
+
+    loyalty_src = inspect.getsource(run_all.run_loyalty_staffing_and_tasks)
+    assert "SET LOCAL lock_timeout = '2s'" in loyalty_src
+    assert "range(0, len(rfm_updates), 50)" in loyalty_src
+    assert "rfm_segment IS DISTINCT FROM" in loyalty_src
+
+
+def test_build_pg_connect_kwargs_special_char_password():
+    from run_all import build_pg_connect_kwargs
+
+    # Explicit PG* variables preserve raw special characters safely without URL parsing corruption
+    kwargs = build_pg_connect_kwargs({
+        "PGHOST": "postgres",
+        "PGPORT": "5432",
+        "PGUSER": "supermarket",
+        "PGPASSWORD": "p@ss:w#rd/%1?x=2",
+        "PGDATABASE": "supermarket_os",
+    })
+    assert kwargs == {
+        "host": "postgres",
+        "port": 5432,
+        "user": "supermarket",
+        "password": "p@ss:w#rd/%1?x=2",
+        "dbname": "supermarket_os",
+    }
+
+    uri_kwargs = build_pg_connect_kwargs({
+        "DATABASE_URL": "postgres://u:p@localhost:5433/db",
+        "PGHOST": "ignored",
+    })
+    assert uri_kwargs == {"conninfo": "postgres://u:p@localhost:5433/db"}

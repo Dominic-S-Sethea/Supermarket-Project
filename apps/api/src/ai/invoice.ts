@@ -2,9 +2,10 @@ import { GoogleGenAI } from "@google/genai";
 import { computeEffectiveUnitCostCents } from "@supermarket/shared";
 import { eq, ilike, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
+import { env } from "../config/env.js";
 import { db, productBarcodes, products, suppliers } from "../db/index.js";
-import { isGeminiConfigured } from "./copilot.js";
-import { semanticSearchProducts } from "./semantic.js";
+import { isGeminiConfigured, raceWithTimeoutAndAbort, sanitizeGeminiError } from "./copilot.js";
+import { semanticMatchDescriptionsBatch } from "./semantic.js";
 import { runCalibratedTriage, type CalibratedTriageResult } from "./triage.js";
 
 const ExtractedInvoiceLineSchema = z.object({
@@ -78,14 +79,14 @@ interface RawExtractedInvoice {
   }[];
 }
 
-function parsePlainTextInvoice(text: string): RawExtractedInvoice {
+export function parsePlainTextInvoice(text: string): RawExtractedInvoice {
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
 
-  let supplierName = "Summit Brewing & Beer Supply";
-  let invoiceNumber = `INV-${new Date().getFullYear()}-${String(Math.floor(10000 + Math.random() * 89999))}`;
+  let supplierName = "";
+  let invoiceNumber = "";
   let invoiceDate = new Date().toISOString().slice(0, 10);
   const parsedLines: NonNullable<RawExtractedInvoice["lines"]> = [];
 
@@ -109,10 +110,14 @@ function parsePlainTextInvoice(text: string): RawExtractedInvoice {
     // Pipe-delimited or CSV-like invoice line:
     // SKU/Desc | caseQty | paidCases | freeBonusCases | totalUsd | bestBeforeDate
     const parts = line.split(/[|;]/).map((p) => p.trim());
-    if (parts.length >= 4 && !/^item|^sku|^desc/i.test(parts[0])) {
+    if (
+      parts.length >= 4 &&
+      !/^(?:item(?:\s+desc(?:ription)?)?|sku(?:\s*\/\s*desc)?|desc(?:ription)?)$/i.test(parts[0])
+    ) {
       const desc = parts[0];
       const caseQty = Math.max(1, parseInt(parts[1], 10) || 24);
-      const paidCases = Math.max(0, parseInt(parts[2], 10) || 1);
+      const rawPaid = parseInt(parts[2], 10);
+      const paidCases = Number.isFinite(rawPaid) ? Math.max(0, rawPaid) : 1;
       const freeBonusCases = Math.max(0, parseInt(parts[3], 10) || 0);
       const usdStr = (parts[4] ?? "100").replace(/[^0-9.]/g, "");
       const invoiceLineTotalCents = Math.max(0, Math.round((Number(usdStr) || 0) * 100));
@@ -221,11 +226,14 @@ export async function parseSupplierInvoice(
                 mime_type: verifiedMime,
               };
 
-        const interaction = await ai.interactions.create({
-          model: "gemini-4-hydrogen",
-          input: [{ type: "text", text: prompt }, mediaBlock],
-          store: false,
-        });
+        const interaction = await raceWithTimeoutAndAbort(
+          ai.interactions.create({
+            model: env.geminiCopilotModel,
+            input: [{ type: "text", text: prompt }, mediaBlock],
+            store: false,
+          }),
+          env.geminiTimeoutMs
+        );
 
         const outText = interaction.output_text ?? "";
         const jsonMatch = outText.match(/\{[\s\S]*\}/);
@@ -237,14 +245,14 @@ export async function parseSupplierInvoice(
               invoiceDate: parsedJson.data.invoiceDate ?? new Date().toISOString().slice(0, 10),
             };
             mode = "gemini_vision";
-            model = "gemini-4-hydrogen";
+            model = env.geminiCopilotModel;
           } else {
             note = "Gemini Vision returned invalid invoice JSON; used local invoice parser.";
           }
         }
       }
     } catch (err) {
-      note = `Gemini Vision OCR failed (${err instanceof Error ? err.message : "error"}); used local invoice parser.`;
+      note = `Gemini Vision OCR failed (${sanitizeGeminiError(err)}); used local invoice parser.`;
     }
   }
 
@@ -262,47 +270,54 @@ export async function parseSupplierInvoice(
         raw = parsePlainTextInvoice(decoded);
       }
     } catch {
-      // Fall back to sample invoice below
+      // Ignore malformed base64 text payload and return clean empty extraction below
     }
   }
 
   if (!raw || !raw.lines || raw.lines.length === 0) {
-    // Clean sample fallback when an image/PDF is uploaded without GEMINI_API_KEY
-    const sampleProds = await db
-      .select({ sku: products.sku, name: products.name, avgCostCents: products.avgCostCents })
-      .from(products)
-      .limit(2);
-    const p1 = sampleProds[0] ?? { sku: "BEER-0001", name: "Heineken Original 330ml Can", avgCostCents: 120 };
     raw = {
-      supplierName: "Summit Brewing & Beer Supply",
-      invoiceNumber: `INV-${new Date().getFullYear()}-90421`,
-      invoiceDate: new Date().toISOString().slice(0, 10),
-      lines: [
-        {
-          description: p1.name,
-          skuHint: p1.sku,
-          barcodeHint: "",
-          caseQty: 24,
-          paidCases: 10,
-          freeBonusCases: 1,
-          // Simulate a +22% wholesale invoice cost creep on paid cases for demo visibility
-          invoiceLineTotalCents: Math.round(10 * 24 * p1.avgCostCents * 1.22),
-          bestBeforeDate: defaultBbd,
-        },
-      ],
+      supplierName: raw?.supplierName?.trim() || "",
+      invoiceNumber: raw?.invoiceNumber?.trim() || "",
+      invoiceDate: raw?.invoiceDate ?? new Date().toISOString().slice(0, 10),
+      lines: [],
     };
     note =
       note ??
-      (input.base64Data && !isGeminiConfigured()
-        ? "Demo Vision Fallback (set GEMINI_API_KEY to run live Gemini 4 Hydrogen image/PDF OCR)."
-        : null);
+      (isBinaryMediaMime && !isGeminiConfigured()
+        ? "Binary PDF/image invoice OCR requires GEMINI_API_KEY; returned 0 lines instead of fabricating items. Paste text/CSV invoice lines or click Sample Invoice."
+        : "No invoice lines could be extracted from uploaded document.");
   }
 
-  // Match supplier
+  // Match supplier deterministically: exact substring first, then significant token overlap
   const supHint = (raw.supplierName ?? "").trim();
-  const [matchedSupplier] = supHint
-    ? await db.select().from(suppliers).where(ilike(suppliers.name, `%${supHint.split(" ")[0]}%`)).limit(1)
-    : await db.select().from(suppliers).limit(1);
+  let matchedSupplier: (typeof suppliers.$inferSelect) | null = null;
+  if (supHint) {
+    const [exactMatch] = await db
+      .select()
+      .from(suppliers)
+      .where(ilike(suppliers.name, `%${supHint}%`))
+      .limit(1);
+    if (exactMatch) {
+      matchedSupplier = exactMatch;
+    } else {
+      const tokens = supHint
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length >= 3);
+      if (tokens.length > 0) {
+        const allSups = await db.select().from(suppliers);
+        let bestScore = 0;
+        for (const s of allSups) {
+          const sName = s.name.toLowerCase();
+          const score = tokens.reduce((acc, tok) => (sName.includes(tok) ? acc + 1 : acc), 0);
+          if (score > bestScore) {
+            bestScore = score;
+            matchedSupplier = s;
+          }
+        }
+      }
+    }
+  }
 
   // Batch-resolve all barcode hints and SKU hints up-front (eliminates 2N per-line DB queries - H-06)
   const rawLines = raw.lines ?? [];
@@ -342,6 +357,21 @@ export async function parseSupplierInvoice(
 
   const bcMatchMap = new Map(bcMatches.map((r) => [r.barcode.toLowerCase(), r]));
   const skuMatchMap = new Map(skuMatches.map((r) => [r.sku.toUpperCase(), r]));
+
+  const unmatchedDescs = rawLines
+    .filter((l) => {
+      const bcHint = (l.barcodeHint ?? "").trim().toLowerCase();
+      const skuHint = (l.skuHint ?? "").trim().toUpperCase();
+      const hasBc = bcHint ? bcMatchMap.has(bcHint) : false;
+      const hasSku = skuHint ? skuMatchMap.has(skuHint) : false;
+      return !hasBc && !hasSku && Boolean((l.description ?? "").trim());
+    })
+    .map((l) => (l.description ?? "").trim());
+
+  const semMatchMap =
+    unmatchedDescs.length > 0
+      ? await semanticMatchDescriptionsBatch(unmatchedDescs)
+      : new Map();
 
   const enrichedLines: ExtractedInvoiceLine[] = [];
   for (const l of rawLines) {
@@ -389,15 +419,9 @@ export async function parseSupplierInvoice(
     }
 
     if (!matched && desc) {
-      const sem = await semanticSearchProducts(desc, 1);
-      if (sem.items[0]) {
-        matched = {
-          id: sem.items[0].id,
-          sku: sem.items[0].sku,
-          name: sem.items[0].name,
-          avgCostCents: sem.items[0].avgCostCents,
-          confidence: sem.items[0].similarityScore,
-        };
+      const semHit = semMatchMap.get(desc);
+      if (semHit) {
+        matched = semHit;
       }
     }
 

@@ -15,7 +15,8 @@ import {
   stockMovements,
   taxRates,
 } from "../db/index.js";
-import { isGeminiConfigured } from "./copilot.js";
+import { env } from "../config/env.js";
+import { isGeminiConfigured, raceWithTimeoutAndAbort } from "./copilot.js";
 
 const DIM = 256;
 
@@ -111,6 +112,8 @@ interface CachedEmbedEntry {
 const EMBEDDING_CACHE_TTL_MS = 10 * 60_000;
 let memoryIndex: Map<string, CachedEmbedEntry> | null = null;
 let memoryIndexLoadedAt = 0;
+let syncInFlight: Promise<{ indexedCount: number; model: string }> | null = null;
+let loadInFlight: Promise<Map<string, CachedEmbedEntry>> | null = null;
 
 export function invalidateEmbeddingCache(): void {
   memoryIndex = null;
@@ -125,11 +128,29 @@ function buildProductDescriptor(p: {
   departmentName: string;
   requiresAgeCheck: boolean;
 }): string {
-  const alcoholTag = p.requiresAgeCheck ? "alcoholic 18+" : "non-alcoholic alcohol-free";
-  return `${p.sku} ${p.brand} ${p.name} ${p.categoryName} ${p.departmentName} ${alcoholTag}`;
+  const alcoholTag = p.requiresAgeCheck
+    ? "alcoholic 18+"
+    : /(beer|wine|cider|spirit|beverage|drink|soda|juice|tea|coffee|water|0\.0|alcohol)/i.test(
+          `${p.departmentName} ${p.categoryName} ${p.name}`,
+        )
+      ? "non-alcoholic alcohol-free"
+      : "";
+  return `${p.sku} ${p.brand} ${p.name} ${p.categoryName} ${p.departmentName}${alcoholTag ? ` ${alcoholTag}` : ""}`;
 }
 
 export async function syncProductEmbeddings(force = false): Promise<{
+  indexedCount: number;
+  model: string;
+}> {
+  if (syncInFlight) return syncInFlight;
+  const run = _syncProductEmbeddingsImpl(force).finally(() => {
+    syncInFlight = null;
+  });
+  syncInFlight = run;
+  return run;
+}
+
+async function _syncProductEmbeddingsImpl(force = false): Promise<{
   indexedCount: number;
   model: string;
 }> {
@@ -152,7 +173,8 @@ export async function syncProductEmbeddings(force = false): Promise<{
   const existingMap = new Map(existingRows.map((e) => [e.productId, e]));
 
   const useGemini = isGeminiConfigured();
-  const targetModel = useGemini ? "gemini-embedding-001" : "local-semantic-256d";
+  const embedModel = env.geminiEmbedModel;
+  const targetModel = useGemini ? embedModel : "local-semantic-256d";
 
   const toEmbed: { productId: string; descriptor: string; textHash: string }[] = [];
   const nextCache = new Map<string, CachedEmbedEntry>();
@@ -182,11 +204,14 @@ export async function syncProductEmbeddings(force = false): Promise<{
       const BATCH = 100;
       for (let i = 0; i < toEmbed.length; i += BATCH) {
         const slice = toEmbed.slice(i, i + BATCH);
-        const resp = await ai.models.embedContent({
-          model: "gemini-embedding-001",
-          contents: slice.map((s) => s.descriptor),
-          config: { outputDimensionality: DIM },
-        });
+        const resp = await raceWithTimeoutAndAbort(
+          ai.models.embedContent({
+            model: embedModel,
+            contents: slice.map((s) => s.descriptor),
+            config: { outputDimensionality: DIM },
+          }),
+          env.geminiTimeoutMs
+        );
         const embs = resp.embeddings ?? [];
         for (let j = 0; j < slice.length; j++) {
           const item = slice[j];
@@ -195,14 +220,14 @@ export async function syncProductEmbeddings(force = false): Promise<{
           const unitVec = rawVec.map((v) => Number((v / norm).toFixed(5)));
           upsertRows.push({
             productId: item.productId,
-            embeddingModel: "gemini-embedding-001",
+            embeddingModel: embedModel,
             textHash: item.textHash,
             vectorJson: unitVec,
           });
           nextCache.set(item.productId, {
             productId: item.productId,
             descriptor: item.descriptor,
-            model: "gemini-embedding-001",
+            model: embedModel,
             vector: toNormalizedFloat64(unitVec),
           });
         }
@@ -263,44 +288,51 @@ async function ensureMemoryIndex(): Promise<Map<string, CachedEmbedEntry>> {
   ) {
     return memoryIndex;
   }
+  if (loadInFlight) return loadInFlight;
 
-  const [embRows, prodRows] = await Promise.all([
-    db.select().from(productEmbeddings),
-    db
-      .select({
-        productId: products.id,
-        sku: products.sku,
-        brand: products.brand,
-        name: products.name,
-        requiresAgeCheck: products.requiresAgeCheck,
-        categoryName: categories.name,
-        departmentName: departments.name,
-      })
-      .from(products)
-      .innerJoin(categories, eq(products.categoryId, categories.id))
-      .innerJoin(departments, eq(categories.departmentId, departments.id))
-      .where(eq(products.active, true)),
-  ]);
+  const loadPromise = (async () => {
+    const [embRows, prodRows] = await Promise.all([
+      db.select().from(productEmbeddings),
+      db
+        .select({
+          productId: products.id,
+          sku: products.sku,
+          brand: products.brand,
+          name: products.name,
+          requiresAgeCheck: products.requiresAgeCheck,
+          categoryName: categories.name,
+          departmentName: departments.name,
+        })
+        .from(products)
+        .innerJoin(categories, eq(products.categoryId, categories.id))
+        .innerJoin(departments, eq(categories.departmentId, departments.id))
+        .where(eq(products.active, true)),
+    ]);
 
-  if (embRows.length < Math.min(100, prodRows.length)) {
-    await syncProductEmbeddings(false);
-    return memoryIndex!;
-  }
+    if (embRows.length < Math.min(100, prodRows.length)) {
+      await syncProductEmbeddings(false);
+      return memoryIndex!;
+    }
 
-  const descMap = new Map(prodRows.map((p) => [p.productId, buildProductDescriptor(p)]));
-  const loaded = new Map<string, CachedEmbedEntry>();
-  for (const e of embRows) {
-    if (!descMap.has(e.productId)) continue;
-    loaded.set(e.productId, {
-      productId: e.productId,
-      descriptor: descMap.get(e.productId) ?? "",
-      model: e.embeddingModel,
-      vector: toNormalizedFloat64(e.vectorJson as number[]),
-    });
-  }
-  memoryIndex = loaded;
-  memoryIndexLoadedAt = Date.now();
-  return loaded;
+    const descMap = new Map(prodRows.map((p) => [p.productId, buildProductDescriptor(p)]));
+    const loaded = new Map<string, CachedEmbedEntry>();
+    for (const e of embRows) {
+      if (!descMap.has(e.productId)) continue;
+      loaded.set(e.productId, {
+        productId: e.productId,
+        descriptor: descMap.get(e.productId) ?? "",
+        model: e.embeddingModel,
+        vector: toNormalizedFloat64(e.vectorJson as number[]),
+      });
+    }
+    memoryIndex = loaded;
+    memoryIndexLoadedAt = Date.now();
+    return loaded;
+  })().finally(() => {
+    loadInFlight = null;
+  });
+  loadInFlight = loadPromise;
+  return loadPromise;
 }
 
 export async function getEmbeddingStats(): Promise<{
@@ -327,18 +359,21 @@ export async function semanticSearchProducts(query: string, limit = 30) {
   let queryVec: number[];
   let engine = "local-semantic-256d";
 
-  if (storedModel === "gemini-embedding-001" && isGeminiConfigured()) {
+  if (storedModel === env.geminiEmbedModel && isGeminiConfigured()) {
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY!.trim() });
-      const resp = await ai.models.embedContent({
-        model: "gemini-embedding-001",
-        contents: [query],
-        config: { outputDimensionality: DIM },
-      });
+      const resp = await raceWithTimeoutAndAbort(
+        ai.models.embedContent({
+          model: env.geminiEmbedModel,
+          contents: [query],
+          config: { outputDimensionality: DIM },
+        }),
+        env.geminiTimeoutMs
+      );
       const raw = resp.embeddings?.[0]?.values ?? embedTextLocal(query);
       const norm = Math.sqrt(raw.reduce((s, v) => s + v * v, 0)) || 1;
       queryVec = raw.map((v) => v / norm);
-      engine = "gemini-embedding-001";
+      engine = env.geminiEmbedModel;
     } catch {
       queryVec = embedTextLocal(query);
     }
@@ -470,4 +505,110 @@ export async function semanticSearchProducts(query: string, limit = 30) {
     totalIndexed: index.size,
     items,
   };
+}
+
+/** Match multiple free-text invoice descriptions against the semantic product index in batch. */
+export async function semanticMatchDescriptionsBatch(
+  descriptions: string[]
+): Promise<Map<string, { id: string; sku: string; name: string; avgCostCents: number; confidence: number }>> {
+  const unique = Array.from(new Set(descriptions.map((d) => d.trim()).filter(Boolean)));
+  const result = new Map<
+    string,
+    { id: string; sku: string; name: string; avgCostCents: number; confidence: number }
+  >();
+  if (unique.length === 0) return result;
+
+  const index = await ensureMemoryIndex();
+  if (index.size === 0) return result;
+
+  const sampleEntry = index.values().next().value;
+  const storedModel = sampleEntry?.model ?? "local-semantic-256d";
+  const queryVectors = new Map<string, number[]>();
+
+  if (storedModel === env.geminiEmbedModel && isGeminiConfigured()) {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY!.trim() });
+      const BATCH = 100;
+      for (let i = 0; i < unique.length; i += BATCH) {
+        const slice = unique.slice(i, i + BATCH);
+        const resp = await raceWithTimeoutAndAbort(
+          ai.models.embedContent({
+            model: env.geminiEmbedModel,
+            contents: slice,
+            config: { outputDimensionality: DIM },
+          }),
+          env.geminiTimeoutMs
+        );
+        const embs = resp.embeddings ?? [];
+        for (let j = 0; j < slice.length; j++) {
+          const raw = embs[j]?.values ?? embedTextLocal(slice[j]);
+          const norm = Math.sqrt(raw.reduce((s, v) => s + v * v, 0)) || 1;
+          queryVectors.set(
+            slice[j],
+            raw.map((v) => v / norm)
+          );
+        }
+      }
+    } catch {
+      queryVectors.clear();
+    }
+  }
+
+  for (const q of unique) {
+    if (!queryVectors.has(q)) {
+      queryVectors.set(q, embedTextLocal(q));
+    }
+  }
+
+  const bestByQuery = new Map<string, { productId: string; score: number }>();
+  const matchedIds = new Set<string>();
+  for (const q of unique) {
+    const queryVec = queryVectors.get(q)!;
+    const queryTokens = q
+      .toLowerCase()
+      .split(/[^a-z0-9.]+/)
+      .filter((t) => t.length >= 2);
+    let bestId: string | null = null;
+    let bestScore = -Infinity;
+    for (const entry of index.values()) {
+      let sim = cosineSim(queryVec, entry.vector);
+      const descLower = entry.descriptor.toLowerCase();
+      for (const qt of queryTokens) {
+        if (descLower.includes(qt)) sim += 0.08;
+      }
+      if (sim > bestScore) {
+        bestScore = sim;
+        bestId = entry.productId;
+      }
+    }
+    if (bestId) {
+      bestByQuery.set(q, { productId: bestId, score: bestScore });
+      matchedIds.add(bestId);
+    }
+  }
+
+  if (matchedIds.size === 0) return result;
+  const prodRows = await db
+    .select({
+      id: products.id,
+      sku: products.sku,
+      name: products.name,
+      avgCostCents: products.avgCostCents,
+    })
+    .from(products)
+    .where(inArray(products.id, Array.from(matchedIds)));
+  const prodMap = new Map(prodRows.map((p) => [p.id, p]));
+
+  for (const [q, match] of bestByQuery) {
+    const prod = prodMap.get(match.productId);
+    if (!prod) continue;
+    result.set(q, {
+      id: prod.id,
+      sku: prod.sku,
+      name: prod.name,
+      avgCostCents: prod.avgCostCents,
+      confidence: Number(match.score.toFixed(3)),
+    });
+  }
+  return result;
 }

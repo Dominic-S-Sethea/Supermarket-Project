@@ -4,6 +4,7 @@ import {
   computeSuggestedSellPriceCents,
   generateUuidV7,
   ParseInvoiceSchema,
+  PromotionRulesSchema,
 } from "@supermarket/shared";
 import { and, asc, desc, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
@@ -66,16 +67,28 @@ const ExecuteCreatePromoPayloadSchema = z
     promoType: z.enum(["mix_and_match", "bogo", "tier_price", "clearance", "basket_threshold"]),
     priority: z.number().int().min(1).max(1000).default(15),
     combinable: z.boolean().default(false),
-    minMarginGuardBp: z.number().int().min(0).max(9500).nullable().optional().default(1000),
+    minMarginGuardBp: z.number().int().min(500).max(9500).default(1000),
     daypartStartHour: z.number().int().min(0).max(23).nullable().optional(),
     daypartEndHour: z.number().int().min(1).max(24).nullable().optional(),
-    rulesJson: z.record(z.string(), z.unknown()).default({}),
+    rulesJson: PromotionRulesSchema.default({}),
   })
   .refine(
     (d) =>
       (d.daypartStartHour == null && d.daypartEndHour == null) ||
-      (d.daypartStartHour != null && d.daypartEndHour != null),
-    { message: "Both daypartStartHour and daypartEndHour must be set together or both omitted." }
+      (d.daypartStartHour != null && d.daypartEndHour != null && d.daypartStartHour !== d.daypartEndHour),
+    { message: "Both daypartStartHour and daypartEndHour must be set together and differ." }
+  )
+  .refine(
+    (d) => (d.rulesJson.productIds?.length ?? 0) > 0 || (d.rulesJson.categoryIds?.length ?? 0) > 0,
+    { message: "AI-proposed promotions must explicitly scope productIds or categoryIds." }
+  )
+  .refine(
+    (d) => d.rulesJson.discountBp == null || d.rulesJson.discountBp <= env.aiMaxPromoDiscountBp,
+    { message: `Promotion discountBp exceeds AI safety ceiling (${env.aiMaxPromoDiscountBp} bp).` }
+  )
+  .refine(
+    (d) => d.rulesJson.bundlePriceCents == null || d.rulesJson.bundlePriceCents >= 50,
+    { message: "Promotion bundlePriceCents must be at least 50 cents ($0.50)." }
   );
 
 export async function aiRoutes(app: FastifyInstance) {
@@ -92,7 +105,7 @@ export async function aiRoutes(app: FastifyInstance) {
     const embStats = await getEmbeddingStats();
     return {
       geminiConfigured: isGeminiConfigured(),
-      model: isGeminiConfigured() ? "gemini-4-hydrogen" : "local-deterministic-tools",
+      model: isGeminiConfigured() ? env.geminiCopilotModel : "local-deterministic-tools",
       capabilities: [
         "copilot_sse",
         "briefing",
@@ -155,7 +168,7 @@ export async function aiRoutes(app: FastifyInstance) {
   });
 
   // Calibrated Anomaly & Discrepancy Triage (Decisions API / calibrated local)
-  app.post("/api/ai/triage", { preHandler: managerOnly }, async (req, reply) => {
+  app.post("/api/ai/triage", { preHandler: managerAiLimited }, async (req, reply) => {
     const parsed = AiTriageRequestSchema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
     return runCalibratedTriage(parsed.data.targetType, parsed.data.metrics);
@@ -235,7 +248,7 @@ export async function aiRoutes(app: FastifyInstance) {
         .values({
           userId: user.id,
           title: msgText.slice(0, 64),
-          model: isGeminiConfigured() ? "gemini-4-hydrogen" : "local-deterministic-tools",
+          model: isGeminiConfigured() ? env.geminiCopilotModel : "local-deterministic-tools",
         })
         .returning();
       conversationId = created.id;
@@ -312,7 +325,7 @@ export async function aiRoutes(app: FastifyInstance) {
         .values({
           userId: user.id,
           title: msgText.slice(0, 64),
-          model: isGeminiConfigured() ? "gemini-4-hydrogen" : "local-deterministic-tools",
+          model: isGeminiConfigured() ? env.geminiCopilotModel : "local-deterministic-tools",
         })
         .returning();
       conversationId = created.id;
@@ -346,8 +359,10 @@ export async function aiRoutes(app: FastifyInstance) {
 
     let clientClosed = false;
     let streamOutcome: "completed" | "error" | "aborted" = "completed";
+    const abortController = new AbortController();
     req.raw.on("close", () => {
       clientClosed = true;
+      abortController.abort();
       if (!rawRes.writableEnded) {
         streamOutcome = "aborted";
       }
@@ -366,8 +381,14 @@ export async function aiRoutes(app: FastifyInstance) {
         msgText,
         previousInteractionId,
         { conversationId, user },
-        (ev) => sendSse(ev)
+        (ev) => sendSse(ev),
+        abortController.signal
       );
+
+      if (clientClosed || abortController.signal.aborted || rawRes.writableEnded) {
+        streamOutcome = "aborted";
+        return;
+      }
 
       const [assistantMsg] = await db
         .insert(aiMessages)
@@ -404,12 +425,20 @@ export async function aiRoutes(app: FastifyInstance) {
         actions,
       });
     } catch (err) {
-      streamOutcome = "error";
-      req.log.error({ err }, "SSE copilot streaming error");
-      sendSse({
-        type: "error",
-        error: "Copilot streaming failed. Please retry.",
-      });
+      if (
+        clientClosed ||
+        abortController.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
+        streamOutcome = "aborted";
+      } else {
+        streamOutcome = "error";
+        req.log.error({ err }, "SSE copilot streaming error");
+        sendSse({
+          type: "error",
+          error: "Copilot streaming failed. Please retry.",
+        });
+      }
     } finally {
       finishSseMetric(clientClosed && streamOutcome === "completed" ? "aborted" : streamOutcome);
       if (!rawRes.writableEnded) {
@@ -441,6 +470,18 @@ export async function aiRoutes(app: FastifyInstance) {
       if (!ownerConv) return { status: 404 as const, error: "Proposed action not found" };
       if (action.status !== "pending") {
         return { status: 409 as const, error: `Action is already "${action.status}".` };
+      }
+
+      const maxAgeMs = env.aiActionTtlHours * 3600_000;
+      if (Date.now() - action.createdAt.getTime() > maxAgeMs) {
+        await tx
+          .update(aiProposedActions)
+          .set({ status: "rejected", executedAt: new Date() })
+          .where(eq(aiProposedActions.id, action.id));
+        return {
+          status: 410 as const,
+          error: `Proposed action expired (older than ${env.aiActionTtlHours}h) and was marked rejected.`,
+        };
       }
 
       const rawPayload = action.payloadJson as Record<string, unknown>;
@@ -585,7 +626,7 @@ export async function aiRoutes(app: FastifyInstance) {
           await tx
             .update(marginAlerts)
             .set({ resolved: true })
-            .where(eq(marginAlerts.id, alertId));
+            .where(and(eq(marginAlerts.id, alertId), eq(marginAlerts.productId, productId)));
         }
 
         await tx.insert(auditLogs).values({

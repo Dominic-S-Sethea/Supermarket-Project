@@ -1,4 +1,5 @@
 import {
+  computeInventoryValueCents,
   computeNetMarginBp,
   computeSuggestedSellPriceCents,
   evaluateCart,
@@ -6,6 +7,7 @@ import {
   formatMoney,
   type CartInputLine,
   type PromotionRule,
+  type UnitMode,
 } from "@supermarket/shared";
 import { and, asc, desc, eq, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import {
@@ -18,6 +20,7 @@ import {
   analyticsPhantomStock,
   analyticsShiftDiagnostics,
   analyticsSupplierScorecards,
+  categories,
   db,
   grnVariances,
   inventoryBatches,
@@ -32,11 +35,15 @@ import {
   suppliers,
   taxRates,
 } from "../db/index.js";
+import { env } from "../config/env.js";
 import type { AuthUser } from "../plugins/auth.js";
+
+export const MAX_PROPOSALS_PER_TURN = 3;
 
 export interface CopilotToolContext {
   conversationId: string;
   user: AuthUser;
+  proposalsCreated?: number;
 }
 
 export interface CopilotToolDefinition {
@@ -202,7 +209,12 @@ export const COPILOT_TOOLS: CopilotToolDefinition[] = [
         productIds: {
           type: "array",
           items: { type: "string" },
-          description: "Optional list of product UUIDs targeted.",
+          description: "List of targeted product UUIDs or SKUs.",
+        },
+        categoryIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of targeted category UUIDs (use productIds or categoryIds).",
         },
         discountBp: {
           type: "integer",
@@ -312,19 +324,21 @@ async function executeCopilotToolInner(
         db.execute(sql`
           SELECT
             COUNT(*) FILTER (WHERE kind = 'sale')::int AS receipt_count,
-            COALESCE(SUM(total_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS gross_sales_cents,
-            COALESCE(SUM(discount_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS discounts_cents,
-            COALESCE(SUM(tax_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS tax_cents,
-            COALESCE(SUM(total_cost_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS cogs_cents,
-            COALESCE(SUM(total_cents - tax_cents) FILTER (WHERE kind = 'sale'), 0)::bigint AS net_sales_cents
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN total_cents ELSE -total_cents END), 0)::bigint AS gross_sales_cents,
+            COALESCE(SUM(total_cents) FILTER (WHERE kind IN ('void', 'refund')), 0)::bigint AS refunds_voids_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN discount_cents ELSE -discount_cents END), 0)::bigint AS discounts_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN tax_cents ELSE -tax_cents END), 0)::bigint AS tax_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN total_cost_cents ELSE -total_cost_cents END), 0)::bigint AS cogs_cents,
+            COALESCE(SUM(CASE WHEN kind = 'sale' THEN (total_cents - tax_cents) ELSE -(total_cents - tax_cents) END), 0)::bigint AS net_sales_cents
           FROM sales
           WHERE sold_at >= now() - (${days} || ' days')::interval
         `),
         db.execute(sql`
-          SELECT COALESCE(SUM(ABS(qty_delta) * unit_cost_cents), 0)::bigint AS shrink_cost_cents
-          FROM stock_movements
-          WHERE reason IN ('spoilage', 'damage', 'count_adj') AND qty_delta < 0
-            AND created_at >= now() - (${days} || ' days')::interval
+          SELECT COALESCE(SUM(ROUND((ABS(sm.qty_delta)::numeric * sm.unit_cost_cents) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS shrink_cost_cents
+          FROM stock_movements sm
+          JOIN products p ON p.id = sm.product_id
+          WHERE sm.reason IN ('spoilage', 'damage', 'count_adj') AND sm.qty_delta < 0
+            AND sm.created_at >= now() - (${days} || ' days')::interval
         `),
         db.execute(sql`
           WITH unfolded AS (
@@ -333,7 +347,7 @@ async function executeCopilotToolInner(
           )
           SELECT
             COUNT(*)::int AS total_skus,
-            COALESCE(SUM(GREATEST(0, COALESCE(b.quantity, 0) + COALESCE(u.delta, 0)) * p.avg_cost_cents), 0)::bigint AS inv_cost_cents
+            COALESCE(SUM(ROUND((GREATEST(0, COALESCE(b.quantity, 0) + COALESCE(u.delta, 0))::numeric * p.avg_cost_cents) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS inv_cost_cents
           FROM products p
           LEFT JOIN stock_baselines b ON b.product_id = p.id
           LEFT JOIN unfolded u ON u.product_id = p.id
@@ -351,6 +365,7 @@ async function executeCopilotToolInner(
         days,
         receiptCount: Number(k.receipt_count ?? 0),
         grossSalesUsd: formatMoney(gross),
+        refundsVoidsUsd: formatMoney(Number(k.refunds_voids_cents ?? 0)),
         netSalesUsd: formatMoney(net),
         grossProfitUsd: formatMoney(profit),
         grossMarginPct: formatBp(net > 0 ? Math.round((profit * 10000) / net) : 0),
@@ -369,18 +384,19 @@ async function executeCopilotToolInner(
         ),
         sales_by_dept AS (
           SELECT d.id AS department_id,
-            COALESCE(SUM(sl.line_total_cents - sl.tax_cents), 0)::bigint AS net_sales_60d,
-            COALESCE(SUM(sl.unit_cost_cents * sl.base_units_sold), 0)::bigint AS cogs_60d
+            COALESCE(SUM(CASE WHEN s.kind = 'sale' THEN (sl.line_total_cents - sl.tax_cents) ELSE -(sl.line_total_cents - sl.tax_cents) END), 0)::bigint AS net_sales_60d,
+            COALESCE(SUM(ROUND(((CASE WHEN s.kind = 'sale' THEN 1 ELSE -1 END) * sl.unit_cost_cents::numeric * sl.base_units_sold) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS cogs_60d
           FROM sale_lines sl
-          JOIN sales s ON s.id = sl.sale_id AND s.kind = 'sale'
+          JOIN sales s ON s.id = sl.sale_id
           JOIN products p ON p.id = sl.product_id
           JOIN categories c ON c.id = p.category_id
           JOIN departments d ON d.id = c.department_id
+          WHERE s.sold_at >= now() - interval '60 days'
           GROUP BY d.id
         ),
         inv_by_dept AS (
           SELECT d.id AS department_id,
-            COALESCE(SUM(GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0)) * p.avg_cost_cents), 0)::bigint AS stock_cost_cents
+            COALESCE(SUM(ROUND((GREATEST(0, COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::numeric * p.avg_cost_cents) / CASE WHEN p.unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)), 0)::bigint AS stock_cost_cents
           FROM products p
           JOIN categories c ON c.id = p.category_id
           JOIN departments d ON d.id = c.department_id
@@ -559,6 +575,7 @@ async function executeCopilotToolInner(
           bestBeforeDate: inventoryBatches.bestBeforeDate,
           qtyRemaining: inventoryBatches.qtyRemaining,
           unitCostCents: inventoryBatches.unitCostCents,
+          unitMode: products.unitMode,
           status: inventoryBatches.status,
         })
         .from(inventoryBatches)
@@ -577,7 +594,9 @@ async function executeCopilotToolInner(
         horizonDays: days,
         batches: rows.map((r) => ({
           ...r,
-          atRiskCostUsd: formatMoney(r.qtyRemaining * r.unitCostCents),
+          atRiskCostUsd: formatMoney(
+            computeInventoryValueCents(r.qtyRemaining, r.unitCostCents, r.unitMode as UnitMode)
+          ),
         })),
       };
     }
@@ -631,7 +650,7 @@ async function executeCopilotToolInner(
           FROM stock_movements WHERE folded = false GROUP BY product_id
         ),
         live AS (
-          SELECT p.id, p.sku, p.name,
+          SELECT p.id, p.sku, p.name, p.unit_mode,
             (COALESCE(sb.quantity, 0) + COALESCE(u.delta, 0))::int AS on_hand,
             p.avg_cost_cents,
             COALESCE(ax.units_60d, 0)::int AS units_60d
@@ -641,7 +660,7 @@ async function executeCopilotToolInner(
           LEFT JOIN analytics_abc_xyz ax ON ax.product_id = p.id
         )
         SELECT sku, name, on_hand, units_60d,
-          (GREATEST(0, on_hand) * avg_cost_cents)::bigint AS tied_cents
+          ROUND((GREATEST(0, on_hand)::numeric * avg_cost_cents) / CASE WHEN unit_mode IN ('weight_g', 'volume_ml') THEN 1000.0 ELSE 1.0 END)::bigint AS tied_cents
         FROM live
         WHERE units_60d <= 2 AND on_hand > 10
         ORDER BY tied_cents DESC
@@ -766,6 +785,9 @@ async function executeCopilotToolInner(
     }
 
     case "propose_purchase_order": {
+      if ((ctx.proposalsCreated ?? 0) >= MAX_PROPOSALS_PER_TURN) {
+        return { error: `Proposal rate limit exceeded (max ${MAX_PROPOSALS_PER_TURN} proposals per turn).` };
+      }
       const supQuery = String(args.supplierName ?? "").trim().slice(0, 120);
       if (!supQuery) {
         return { error: "supplierName is required to propose a purchase order." };
@@ -818,7 +840,10 @@ async function executeCopilotToolInner(
       }
 
       const totalCases = forecastRows.reduce((s, r) => s + r.suggestedCases, 0);
-      const totalCostCents = forecastRows.reduce((s, r) => s + r.estCostCents, 0);
+      const totalCostCents = forecastRows.reduce(
+        (s, r) => s + r.suggestedCases * r.caseQty * r.avgCostCents,
+        0
+      );
 
       const payloadJson = {
         supplierId: sup.id,
@@ -843,6 +868,7 @@ async function executeCopilotToolInner(
         totalCases,
         estimatedCostUsd: formatMoney(totalCostCents),
         topLines: forecastRows.slice(0, 5).map((r) => `${r.sku} (${r.suggestedCases} cs)`),
+        expiresAt: new Date(Date.now() + env.aiActionTtlHours * 3600_000).toISOString(),
       };
 
       const [action] = await db
@@ -859,6 +885,8 @@ async function executeCopilotToolInner(
         })
         .returning();
 
+      ctx.proposalsCreated = (ctx.proposalsCreated ?? 0) + 1;
+
       return {
         proposedActionId: action.id,
         status: "pending_approval",
@@ -867,6 +895,9 @@ async function executeCopilotToolInner(
     }
 
     case "propose_price_update": {
+      if ((ctx.proposalsCreated ?? 0) >= MAX_PROPOSALS_PER_TURN) {
+        return { error: `Proposal rate limit exceeded (max ${MAX_PROPOSALS_PER_TURN} proposals per turn).` };
+      }
       const key = String(args.skuOrProductId ?? "").trim().slice(0, 80);
       if (!key) {
         return { error: "skuOrProductId is required." };
@@ -948,6 +979,7 @@ async function executeCopilotToolInner(
         newPriceUsd: formatMoney(targetPrice),
         currentNetMargin: formatBp(currentMarginBp),
         newNetMargin: formatBp(newMarginBp),
+        expiresAt: new Date(Date.now() + env.aiActionTtlHours * 3600_000).toISOString(),
       };
 
       const [action] = await db
@@ -964,6 +996,8 @@ async function executeCopilotToolInner(
         })
         .returning();
 
+      ctx.proposalsCreated = (ctx.proposalsCreated ?? 0) + 1;
+
       return {
         proposedActionId: action.id,
         status: "pending_approval",
@@ -972,6 +1006,9 @@ async function executeCopilotToolInner(
     }
 
     case "propose_promotion": {
+      if ((ctx.proposalsCreated ?? 0) >= MAX_PROPOSALS_PER_TURN) {
+        return { error: `Proposal rate limit exceeded (max ${MAX_PROPOSALS_PER_TURN} proposals per turn).` };
+      }
       const rawPromoType = String(args.promoType ?? "clearance").trim() as PromotionRule["promoType"];
       if (!VALID_PROMO_TYPES.has(rawPromoType)) {
         return { error: `Unsupported promoType "${rawPromoType}".` };
@@ -982,9 +1019,15 @@ async function executeCopilotToolInner(
         return { error: "Promotion name must be at least 2 characters." };
       }
       const minMarginGuardBp = finiteIntInRange(args.minMarginGuardBp, 0, 9500) ?? 1000;
+      if (minMarginGuardBp < 500) {
+        return { error: "minMarginGuardBp must be at least 500 (5.0% net margin floor)." };
+      }
       const rawDaypartStart = finiteIntInRange(args.daypartStartHour, 0, 23);
       const rawDaypartEnd = finiteIntInRange(args.daypartEndHour, 1, 24);
       const hasCompleteDaypart = rawDaypartStart !== null && rawDaypartEnd !== null;
+      if (hasCompleteDaypart && rawDaypartStart === rawDaypartEnd) {
+        return { error: "daypartStartHour and daypartEndHour must differ." };
+      }
       const daypartStartHour = hasCompleteDaypart ? rawDaypartStart : null;
       const daypartEndHour = hasCompleteDaypart ? rawDaypartEnd : null;
 
@@ -1008,14 +1051,54 @@ async function executeCopilotToolInner(
         productIds = deduped;
       }
 
+      let categoryIds: string[] | undefined;
+      if (Array.isArray(args.categoryIds) && args.categoryIds.length > 0) {
+        const rawCatIds = args.categoryIds
+          .map((x) => String(x).trim())
+          .filter((x) => UUID_RE.test(x))
+          .slice(0, 50);
+        if (rawCatIds.length > 0) {
+          const validCats = await db
+            .select({ id: categories.id })
+            .from(categories)
+            .where(inArray(categories.id, rawCatIds));
+          if (validCats.length > 0) {
+            categoryIds = validCats.map((c) => c.id);
+          }
+        }
+        if (!categoryIds || categoryIds.length === 0) {
+          return { error: "No valid category UUIDs found in categoryIds." };
+        }
+      }
+
+      if ((!productIds || productIds.length === 0) && (!categoryIds || categoryIds.length === 0)) {
+        return {
+          error:
+            "AI-proposed promotions must specify explicit productIds or categoryIds (storewide promos are blocked).",
+        };
+      }
+
       const rulesJson: Record<string, unknown> = {};
       if (productIds && productIds.length > 0) rulesJson.productIds = productIds;
+      if (categoryIds && categoryIds.length > 0) rulesJson.categoryIds = categoryIds;
       const discountBp = finiteIntInRange(args.discountBp, 1, 9500);
-      if (discountBp !== null) rulesJson.discountBp = discountBp;
+      if (discountBp !== null) {
+        if (discountBp > env.aiMaxPromoDiscountBp) {
+          return {
+            error: `discountBp (${discountBp}) exceeds safety limit (${env.aiMaxPromoDiscountBp} bp).`,
+          };
+        }
+        rulesJson.discountBp = discountBp;
+      }
       const requiredQty = finiteIntInRange(args.requiredQty, 1, 100);
       if (requiredQty !== null) rulesJson.requiredQty = requiredQty;
       const bundlePriceCents = finiteIntInRange(args.bundlePriceCents, 1, 10_000_000);
-      if (bundlePriceCents !== null) rulesJson.bundlePriceCents = bundlePriceCents;
+      if (bundlePriceCents !== null) {
+        if (bundlePriceCents < 50) {
+          return { error: "bundlePriceCents must be at least 50 cents ($0.50)." };
+        }
+        rulesJson.bundlePriceCents = bundlePriceCents;
+      }
       const buyQty = finiteIntInRange(args.buyQty, 1, 50);
       if (buyQty !== null) rulesJson.buyQty = buyQty;
       const getQty = finiteIntInRange(args.getQty, 1, 50);
@@ -1043,8 +1126,16 @@ async function executeCopilotToolInner(
           productBarcodes,
           and(eq(productBarcodes.productId, products.id), eq(productBarcodes.isPrimary, true))
         )
-        .where(productIds && productIds.length > 0 ? inArray(products.id, productIds) : undefined)
+        .where(
+          productIds && productIds.length > 0
+            ? inArray(products.id, productIds)
+            : inArray(products.categoryId, categoryIds!)
+        )
         .limit(3);
+
+      if (sampleProds.length === 0) {
+        return { error: "No active priced products matched the promotion scope." };
+      }
 
       const qtyPerLine =
         promoType === "bogo"
@@ -1102,14 +1193,21 @@ async function executeCopilotToolInner(
         daypartStartHour !== null && daypartEndHour !== null
           ? `${String(daypartStartHour).padStart(2, "0")}:00-${String(daypartEndHour).padStart(2, "0")}:00`
           : "All hours";
+      const targetCount = productIds?.length ?? categoryIds?.length ?? 0;
       const previewJson = {
         promoType,
+        scopeType: productIds && productIds.length > 0 ? "products" : "categories",
+        targetCount,
+        targetSkus: sampleProds.map((p) => p.sku),
+        ...(discountBp !== null ? { discountPct: `${(discountBp / 100).toFixed(1)}%` } : {}),
+        ...(bundlePriceCents !== null ? { bundlePriceUsd: formatMoney(bundlePriceCents) } : {}),
         daypartWindow: daypartLabel,
         minMarginFloor: formatBp(minMarginGuardBp),
         sampleSubtotalUsd: formatMoney(sim.subtotalBeforeDiscountCents),
         sampleDiscountUsd: formatMoney(sim.totalDiscountCents),
         sampleTotalUsd: formatMoney(sim.grandTotalCents),
         simulatedNetMargin: formatBp(sim.estimatedMarginBp),
+        expiresAt: new Date(Date.now() + env.aiActionTtlHours * 3600_000).toISOString(),
       };
 
       const [action] = await db
@@ -1125,6 +1223,8 @@ async function executeCopilotToolInner(
           createdBy: ctx.user.fullName,
         })
         .returning();
+
+      ctx.proposalsCreated = (ctx.proposalsCreated ?? 0) + 1;
 
       return {
         proposedActionId: action.id,
